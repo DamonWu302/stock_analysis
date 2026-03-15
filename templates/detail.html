@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ detail.name }} - 股票详情</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero detail-hero">
+            <div>
+                <p class="eyebrow">STOCK DETAIL</p>
+                <h1>{{ detail.name }} <span class="code">{{ detail.symbol }}</span></h1>
+                <p class="subtitle">{{ detail.summary }}</p>
+            </div>
+            <div class="detail-stats">
+                <div class="mini-card"><span>评分</span><strong>{{ detail.score }}</strong></div>
+                <div class="mini-card"><span>现价</span><strong>{{ detail.latest_price }}</strong></div>
+                <div class="mini-card"><span>涨跌幅</span><strong class="{{ 'up' if detail.pct_change >= 0 else 'down' }}">{{ detail.pct_change }}%</strong></div>
+                <div class="mini-card"><span>板块</span><strong>{{ detail.sector }}</strong></div>
+            </div>
+        </section>
+
+        <section class="chart-wrap">
+            <div class="section-title">
+                <h2>K 线图</h2>
+                <a class="detail-link" href="{{ back_url }}">{{ back_label }}</a>
+            </div>
+            <div class="chart-box">{{ detail.chart_svg|safe }}</div>
+        </section>
+
+        <section class="detail-grid">
+            <article class="table-wrap">
+                <div class="section-title">
+                    <h2>命中信号</h2>
+                    <span class="score-source {{ 'is-ai' if detail.score_source == 'ai' else 'is-system' }}">
+                        {{ 'AI 评分' if detail.score_source == 'ai' else '系统评分' }}
+                    </span>
+                </div>
+                <div class="badges">
+                    {% for signal in detail.signals %}
+                    <span class="badge">{{ signal }}</span>
+                    {% endfor %}
+                </div>
+                {% if detail.score_breakdown %}
+                <div class="score-breakdown">
+                    {% for item in detail.score_breakdown %}
+                    <div class="score-row {{ 'matched' if item.matched else 'missed' }}">
+                        <div class="score-row-main">
+                            <span class="score-label">{{ item.label }}</span>
+                            <span class="score-state">{{ '已命中' if item.matched else '未命中' }}</span>
+                            {% if item.comment %}
+                            <span class="score-comment">{{ item.comment }}</span>
+                            {% endif %}
+                        </div>
+                        <div class="score-values">
+                            <strong>{{ '%.1f'|format(item.score) }}</strong>
+                            <span>/ {{ item.weight }}</span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+                <p class="summary-block">{{ detail.summary }}</p>
+
+                <div class="section-title section-gap">
+                    <h2>同板块股票</h2>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>代码</th>
+                            <th>名称</th>
+                            <th>现价</th>
+                            <th>涨跌幅</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in detail.sector_members %}
+                        <tr>
+                            <td>{{ row.symbol }}</td>
+                            <td>{{ row.name }}</td>
+                            <td>{{ row.latest_price }}</td>
+                            <td class="{{ 'up' if row.pct_change >= 0 else 'down' }}">{{ row.pct_change }}%</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </article>
+
+            <article class="table-wrap">
+                <div class="chat-panel chat-panel-alone">
+                    <div class="section-title">
+                        <h2>AI 对话</h2>
+                    </div>
+                    <p class="summary-block">可以围绕当前股票的趋势、信号、板块强弱和风险点继续追问。</p>
+                    <div class="quick-prompts">
+                        <button type="button" class="quick-prompt" data-prompt="这只股票当前更偏趋势延续还是短线反弹？">趋势判断</button>
+                        <button type="button" class="quick-prompt" data-prompt="结合均线和K线，当前最值得警惕的风险点是什么？">风险点</button>
+                        <button type="button" class="quick-prompt" data-prompt="这只股票和同板块相比强在哪里、弱在哪里？">板块对比</button>
+                        <button type="button" class="quick-prompt" data-prompt="请严格按照系统评分算法，逐条检查这只股票本次命中的信号是否合理，哪些判断成立，哪些可能偏乐观，并给出复盘结论。">判断复盘</button>
+                        <button type="button" class="quick-prompt" data-prompt="如果继续观察，接下来应该重点看哪些价位和信号？">观察重点</button>
+                    </div>
+                    <div class="chat-toolbar">
+                        <button type="button" id="chat-new" class="chat-action">新建对话</button>
+                        <button type="button" id="chat-clear" class="chat-action chat-action-danger">删除历史</button>
+                    </div>
+                    {% if not detail.chat_enabled %}
+                    <p class="chat-empty">未配置 `LLM_API_KEY`，暂时无法使用对话功能。</p>
+                    {% endif %}
+                    <div id="chat-status" class="chat-status" hidden>
+                        <div class="chat-status-track">
+                            <span class="chat-status-line"></span>
+                            <span class="chat-status-line is-progress"></span>
+                            <span class="chat-status-node is-active" data-step="sent">
+                                <span class="chat-status-dot"></span>
+                                <span class="chat-status-label">已发送</span>
+                            </span>
+                            <span class="chat-status-node" data-step="thinking">
+                                <span class="chat-status-dot"></span>
+                                <span class="chat-status-label">模型思考</span>
+                            </span>
+                            <span class="chat-status-node" data-step="streaming">
+                                <span class="chat-status-dot"></span>
+                                <span class="chat-status-label">开始输出</span>
+                            </span>
+                        </div>
+                    </div>
+                    <div id="chat-messages" class="chat-messages">
+                        <div class="chat-bubble assistant">
+                            <div class="chat-markdown">
+                                <p>你好，可以问我这只股票的趋势、板块联动、信号含义和风险点。</p>
+                            </div>
+                        </div>
+                    </div>
+                    <form id="chat-form" class="chat-form" data-symbol="{{ detail.symbol }}">
+                        <textarea id="chat-input" rows="3" placeholder="例如：这只股票当前更像趋势延续还是短期反弹？" {% if not detail.chat_enabled %}disabled{% endif %}></textarea>
+                        <button id="chat-submit" type="submit" {% if not detail.chat_enabled %}disabled{% endif %}>发送</button>
+                    </form>
+                </div>
+            </article>
+        </section>
+    </main>
+
+    <script>
+    const chatForm = document.getElementById('chat-form');
+    const chatInput = document.getElementById('chat-input');
+    const chatMessages = document.getElementById('chat-messages');
+    const chatNewButton = document.getElementById('chat-new');
+    const chatClearButton = document.getElementById('chat-clear');
+    const chatSubmitButton = document.getElementById('chat-submit');
+    const chatStatus = document.getElementById('chat-status');
+    const quickPrompts = document.querySelectorAll('.quick-prompt');
+    const storageKey = `stock-chat-{{ detail.symbol }}`;
+    const defaultAssistantMessage = '你好，可以问我这只股票的趋势、板块联动、信号含义和风险点。';
+    let chatStatusStartedAt = 0;
+    let pendingReviewMode = false;
+
+    if (chatForm && chatInput && chatMessages) {
+      renderConversation(loadHistory());
+
+      quickPrompts.forEach((button) => {
+        button.addEventListener('click', () => {
+          if (chatInput.disabled) return;
+          chatInput.value = button.dataset.prompt || '';
+          pendingReviewMode = (button.textContent || '').includes('判断复盘');
+          chatInput.focus();
+        });
+      });
+
+      chatNewButton?.addEventListener('click', () => {
+        localStorage.removeItem(storageKey);
+        renderConversation([]);
+        chatInput.value = '';
+        chatInput.focus();
+      });
+
+      chatClearButton?.addEventListener('click', () => {
+        localStorage.removeItem(storageKey);
+        renderConversation([]);
+      });
+
+      chatForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const message = chatInput.value.trim();
+        if (!message) return;
+        pendingReviewMode = pendingReviewMode || /复盘|评分|重算/.test(message);
+
+        const history = loadHistory();
+        const nextHistory = [...history, { role: 'user', content: message }];
+        saveHistory(nextHistory);
+        renderConversation(nextHistory);
+        chatInput.value = '';
+        setChatBusy(true);
+        setChatStatus('sent');
+
+        const assistantBubble = appendBubble('正在思考中', 'assistant pending thinking', true);
+        let finalReply = '';
+
+        try {
+          const response = await fetch(`/api/stocks/${chatForm.dataset.symbol}/chat/stream`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message, history }),
+          });
+
+          if (!response.ok || !response.body) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.error || '请求失败，请稍后重试。');
+          }
+
+          setChatStatus('thinking');
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let buffer = '';
+          let hasStartedStreaming = false;
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              const eventData = JSON.parse(line);
+              if (eventData.type === 'chunk') {
+                if (!hasStartedStreaming) {
+                  hasStartedStreaming = true;
+                  setChatStatus('streaming');
+                }
+                assistantBubble.classList.remove('thinking');
+                finalReply += eventData.content || '';
+                updateBubble(assistantBubble, finalReply);
+              } else if (eventData.type === 'done') {
+                assistantBubble.classList.remove('thinking');
+                finalReply = eventData.content || finalReply;
+                updateBubble(assistantBubble, finalReply);
+              } else if (eventData.type === 'error') {
+                throw new Error(eventData.error || '模型返回异常');
+              }
+            }
+          }
+
+          if (!finalReply.trim()) {
+            throw new Error('模型没有返回内容，请稍后重试。');
+          }
+
+          const updatedHistory = [...nextHistory, { role: 'assistant', content: finalReply }];
+          saveHistory(updatedHistory);
+          assistantBubble.classList.remove('pending');
+        } catch (error) {
+          assistantBubble.classList.remove('pending', 'thinking');
+          updateBubble(assistantBubble, error.message || '网络异常，暂时无法完成对话。');
+        } finally {
+          setChatBusy(false);
+          await clearChatStatusWithDelay();
+          pendingReviewMode = false;
+          chatInput.focus();
+        }
+      });
+    }
+
+    function loadHistory() {
+      try {
+        const raw = localStorage.getItem(storageKey);
+        const history = JSON.parse(raw || '[]');
+        return Array.isArray(history) ? history : [];
+      } catch (error) {
+        return [];
+      }
+    }
+
+    function saveHistory(history) {
+      localStorage.setItem(storageKey, JSON.stringify(history));
+    }
+
+    function renderConversation(history) {
+      chatMessages.innerHTML = '';
+      if (!history.length) {
+        appendBubble(defaultAssistantMessage, 'assistant');
+        return;
+      }
+      history.forEach((item) => appendBubble(item.content, item.role));
+    }
+
+    function setChatBusy(isBusy) {
+      chatInput.disabled = isBusy || chatInput.hasAttribute('disabled');
+      if (chatSubmitButton) chatSubmitButton.disabled = isBusy || chatSubmitButton.hasAttribute('disabled');
+      if (chatNewButton) chatNewButton.disabled = isBusy;
+      if (chatClearButton) chatClearButton.disabled = isBusy;
+      quickPrompts.forEach((button) => { button.disabled = isBusy || chatInput.hasAttribute('disabled'); });
+    }
+
+    function setChatStatus(step) {
+      if (!chatStatus) return;
+      if (!chatStatusStartedAt) {
+        chatStatusStartedAt = Date.now();
+      }
+      chatStatus.hidden = false;
+      chatStatus.dataset.currentStep = step;
+      chatStatus.querySelectorAll('[data-step]').forEach((item) => {
+        item.classList.toggle('is-active', item.dataset.step === step);
+        item.classList.toggle('is-done', stepOrder(item.dataset.step) < stepOrder(step));
+      });
+    }
+
+    async function clearChatStatusWithDelay() {
+      const elapsed = Date.now() - chatStatusStartedAt;
+      const minVisibleMs = 1200;
+      if (elapsed < minVisibleMs) {
+        await new Promise((resolve) => window.setTimeout(resolve, minVisibleMs - elapsed));
+      }
+      clearChatStatus();
+    }
+
+    function clearChatStatus() {
+      if (!chatStatus) return;
+      chatStatus.hidden = true;
+      chatStatusStartedAt = 0;
+      delete chatStatus.dataset.currentStep;
+      chatStatus.querySelectorAll('[data-step]').forEach((item) => {
+        item.classList.remove('is-active', 'is-done');
+      });
+      const first = chatStatus.querySelector('[data-step="sent"]');
+      if (first) first.classList.add('is-active');
+    }
+
+    function stepOrder(step) {
+      return { sent: 1, thinking: 2, streaming: 3 }[step] || 0;
+    }
+
+    function appendBubble(text, role, useMarkdown = false) {
+      const node = document.createElement('div');
+      node.className = `chat-bubble ${role}`;
+      updateBubble(node, text, useMarkdown || role.includes('assistant'));
+      chatMessages.appendChild(node);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+      return node;
+    }
+
+    function updateBubble(node, text, useMarkdown = true) {
+      const proposal = extractReviewProposal(text);
+      const displayText = proposal ? stripReviewProposal(text) : text;
+      if (useMarkdown) {
+        node.innerHTML = `<div class="chat-markdown">${renderMarkdown(displayText)}</div>`;
+      } else {
+        node.innerHTML = `<div class="chat-text">${escapeHtml(displayText)}</div>`;
+      }
+      if (proposal?.action === 'propose_review_update' && proposal.data_sufficient) {
+        node.appendChild(buildReviewProposalCard(proposal));
+      }
+      if (proposal?.action === 'needs_refresh') {
+        node.appendChild(buildRefreshHintCard(proposal));
+      } else if (pendingReviewMode && !proposal) {
+        const hint = document.createElement('div');
+        hint.className = 'review-hint review-hint-warning';
+        hint.textContent = '本次复盘没有生成可执行评分提案。可以重试一次，或者提示模型按要求输出 JSON 评分提案。';
+        node.appendChild(hint);
+      }
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    function buildReviewProposalCard(proposal) {
+      const card = document.createElement('div');
+      card.className = 'review-card';
+      card.innerHTML = `
+        <div class="review-card-title">AI 复盘评分建议</div>
+        <div class="review-card-meta">有效交易日：${escapeHtml(proposal.effective_trade_date || '未知')} | 建议总分：${escapeHtml(String(proposal.score ?? ''))}</div>
+        <button type="button" class="review-apply">更新到系统</button>
+      `;
+      const button = card.querySelector('.review-apply');
+      button?.addEventListener('click', async () => {
+        button.disabled = true;
+        button.textContent = '更新中...';
+        try {
+          const response = await fetch(`/api/stocks/${chatForm.dataset.symbol}/apply-review`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ proposal }),
+          });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.error || '更新评分失败');
+          }
+          button.textContent = '已更新，刷新中...';
+          window.location.reload();
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = '更新到系统';
+          alert(error.message || '更新评分失败');
+        }
+      });
+      return card;
+    }
+
+    function buildRefreshHintCard(proposal) {
+      const card = document.createElement('div');
+      card.className = 'review-card review-card-warning';
+      card.innerHTML = `
+        <div class="review-card-title">建议先刷新数据</div>
+        <div class="review-card-meta">个股最新交易日：${escapeHtml(proposal.effective_trade_date || '未知')} | 大盘最新交易日：${escapeHtml(proposal.benchmark_trade_date || '未知')}</div>
+        <div class="review-hint">原因：${escapeHtml(proposal.refresh_reason || '模型认为当前关键数据不足以完成可靠复盘。')}</div>
+      `;
+      return card;
+    }
+
+    function extractReviewProposal(text) {
+      const match = String(text || '').match(/```json\s*([\s\S]*?)```/i);
+      if (!match) return null;
+      try {
+        return JSON.parse(match[1].trim());
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function stripReviewProposal(text) {
+      return String(text || '').replace(/```json\s*[\s\S]*?```/i, '').trim();
+    }
+
+    function renderMarkdown(source) {
+      const escaped = escapeHtml(source || '');
+      const fenced = [];
+      let index = 0;
+      let text = escaped.replace(/```([\s\S]*?)```/g, (_, code) => {
+        const token = `@@CODE${index}@@`;
+        fenced.push(`<pre><code>${code.trim()}</code></pre>`);
+        index += 1;
+        return token;
+      });
+
+      text = text.replace(/^###\s(.+)$/gm, '<h3>$1</h3>');
+      text = text.replace(/^##\s(.+)$/gm, '<h2>$1</h2>');
+      text = text.replace(/^#\s(.+)$/gm, '<h1>$1</h1>');
+      text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+      text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+      text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
+      text = text.replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>');
+      text = text.split(/\n{2,}/).map((block) => {
+        if (/^\s*<(h1|h2|h3|ul|pre)/.test(block)) {
+          return block;
+        }
+        return `<p>${block.replace(/\n/g, '<br>')}</p>`;
+      }).join('');
+
+      fenced.forEach((html, itemIndex) => {
+        text = text.replace(`@@CODE${itemIndex}@@`, html);
+      });
+      return text;
+    }
+
+    function escapeHtml(text) {
+      return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+    </script>
+</body>
+</html>

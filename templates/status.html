@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% if task.status == 'running' %}
+    <meta http-equiv="refresh" content="3">
+    {% endif %}
+    <title>扫描状态</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero detail-hero">
+            <div>
+                <p class="eyebrow">TASK STATUS</p>
+                <h1>扫描任务 #{{ task.id }}</h1>
+                <p class="subtitle">{{ task.message or '等待任务更新' }}</p>
+            </div>
+            <div class="detail-stats">
+                <div class="mini-card"><span>状态</span><strong>{{ task.status }}</strong></div>
+                <div class="mini-card"><span>数据源</span><strong>{{ task.provider }}</strong></div>
+                <div class="mini-card"><span>进度</span><strong>{{ task.progress_current }}/{{ task.progress_total }}</strong></div>
+                <div class="mini-card"><span>最近股票</span><strong>{{ task.last_symbol or '-' }}</strong></div>
+            </div>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>扫描进度</h2>
+                <span>{{ task.progress_percent }}%</span>
+            </div>
+            <div class="progress-track">
+                <div class="progress-bar" style="width: {{ task.progress_percent }}%;"></div>
+            </div>
+        </section>
+
+        <section class="stats">
+            <article class="card">
+                <span>命中缓存</span>
+                <strong>{{ task.cache_hits }}</strong>
+            </article>
+            <article class="card">
+                <span>增量更新</span>
+                <strong>{{ task.incremental_updates }}</strong>
+            </article>
+            <article class="card">
+                <span>完整回补</span>
+                <strong>{{ task.full_refreshes }}</strong>
+            </article>
+            <article class="card">
+                <span>指数缓存</span>
+                <strong>{{ task.benchmark_cache_mode or '-' }}</strong>
+            </article>
+        </section>
+
+        {% if recent_tasks %}
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>最近几次任务</h2>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务</th>
+                        <th>状态</th>
+                        <th>进度</th>
+                        <th>缓存</th>
+                        <th>最近股票</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in recent_tasks %}
+                    <tr>
+                        <td><a class="detail-link" href="{{ url_for('task_status', task_id=row.id) }}">#{{ row.id }}</a></td>
+                        <td>{{ row.status }}</td>
+                        <td>{{ row.progress_current }}/{{ row.progress_total }}</td>
+                        <td>{{ row.cache_hits }}/{{ row.incremental_updates }}/{{ row.full_refreshes }}</td>
+                        <td>{{ row.last_symbol or '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>任务详情</h2>
+                <div>
+                    <a class="detail-link" href="{{ url_for('index') }}">返回首页</a>
+                    {% if task.run_id %}
+                    <span class="inline-gap"></span>
+                    <a class="detail-link" href="{{ url_for('index') }}">查看最新结果</a>
+                    {% endif %}
+                </div>
+            </div>
+            <p class="summary-block">开始时间：{{ task.started_at }}</p>
+            <p class="summary-block">结束时间：{{ task.finished_at or '运行中' }}</p>
+            <p class="summary-block">当前说明：{{ task.message or '无' }}</p>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>缓存明细</h2>
+                <span>按股票展开命中缓存 / 增量更新 / 完整回补</span>
+            </div>
+            {% if task['items'] %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>代码</th>
+                        <th>名称</th>
+                        <th>缓存模式</th>
+                        <th>现价</th>
+                        <th>涨跌幅</th>
+                        <th>评分</th>
+                        <th>更新时间</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in task['items'] %}
+                    <tr>
+                        <td>{{ item.symbol }}</td>
+                        <td>{{ item.name }}</td>
+                        <td><span class="badge">{{ item.cache_mode }}</span></td>
+                        <td>{{ item.latest_price }}</td>
+                        <td class="{{ 'up' if item.pct_change >= 0 else 'down' }}">{{ item.pct_change }}%</td>
+                        <td>{{ item.score }}</td>
+                        <td>{{ item.updated_at }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="summary-block">当前还没有股票级缓存明细，可能任务刚启动。</p>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>

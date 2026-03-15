@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>A股分析系统</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero">
+            <div>
+                <p class="eyebrow">A-SHARE STOCK ANALYSIS</p>
+                <h1>沪深 A 股全量扫描</h1>
+                <p class="subtitle">当前默认扫描主板 A 股，自动去掉 ST、创业板、科创板，再按最近交易日 K 线和趋势规则做评分。</p>
+            </div>
+            <form class="control-panel" method="post" action="{{ url_for('analyze') }}">
+                <label>
+                    数据源
+                    <select name="provider">
+                        <option value="baostock" {% if not data or data.provider == 'baostock' %}selected{% endif %}>baostock 历史日线</option>
+                        <option value="mock" {% if data and data.provider == 'mock' %}selected{% endif %}>Mock 演示数据</option>
+                        <option value="akshare" {% if data and data.provider == 'akshare' %}selected{% endif %}>AKShare 历史数据</option>
+                    </select>
+                </label>
+                <div class="hint">
+                    <strong>扫描范围</strong>
+                    <span>沪深主板全量分批扫描，默认每批 {{ defaults.scan_batch_size }} 只。</span>
+                </div>
+                <button type="submit">开始全量扫描</button>
+                <a class="detail-link" href="{{ url_for('latest_status') }}">查看任务状态</a>
+            </form>
+        </section>
+
+        {% if error %}
+        <section class="alert">
+            <strong>分析失败：</strong>{{ error }}
+        </section>
+        {% endif %}
+
+        {% if task %}
+        <section class="stats">
+            <article class="card">
+                <span>最近任务</span>
+                <strong>{{ task.status }}</strong>
+            </article>
+            <article class="card">
+                <span>进度</span>
+                <strong>{{ task.progress_current }}/{{ task.progress_total }}</strong>
+            </article>
+            <article class="card">
+                <span>最近股票</span>
+                <strong>{{ task.last_symbol or '-' }}</strong>
+            </article>
+            <article class="card">
+                <span>详情</span>
+                <strong><a class="detail-link" href="{{ url_for('task_status', task_id=task.id) }}">打开状态页</a></strong>
+            </article>
+        </section>
+        {% endif %}
+
+        {% if recent_tasks %}
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>最近任务</h2>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务</th>
+                        <th>状态</th>
+                        <th>进度</th>
+                        <th>缓存</th>
+                        <th>最近股票</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in recent_tasks %}
+                    <tr>
+                        <td>#{{ row.id }}</td>
+                        <td>{{ row.status }}</td>
+                        <td>{{ row.progress_current }}/{{ row.progress_total }}</td>
+                        <td>{{ row.cache_hits }}/{{ row.incremental_updates }}/{{ row.full_refreshes }}</td>
+                        <td>{{ row.last_symbol or '-' }}</td>
+                        <td><a class="detail-link" href="{{ url_for('task_status', task_id=row.id) }}">查看状态</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+
+        {% if data %}
+        <section class="stats">
+            <article class="card">
+                <span>分析日期</span>
+                <strong>{{ data.trade_date }}</strong>
+            </article>
+            <article class="card">
+                <span>扫描股票数</span>
+                <strong>{{ data.sample_size }}</strong>
+            </article>
+            <article class="card">
+                <span>页面展示数</span>
+                <strong>{{ data.display_size }}</strong>
+            </article>
+            <article class="card">
+                <span>{{ data.benchmark_name }}</span>
+                <strong class="{{ 'up' if data.benchmark_change >= 0 else 'down' }}">{{ data.benchmark_change }}%</strong>
+            </article>
+        </section>
+
+        <section class="stats">
+            <article class="card">
+                <span>本次命中缓存</span>
+                <strong>{{ data.cache_hits }}</strong>
+            </article>
+            <article class="card">
+                <span>本次增量更新</span>
+                <strong>{{ data.incremental_updates }}</strong>
+            </article>
+            <article class="card">
+                <span>本次完整回补</span>
+                <strong>{{ data.full_refreshes }}</strong>
+            </article>
+            <article class="card">
+                <span>指数缓存模式</span>
+                <strong>{{ data.benchmark_cache_mode }}</strong>
+            </article>
+        </section>
+        <section class="table-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>评分结果</h2>
+                    <p>评分结果已经单独放到新页面，点击下面按钮进入，按每页 20 条分页浏览。</p>
+                </div>
+                <a class="detail-link" href="{{ url_for('results') }}">查看评分结果</a>
+            </div>
+        </section>
+        {% else %}
+        <section class="empty-state">
+            <h2>还没有分析结果</h2>
+            <p>点击“开始全量扫描”后，系统会从主板股票池中分批抓取历史日线并生成结果。</p>
+        </section>
+        {% endif %}
+    </main>
+</body>
+</html>

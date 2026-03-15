@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>评分结果</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero detail-hero">
+            <div>
+                <p class="eyebrow">SCORING RESULTS</p>
+                <h1>评分结果</h1>
+                <p class="subtitle">支持评分、涨跌幅、板块筛选，以及按评分、涨跌幅、现价排序。详情页会保留当前分页和筛选条件。</p>
+            </div>
+            <div class="detail-stats">
+                <div class="mini-card"><span>分析日期</span><strong>{{ data.trade_date }}</strong></div>
+                <div class="mini-card"><span>过滤后结果</span><strong>{{ data.total_items }}</strong></div>
+                <div class="mini-card"><span>当前页</span><strong>{{ data.page }}/{{ data.total_pages }}</strong></div>
+                <div class="mini-card"><span>平均分</span><strong>{{ data.average_score }}</strong></div>
+            </div>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>筛选与排序</h2>
+                <a class="detail-link" href="{{ url_for('index') }}">返回首页</a>
+            </div>
+            <form class="filter-bar" method="get" action="{{ url_for('results') }}">
+                <label>
+                    最低评分
+                    <input type="number" step="0.1" name="min_score" value="{{ data.filters.min_score }}">
+                </label>
+                <label>
+                    最低涨跌幅
+                    <input type="number" step="0.1" name="min_pct_change" value="{{ data.filters.min_pct_change }}">
+                </label>
+                <label>
+                    板块
+                    <select name="sector">
+                        <option value="">全部板块</option>
+                        {% for option in data.sector_options %}
+                        <option value="{{ option }}" {% if option == data.filters.sector %}selected{% endif %}>{{ option }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    排序字段
+                    <select name="sort_by">
+                        <option value="score" {% if data.filters.sort_by == 'score' %}selected{% endif %}>评分</option>
+                        <option value="pct_change" {% if data.filters.sort_by == 'pct_change' %}selected{% endif %}>涨跌幅</option>
+                        <option value="latest_price" {% if data.filters.sort_by == 'latest_price' %}selected{% endif %}>现价</option>
+                        <option value="symbol" {% if data.filters.sort_by == 'symbol' %}selected{% endif %}>代码</option>
+                    </select>
+                </label>
+                <label>
+                    排序方向
+                    <select name="sort_dir">
+                        <option value="desc" {% if data.filters.sort_dir == 'desc' %}selected{% endif %}>降序</option>
+                        <option value="asc" {% if data.filters.sort_dir == 'asc' %}selected{% endif %}>升序</option>
+                    </select>
+                </label>
+                <button type="submit">应用筛选</button>
+            </form>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>股票列表</h2>
+                <span>每页 20 条</span>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>代码</th>
+                        <th>名称</th>
+                        <th>评分</th>
+                        <th>现价</th>
+                        <th>涨跌幅</th>
+                        <th>板块</th>
+                        <th>信号</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in data.results %}
+                    <tr>
+                        <td><a class="stock-link" href="{{ url_for('stock_detail', symbol=row.symbol, return_to='results', page=data.page, min_score=data.filters.min_score, min_pct_change=data.filters.min_pct_change, sector=data.filters.sector, sort_by=data.filters.sort_by, sort_dir=data.filters.sort_dir) }}">{{ row.symbol }}</a></td>
+                        <td>{{ row.name }}</td>
+                        <td><strong>{{ row.score }}</strong></td>
+                        <td>{{ row.latest_price }}</td>
+                        <td class="{{ 'up' if row.pct_change >= 0 else 'down' }}">{{ row.pct_change }}%</td>
+                        <td>{{ row.sector }}</td>
+                        <td>
+                            <div class="badges">
+                                {% for signal in row.signals %}
+                                <span class="badge">{{ signal }}</span>
+                                {% endfor %}
+                            </div>
+                        </td>
+                        <td><a class="detail-link" href="{{ url_for('stock_detail', symbol=row.symbol, return_to='results', page=data.page, min_score=data.filters.min_score, min_pct_change=data.filters.min_pct_change, sector=data.filters.sector, sort_by=data.filters.sort_by, sort_dir=data.filters.sort_dir) }}">查看详情</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+            <div class="pagination">
+                {% if data.has_prev %}
+                <a class="detail-link" href="{{ url_for('results', page=data.prev_page, min_score=data.filters.min_score, min_pct_change=data.filters.min_pct_change, sector=data.filters.sector, sort_by=data.filters.sort_by, sort_dir=data.filters.sort_dir) }}">上一页</a>
+                {% endif %}
+
+                {% for page_no in data.page_numbers %}
+                {% if page_no == data.page %}
+                <span class="page-pill active">{{ page_no }}</span>
+                {% else %}
+                <a class="page-pill" href="{{ url_for('results', page=page_no, min_score=data.filters.min_score, min_pct_change=data.filters.min_pct_change, sector=data.filters.sector, sort_by=data.filters.sort_by, sort_dir=data.filters.sort_dir) }}">{{ page_no }}</a>
+                {% endif %}
+                {% endfor %}
+
+                {% if data.has_next %}
+                <a class="detail-link" href="{{ url_for('results', page=data.next_page, min_score=data.filters.min_score, min_pct_change=data.filters.min_pct_change, sector=data.filters.sector, sort_by=data.filters.sort_by, sort_dir=data.filters.sort_dir) }}">下一页</a>
+                {% endif %}
+            </div>
+        </section>
+    </main>
+</body>
+</html>
