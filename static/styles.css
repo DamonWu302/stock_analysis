@@ -567,6 +567,21 @@ button {
     gap: 14px;
 }
 
+.stock-query-bar {
+    grid-template-columns: 2fr 1fr;
+    align-items: end;
+}
+
+.lookup-card {
+    display: grid;
+    gap: 16px;
+    margin-top: 18px;
+}
+
+.compact-stats {
+    margin: 0;
+}
+
 .page-pill {
     display: inline-flex;
     align-items: center;

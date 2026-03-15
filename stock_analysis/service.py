@@ -259,8 +259,6 @@ class StockAnalysisService:
                 """,
                 (symbol,),
             ).fetchone()
-            if not latest_row:
-                return None
             history_rows = conn.execute(
                 """
                 SELECT trade_date, open, close, high, low, volume, amount
@@ -279,17 +277,6 @@ class StockAnalysisService:
                 """,
                 ("000001",),
             ).fetchall()
-            sector_rows = conn.execute(
-                """
-                SELECT symbol, name, latest_price, pct_change
-                FROM market_snapshot
-                WHERE trade_date = (SELECT MAX(trade_date) FROM market_snapshot)
-                  AND sector = ?
-                ORDER BY pct_change DESC, symbol ASC
-                LIMIT 12
-                """,
-                (latest_row["sector"],),
-            ).fetchall()
             snapshot_row = conn.execute(
                 """
                 SELECT symbol, name, latest_price, pct_change, volume, amount, sector,
@@ -301,15 +288,59 @@ class StockAnalysisService:
                 """,
                 (symbol,),
             ).fetchone()
+            sector_value = None
+            if latest_row:
+                sector_value = latest_row["sector"]
+            elif snapshot_row:
+                sector_value = snapshot_row["sector"]
 
-        detail = dict(latest_row)
-        detail["signals"] = json.loads(detail["signals"])
+            sector_rows = []
+            if sector_value:
+                sector_rows = conn.execute(
+                    """
+                    SELECT symbol, name, latest_price, pct_change
+                    FROM market_snapshot
+                    WHERE trade_date = (SELECT MAX(trade_date) FROM market_snapshot)
+                      AND sector = ?
+                    ORDER BY pct_change DESC, symbol ASC
+                    LIMIT 12
+                    """,
+                    (sector_value,),
+                ).fetchall()
+
+        if not history_rows or not snapshot_row or not benchmark_rows:
+            return None
+
+        if latest_row:
+            detail = dict(latest_row)
+            detail["signals"] = json.loads(detail["signals"])
+            saved_breakdown = json.loads(detail["score_breakdown"]) if detail.get("score_breakdown") else []
+        else:
+            snapshot = pd.Series(dict(snapshot_row))
+            computed = score_stock(snapshot, pd.DataFrame([dict(row) for row in history_rows]), pd.DataFrame([dict(row) for row in benchmark_rows]))
+            if not computed:
+                return None
+            detail = {
+                "run_id": None,
+                "symbol": computed.symbol,
+                "name": computed.name,
+                "score": computed.score,
+                "latest_price": computed.latest_price,
+                "pct_change": computed.pct_change,
+                "sector": computed.sector,
+                "summary": computed.summary,
+                "signals": computed.signals,
+                "score_breakdown": computed.score_breakdown,
+                "score_source": "system",
+                "review_updated_at": None,
+            }
+            saved_breakdown = computed.score_breakdown
+
         detail["history"] = [dict(row) for row in history_rows]
         detail["benchmark_history"] = [dict(row) for row in benchmark_rows]
         detail["sector_members"] = [dict(row) for row in sector_rows]
         detail["history_count"] = len(detail["history"])
         detail["benchmark_count"] = len(detail["benchmark_history"])
-        saved_breakdown = json.loads(detail["score_breakdown"]) if detail.get("score_breakdown") else []
         if saved_breakdown:
             detail["score_breakdown"] = saved_breakdown
         elif snapshot_row:
@@ -322,6 +353,23 @@ class StockAnalysisService:
         else:
             detail["score_breakdown"] = []
         return detail
+
+    def lookup_stock_score(self, symbol: str) -> dict | None:
+        detail = self.stock_detail(symbol)
+        if not detail:
+            return None
+        return {
+            "symbol": detail["symbol"],
+            "name": detail["name"],
+            "score": detail["score"],
+            "latest_price": detail["latest_price"],
+            "pct_change": detail["pct_change"],
+            "sector": detail["sector"],
+            "summary": detail["summary"],
+            "signals": detail["signals"],
+            "score_breakdown": detail["score_breakdown"],
+            "score_source": detail.get("score_source", "system"),
+        }
 
     def apply_review_score(self, symbol: str, proposal: dict) -> dict | None:
         with self.db.connect() as conn:

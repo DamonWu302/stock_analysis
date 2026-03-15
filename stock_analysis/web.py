@@ -46,6 +46,7 @@ def create_app() -> Flask:
         sector = request.args.get("sector", "").strip()
         sort_by = request.args.get("sort_by", "score")
         sort_dir = request.args.get("sort_dir", "desc")
+        query_symbol = request.args.get("query_symbol", "").strip()
 
         filtered_results = list(data["results"])
         if min_score > 0:
@@ -87,9 +88,11 @@ def create_app() -> Flask:
             "sector": sector,
             "sort_by": sort_by,
             "sort_dir": sort_dir,
+            "query_symbol": query_symbol,
         }
         paged["sector_options"] = sorted({row["sector"] for row in data["results"] if row["sector"]})
         paged["page_numbers"] = _build_page_numbers(page, total_pages)
+        paged["searched_stock"] = service.lookup_stock_score(query_symbol) if query_symbol else None
         return render_template("results.html", data=paged)
 
     @app.post("/analyze")

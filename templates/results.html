@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>评分结果</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
@@ -63,6 +64,80 @@
                 </label>
                 <button type="submit">应用筛选</button>
             </form>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>个股评分详情</h2>
+                <span>支持直接按股票代码查询，不受当前前 50 条结果限制</span>
+            </div>
+            <form class="filter-bar stock-query-bar" method="get" action="{{ url_for('results') }}">
+                <input type="hidden" name="page" value="{{ data.page }}">
+                <input type="hidden" name="min_score" value="{{ data.filters.min_score }}">
+                <input type="hidden" name="min_pct_change" value="{{ data.filters.min_pct_change }}">
+                <input type="hidden" name="sector" value="{{ data.filters.sector }}">
+                <input type="hidden" name="sort_by" value="{{ data.filters.sort_by }}">
+                <input type="hidden" name="sort_dir" value="{{ data.filters.sort_dir }}">
+                <label>
+                    股票代码
+                    <input type="text" name="query_symbol" value="{{ data.filters.query_symbol or '' }}" placeholder="例如 600000">
+                </label>
+                <button type="submit">查询个股评分</button>
+            </form>
+
+            {% if data.filters.query_symbol and data.searched_stock %}
+            <div class="lookup-card">
+                <div class="section-title">
+                    <div>
+                        <h2>{{ data.searched_stock.name }} {{ data.searched_stock.symbol }}</h2>
+                        <p class="summary-block">{{ data.searched_stock.summary }}</p>
+                    </div>
+                    <a class="detail-link" href="{{ url_for('stock_detail', symbol=data.searched_stock.symbol, return_to='results', page=data.page, min_score=data.filters.min_score, min_pct_change=data.filters.min_pct_change, sector=data.filters.sector, sort_by=data.filters.sort_by, sort_dir=data.filters.sort_dir) }}">查看详情</a>
+                </div>
+                <div class="stats compact-stats">
+                    <article class="card">
+                        <span>评分</span>
+                        <strong>{{ data.searched_stock.score }}</strong>
+                    </article>
+                    <article class="card">
+                        <span>现价</span>
+                        <strong>{{ data.searched_stock.latest_price }}</strong>
+                    </article>
+                    <article class="card">
+                        <span>涨跌幅</span>
+                        <strong class="{{ 'up' if data.searched_stock.pct_change >= 0 else 'down' }}">{{ data.searched_stock.pct_change }}%</strong>
+                    </article>
+                    <article class="card">
+                        <span>板块</span>
+                        <strong>{{ data.searched_stock.sector }}</strong>
+                    </article>
+                </div>
+                <div class="badges">
+                    {% for signal in data.searched_stock.signals %}
+                    <span class="badge">{{ signal }}</span>
+                    {% endfor %}
+                </div>
+                <div class="score-breakdown">
+                    {% for item in data.searched_stock.score_breakdown %}
+                    <div class="score-row {{ 'matched' if item.matched else 'missed' }}">
+                        <div class="score-row-main">
+                            <span class="score-label">{{ item.label }}</span>
+                            <span class="score-state">{{ '已命中' if item.matched else '未命中' }}</span>
+                            {% if item.comment %}
+                            <span class="score-comment">{{ item.comment }}</span>
+                            {% endif %}
+                        </div>
+                        <div class="score-values">
+                            <strong>{{ '%.1f'|format(item.score) }}</strong>
+                            <span>/ {{ item.weight }}</span>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% elif data.filters.query_symbol %}
+            <p class="summary-block">没有找到代码为 {{ data.filters.query_symbol }} 的最新评分详情，请确认代码是否存在，或先执行一次全量扫描。</p>
+            {% endif %}
         </section>
 
         <section class="table-wrap">

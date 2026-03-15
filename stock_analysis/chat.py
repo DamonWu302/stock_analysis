@@ -131,20 +131,27 @@ class StockChatService:
         algorithm_text = """
 本系统当前评分算法如下，请把它当作固定前置规则来理解：
 1. 均线多头，权重24分：
-   要求 MA5 > MA10 > MA20 > MA60，且收盘价站上 MA20，且 MA20 相比前一日继续上行。
-   其中 MA20 > MA60 是长期趋势门槛，如果这一条不成立，即使短期均线和股价表现较强，也只应保留少量分数。
+   使用 5 条均线 MA5 / MA10 / MA20 / MA30 / MA60，比较 4 组相邻关系：
+   MA5>MA10、MA10>MA20、MA20>MA30、MA30>MA60。
+   每组满分 6 分，总分 24 分。
+   系统不是简单二值判断，而是用 (短期均线-长期均线)/价格 的比例做平滑评分：
+   当该比例达到约 0.5% 时，该组拿满分；低于阈值按比例给分，低于 0 则记 0 分。
+   最终再对最近 5 个交易日做加权滑动平均，得到 0-24 的浮点分。
+   因此即使某一天没有形成标准多头，若最近几天均线关系持续改善，也可能保留部分分数。
 2. 放量上涨 + 缩量回调，权重20分：
    最近10个交易日里，至少出现一次涨幅大于2%且成交量大于5日均量1.5倍的放量上涨，
    同时也至少出现一次跌幅不超过2%且成交量小于5日均量0.8倍的缩量整理。
 3. 资金流入 + 板块强势，权重18分：
    主力净流入占比 > 5%，板块涨幅强于大盘，并且板块内上涨家数占比 > 60%。
 4. 低位启动突破，权重16分：
-   当前收盘价距离近120日最低收盘价涨幅不超过30%，同时收盘价要对前20日高点形成明确突破。
+   当前收盘价距离近120日最低收盘价不宜过远，同时也会结合 ATR 评估是否仍处于相对低位。
+   在此基础上，再判断收盘价是否对前20日高点形成明确突破。
    仅仅接近前20日高点可以拿到少量平滑分，但如果没有实际突破，不应给高分；
    一旦已经明确站上前20日高点，应显著提高该项得分。
 5. 突破后未破位，权重12分：
    这一项必须建立在“已经形成有效突破”的前提上；如果突破本身不成立，这一项应接近 0 分。
-   只有突破成立后，最近4个交易日最低价始终高于突破位的98%，才应获得较高分。
+   防守位不是固定 98%，而是结合 ATR 动态设定，以适应不同波动率股票。
+   同时还会考虑“突破新鲜度”：突破越新，守位信号越有效；突破时间过久，这一项权重会自然衰减。
 6. 大盘共振，权重10分：
    大盘收盘站上 MA20，且 MA20 相比前一日继续上行。
 
@@ -286,7 +293,7 @@ class StockChatService:
         df = df.dropna(subset=["close", "high"]).sort_values("trade_date").reset_index(drop=True)
         if df.empty:
             return "暂无数据"
-        for window in [20, 60]:
+        for window in [20, 30, 60]:
             df[f"ma{window}"] = df["close"].rolling(window).mean()
         latest = df.iloc[-1]
         low_120 = df["close"].tail(120).min() if len(df) >= 1 else None
@@ -294,6 +301,7 @@ class StockChatService:
         return (
             f"- 最新收盘价: {StockChatService._fmt_number(latest['close'])}\n"
             f"- MA20: {StockChatService._fmt_number(latest['ma20'])}\n"
+            f"- MA30: {StockChatService._fmt_number(latest['ma30'])}\n"
             f"- MA60: {StockChatService._fmt_number(latest['ma60'])}\n"
             f"- 近120日最低收盘价: {StockChatService._fmt_number(low_120)}\n"
             f"- 前20日高点(不含当日): {StockChatService._fmt_number(prior_20_high)}"
