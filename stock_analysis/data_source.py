@@ -30,6 +30,9 @@ class MarketDataProvider(ABC):
     def fetch_benchmark_history(self, days: int) -> pd.DataFrame:
         raise NotImplementedError
 
+    def latest_trade_date(self) -> str:
+        return datetime.now().date().isoformat()
+
 
 class MockDataProvider(MarketDataProvider):
     name = "mock"
@@ -46,6 +49,10 @@ class MockDataProvider(MarketDataProvider):
 
     def fetch_benchmark_history(self, days: int) -> pd.DataFrame:
         return generate_benchmark(days=days)
+
+    def latest_trade_date(self) -> str:
+        history = generate_benchmark(days=5)
+        return str(history["trade_date"].iloc[-1])
 
 
 class AkshareDataProvider(MarketDataProvider):
@@ -140,6 +147,10 @@ class AkshareDataProvider(MarketDataProvider):
     def fetch_benchmark_history(self, days: int) -> pd.DataFrame:
         return generate_benchmark(days=days)
 
+    def latest_trade_date(self) -> str:
+        history = generate_benchmark(days=5)
+        return str(history["trade_date"].iloc[-1])
+
 
 class BaostockDataProvider(MarketDataProvider):
     name = "baostock"
@@ -152,6 +163,7 @@ class BaostockDataProvider(MarketDataProvider):
         self.bs = bs
         self._login()
         self._industry_map = self._load_industry_map()
+        self._latest_trade_day: str | None = None
 
     def __del__(self) -> None:
         try:
@@ -166,6 +178,7 @@ class BaostockDataProvider(MarketDataProvider):
 
     def fetch_market_snapshot(self, limit: int) -> pd.DataFrame:
         trading_day, rows = self._query_all_stock_with_fallback()
+        self._latest_trade_day = trading_day
         frame = pd.DataFrame(rows, columns=["symbol", "trade_status", "name"])
         if frame.empty:
             raise RuntimeError(f"baostock 在 {trading_day} 没有返回股票列表。")
@@ -245,6 +258,13 @@ class BaostockDataProvider(MarketDataProvider):
         )
         return frame[["trade_date", "open", "close", "high", "low", "volume", "amount"]].tail(days).reset_index(drop=True)
 
+    def latest_trade_date(self) -> str:
+        if self._latest_trade_day:
+            return self._latest_trade_day
+        trading_day, _ = self._query_all_stock_with_fallback()
+        self._latest_trade_day = trading_day
+        return trading_day
+
     def _load_industry_map(self) -> dict[str, str]:
         rs = self.bs.query_stock_industry()
         if rs.error_code != "0":
@@ -285,7 +305,7 @@ class BaostockDataProvider(MarketDataProvider):
 
     @staticmethod
     def _candidate_trade_days() -> list[str]:
-        start = datetime.now() - timedelta(days=1)
+        start = datetime.now()
         return [(start - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(10)]
 
     def _query_all_stock_with_fallback(self) -> tuple[str, list[list[str]]]:

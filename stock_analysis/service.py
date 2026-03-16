@@ -26,6 +26,7 @@ class StockAnalysisService:
         self.db = Database(settings.database_path)
         self.db.initialize()
         self._last_cache_mode = "unknown"
+        self._recover_stale_tasks()
 
     def start_background_run(self, provider_name: str | None = None, limit: int | None = None) -> int:
         provider_name = provider_name or settings.default_provider
@@ -71,9 +72,12 @@ class StockAnalysisService:
     def run(self, provider_name: str | None = None, limit: int | None = None, task_id: int | None = None) -> dict:
         provider_name = provider_name or settings.default_provider
         provider = build_provider(provider_name)
+        if task_id:
+            self._update_task(task_id, message="正在加载股票池", progress_current=0, progress_total=0)
         snapshot = provider.fetch_market_snapshot(limit=limit or settings.analysis_limit)
+        trade_date = provider.latest_trade_date()
         cache_stats = CacheStats()
-        benchmark = self._get_benchmark_with_cache(provider, settings.history_days, cache_stats)
+        benchmark = self._get_benchmark_with_cache(provider, settings.history_days, cache_stats, trade_date)
 
         if task_id:
             self._update_task(task_id, progress_total=len(snapshot), message="股票池加载完成，开始扫描")
@@ -82,7 +86,7 @@ class StockAnalysisService:
         results: list[AnalysisResult] = []
 
         for index, (_, stock) in enumerate(snapshot.iterrows(), start=1):
-            history = self._get_history_with_cache(provider, str(stock["symbol"]), settings.history_days, cache_stats)
+            history = self._get_history_with_cache(provider, str(stock["symbol"]), settings.history_days, cache_stats, trade_date)
             if history.empty:
                 continue
             self._save_history(str(stock["symbol"]), history)
@@ -120,7 +124,6 @@ class StockAnalysisService:
         results.sort(key=lambda item: (item.score, item.pct_change), reverse=True)
         top_results = results[: settings.top_n]
 
-        trade_date = datetime.now().date().isoformat()
         self._save_snapshot(trade_date, enriched_snapshot)
         run_id = self._save_run(provider.name, benchmark, len(enriched_snapshot), top_results, cache_stats)
 
@@ -250,9 +253,11 @@ class StockAnalysisService:
         with self.db.connect() as conn:
             latest_row = conn.execute(
                 """
-                SELECT run_id, symbol, name, score, latest_price, pct_change, sector, summary, signals,
-                       score_breakdown, score_source, review_updated_at
-                FROM analysis_result
+                SELECT ar.run_id, ar.symbol, ar.name, ar.score, ar.latest_price, ar.pct_change, ar.sector,
+                       ar.summary, ar.signals, ar.score_breakdown, ar.score_source, ar.review_updated_at,
+                       r.created_at AS run_created_at
+                FROM analysis_result ar
+                LEFT JOIN analysis_run r ON ar.run_id = r.id
                 WHERE symbol = ?
                 ORDER BY run_id DESC
                 LIMIT 1
@@ -279,7 +284,7 @@ class StockAnalysisService:
             ).fetchall()
             snapshot_row = conn.execute(
                 """
-                SELECT symbol, name, latest_price, pct_change, volume, amount, sector,
+                SELECT trade_date, symbol, name, latest_price, pct_change, volume, amount, sector,
                        sector_change, sector_up_ratio, main_net_inflow, main_net_inflow_ratio
                 FROM market_snapshot
                 WHERE trade_date = (SELECT MAX(trade_date) FROM market_snapshot)
@@ -311,17 +316,28 @@ class StockAnalysisService:
         if not history_rows or not snapshot_row or not benchmark_rows:
             return None
 
-        if latest_row:
+        snapshot_trade_date = str(snapshot_row["trade_date"])
+        history_df = pd.DataFrame([dict(row) for row in history_rows])
+        benchmark_df = pd.DataFrame([dict(row) for row in benchmark_rows])
+        snapshot = pd.Series(dict(snapshot_row))
+        computed = score_stock(snapshot, history_df, benchmark_df)
+        if not computed:
+            return None
+
+        use_saved_ai_score = bool(
+            latest_row
+            and latest_row["score_source"] == "ai"
+            and latest_row["review_updated_at"]
+            and str(latest_row["review_updated_at"])[:10] >= snapshot_trade_date
+        )
+
+        if use_saved_ai_score:
             detail = dict(latest_row)
             detail["signals"] = json.loads(detail["signals"])
             saved_breakdown = json.loads(detail["score_breakdown"]) if detail.get("score_breakdown") else []
         else:
-            snapshot = pd.Series(dict(snapshot_row))
-            computed = score_stock(snapshot, pd.DataFrame([dict(row) for row in history_rows]), pd.DataFrame([dict(row) for row in benchmark_rows]))
-            if not computed:
-                return None
             detail = {
-                "run_id": None,
+                "run_id": latest_row["run_id"] if latest_row else None,
                 "symbol": computed.symbol,
                 "name": computed.name,
                 "score": computed.score,
@@ -332,7 +348,7 @@ class StockAnalysisService:
                 "signals": computed.signals,
                 "score_breakdown": computed.score_breakdown,
                 "score_source": "system",
-                "review_updated_at": None,
+                "review_updated_at": latest_row["review_updated_at"] if latest_row else None,
             }
             saved_breakdown = computed.score_breakdown
 
@@ -410,6 +426,19 @@ class StockAnalysisService:
             )
 
         return self.stock_detail(symbol)
+
+    def _recover_stale_tasks(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE analysis_task
+                SET status = 'failed',
+                    finished_at = ?,
+                    message = '任务在应用重启前中断，请重新发起扫描'
+                WHERE status = 'running'
+                """,
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
 
     def _update_task(self, task_id: int, **fields) -> None:
         if not fields:
@@ -508,9 +537,9 @@ class StockAnalysisService:
             return pd.DataFrame(columns=["trade_date", "open", "close", "high", "low", "volume", "amount"])
         return pd.DataFrame([dict(row) for row in rows]).tail(days).reset_index(drop=True)
 
-    def _get_history_with_cache(self, provider, symbol: str, days: int, cache_stats: CacheStats) -> pd.DataFrame:
+    def _get_history_with_cache(self, provider, symbol: str, days: int, cache_stats: CacheStats, trade_date: str) -> pd.DataFrame:
         cached = self._load_cached_history(symbol, days)
-        mode, history = self._resolve_history_cache(provider, symbol, days, cached, benchmark=False)
+        mode, history = self._resolve_history_cache(provider, symbol, days, cached, benchmark=False, target_trade_date=trade_date)
         self._last_cache_mode = mode
         if mode == "hit":
             cache_stats.cache_hits += 1
@@ -520,20 +549,29 @@ class StockAnalysisService:
             cache_stats.full_refreshes += 1
         return history
 
-    def _get_benchmark_with_cache(self, provider, days: int, cache_stats: CacheStats) -> pd.DataFrame:
+    def _get_benchmark_with_cache(self, provider, days: int, cache_stats: CacheStats, trade_date: str) -> pd.DataFrame:
         cached = self._load_cached_benchmark("000001", days)
-        mode, history = self._resolve_history_cache(provider, "000001", days, cached, benchmark=True)
+        mode, history = self._resolve_history_cache(provider, "000001", days, cached, benchmark=True, target_trade_date=trade_date)
         cache_stats.benchmark_cache_mode = mode
         self._save_benchmark_history("000001", history)
         return history
 
-    def _resolve_history_cache(self, provider, symbol: str, days: int, cached: pd.DataFrame, benchmark: bool) -> tuple[str, pd.DataFrame]:
+    def _resolve_history_cache(
+        self,
+        provider,
+        symbol: str,
+        days: int,
+        cached: pd.DataFrame,
+        benchmark: bool,
+        target_trade_date: str,
+    ) -> tuple[str, pd.DataFrame]:
         if cached.empty:
             fresh = provider.fetch_benchmark_history(days=days) if benchmark else provider.fetch_stock_history(symbol=symbol, days=days)
             return "full", fresh
 
         latest_cached_date = pd.to_datetime(cached["trade_date"]).max().date()
-        cache_is_fresh = latest_cached_date >= (datetime.now().date() - timedelta(days=3))
+        expected_trade_date = pd.to_datetime(target_trade_date).date()
+        cache_is_fresh = latest_cached_date >= expected_trade_date
         if len(cached) >= days and cache_is_fresh:
             return "hit", cached.tail(days).reset_index(drop=True)
 
