@@ -142,7 +142,10 @@ class StockChatService:
    最近10个交易日里，至少出现一次涨幅大于2%且成交量大于5日均量1.5倍的放量上涨，
    同时也至少出现一次跌幅不超过2%且成交量小于5日均量0.8倍的缩量整理。
 3. 资金流入 + 板块强势，权重18分：
-   主力净流入占比 > 5%，板块涨幅强于大盘，并且板块内上涨家数占比 > 60%。
+   使用资金流向指标替代主力净流入占比：
+   - CMF(21) > 0.05 可视为资金净流入较强；
+   - MFI(14) > 60 代表资金买盘压力偏强，> 70 可视为更强确认；
+   同时要求板块涨幅强于大盘，并且板块内上涨家数占比 > 60%。
 4. 低位启动突破，权重16分：
    当前收盘价距离近120日最低收盘价不宜过远，同时也会结合 ATR 评估是否仍处于相对低位。
    在此基础上，再判断收盘价是否对前20日高点形成明确突破。
@@ -289,12 +292,16 @@ class StockChatService:
         df = pd.DataFrame(history).copy()
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         df["high"] = pd.to_numeric(df["high"], errors="coerce")
+        df["low"] = pd.to_numeric(df["low"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
         df["trade_date"] = pd.to_datetime(df["trade_date"])
-        df = df.dropna(subset=["close", "high"]).sort_values("trade_date").reset_index(drop=True)
+        df = df.dropna(subset=["close", "high", "low", "volume"]).sort_values("trade_date").reset_index(drop=True)
         if df.empty:
             return "暂无数据"
         for window in [20, 30, 60]:
             df[f"ma{window}"] = df["close"].rolling(window).mean()
+        df["cmf21"] = StockChatService._compute_cmf(df, window=21)
+        df["mfi14"] = StockChatService._compute_mfi(df, window=14)
         latest = df.iloc[-1]
         low_120 = df["close"].tail(120).min() if len(df) >= 1 else None
         prior_20_high = df["high"].rolling(20).max().shift(1).iloc[-1] if len(df) >= 21 else None
@@ -303,6 +310,8 @@ class StockChatService:
             f"- MA20: {StockChatService._fmt_number(latest['ma20'])}\n"
             f"- MA30: {StockChatService._fmt_number(latest['ma30'])}\n"
             f"- MA60: {StockChatService._fmt_number(latest['ma60'])}\n"
+            f"- CMF(21): {StockChatService._fmt_percent(latest['cmf21'])}\n"
+            f"- MFI(14): {StockChatService._fmt_number(latest['mfi14'])}\n"
             f"- 近120日最低收盘价: {StockChatService._fmt_number(low_120)}\n"
             f"- 前20日高点(不含当日): {StockChatService._fmt_number(prior_20_high)}"
         )
@@ -333,3 +342,31 @@ class StockChatService:
         if value is None or pd.isna(value):
             return "暂无数据"
         return f"{float(value):.2f}"
+
+    @staticmethod
+    def _fmt_percent(value: Any) -> str:
+        if value is None or pd.isna(value):
+            return "暂无数据"
+        return f"{float(value):.2%}"
+
+    @staticmethod
+    def _compute_cmf(df: pd.DataFrame, window: int = 21) -> pd.Series:
+        price_span = (df["high"] - df["low"]).replace(0, pd.NA)
+        multiplier = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / price_span
+        multiplier = multiplier.fillna(0.0)
+        money_flow_volume = multiplier * df["volume"]
+        volume_sum = df["volume"].rolling(window).sum().replace(0, pd.NA)
+        return (money_flow_volume.rolling(window).sum() / volume_sum).fillna(0.0)
+
+    @staticmethod
+    def _compute_mfi(df: pd.DataFrame, window: int = 14) -> pd.Series:
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        raw_money_flow = typical_price * df["volume"]
+        price_delta = typical_price.diff()
+        positive_flow = raw_money_flow.where(price_delta > 0, 0.0)
+        negative_flow = raw_money_flow.where(price_delta < 0, 0.0).abs()
+        positive_sum = positive_flow.rolling(window).sum()
+        negative_sum = negative_flow.rolling(window).sum()
+        money_ratio = positive_sum / negative_sum.replace(0, pd.NA)
+        mfi = 100 - (100 / (1 + money_ratio))
+        return mfi.fillna(50.0)

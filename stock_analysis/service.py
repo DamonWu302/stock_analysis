@@ -535,7 +535,8 @@ class StockAnalysisService:
             ).fetchall()
         if not rows:
             return pd.DataFrame(columns=["trade_date", "open", "close", "high", "low", "volume", "amount"])
-        return pd.DataFrame([dict(row) for row in rows]).tail(days).reset_index(drop=True)
+        frame = pd.DataFrame([dict(row) for row in rows])
+        return self._sanitize_benchmark_history(frame).tail(days).reset_index(drop=True)
 
     def _get_history_with_cache(self, provider, symbol: str, days: int, cache_stats: CacheStats, trade_date: str) -> pd.DataFrame:
         cached = self._load_cached_history(symbol, days)
@@ -552,6 +553,7 @@ class StockAnalysisService:
     def _get_benchmark_with_cache(self, provider, days: int, cache_stats: CacheStats, trade_date: str) -> pd.DataFrame:
         cached = self._load_cached_benchmark("000001", days)
         mode, history = self._resolve_history_cache(provider, "000001", days, cached, benchmark=True, target_trade_date=trade_date)
+        history = self._sanitize_benchmark_history(history)
         cache_stats.benchmark_cache_mode = mode
         self._save_benchmark_history("000001", history)
         return history
@@ -567,6 +569,8 @@ class StockAnalysisService:
     ) -> tuple[str, pd.DataFrame]:
         if cached.empty:
             fresh = provider.fetch_benchmark_history(days=days) if benchmark else provider.fetch_stock_history(symbol=symbol, days=days)
+            if benchmark:
+                fresh = self._sanitize_benchmark_history(fresh)
             return "full", fresh
 
         latest_cached_date = pd.to_datetime(cached["trade_date"]).max().date()
@@ -577,12 +581,15 @@ class StockAnalysisService:
 
         if len(cached) < days:
             fresh = provider.fetch_benchmark_history(days=days) if benchmark else provider.fetch_stock_history(symbol=symbol, days=days)
+            if benchmark:
+                fresh = self._sanitize_benchmark_history(fresh)
             return "full", self._merge_history(cached, fresh, days)
 
         incremental_start = (latest_cached_date + timedelta(days=1)).isoformat()
         if benchmark:
             fresh = provider.fetch_benchmark_history(days=days)
             fresh = fresh[fresh["trade_date"] >= incremental_start].reset_index(drop=True)
+            fresh = self._sanitize_benchmark_history(fresh)
         else:
             fresh = provider.fetch_stock_history_since(symbol=symbol, start_date=incremental_start, days=days)
 
@@ -697,6 +704,35 @@ class StockAnalysisService:
         merged = pd.concat([cached, incoming], ignore_index=True) if not cached.empty else incoming.copy()
         merged = merged.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
         return merged.tail(days).reset_index(drop=True)
+
+    @staticmethod
+    def _sanitize_benchmark_history(history: pd.DataFrame) -> pd.DataFrame:
+        if history.empty:
+            return history
+
+        frame = history.copy()
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        for column in ["open", "close", "high", "low", "volume", "amount"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+        frame = frame.dropna(subset=["trade_date", "close"]).sort_values("trade_date").reset_index(drop=True)
+        positive = frame[frame["close"] > 0].copy()
+        if positive.empty:
+            return frame
+
+        median_close = float(positive["close"].median())
+        if median_close <= 0:
+            return frame
+
+        lower_bound = median_close * 0.5
+        upper_bound = median_close * 1.5
+        cleaned = positive[(positive["close"] >= lower_bound) & (positive["close"] <= upper_bound)].copy()
+        if cleaned.empty:
+            cleaned = frame
+
+        cleaned = cleaned.reset_index(drop=True)
+        cleaned["trade_date"] = cleaned["trade_date"].dt.strftime("%Y-%m-%d")
+        return cleaned
 
     @staticmethod
     def _hydrate_snapshot_from_history(snapshot: pd.Series, history: pd.DataFrame) -> pd.Series:

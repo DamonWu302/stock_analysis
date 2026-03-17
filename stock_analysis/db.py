@@ -169,6 +169,7 @@ class Database:
                 "run_id": "INTEGER",
             },
         )
+        Database._cleanup_benchmark_history(conn)
 
     @staticmethod
     def _ensure_columns(conn: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:
@@ -183,3 +184,12 @@ class Database:
                 except sqlite3.OperationalError as exc:
                     if "duplicate column name" not in str(exc).lower():
                         raise
+
+    @staticmethod
+    def _cleanup_benchmark_history(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            DELETE FROM benchmark_history
+            WHERE symbol = '000001' AND close IS NOT NULL AND close < 1000
+            """
+        )

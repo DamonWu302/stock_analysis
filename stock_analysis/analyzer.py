@@ -130,6 +130,28 @@ def _compute_breakout_freshness(df: pd.DataFrame, lookback: int = 15) -> tuple[f
     return freshness, age
 
 
+def _compute_cmf(df: pd.DataFrame, window: int = 21) -> pd.Series:
+    price_span = (df["high"] - df["low"]).replace(0, pd.NA)
+    multiplier = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / price_span
+    multiplier = multiplier.fillna(0.0)
+    money_flow_volume = multiplier * df["volume"]
+    volume_sum = df["volume"].rolling(window).sum().replace(0, pd.NA)
+    return (money_flow_volume.rolling(window).sum() / volume_sum).fillna(0.0)
+
+
+def _compute_mfi(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    raw_money_flow = typical_price * df["volume"]
+    price_delta = typical_price.diff()
+    positive_flow = raw_money_flow.where(price_delta > 0, 0.0)
+    negative_flow = raw_money_flow.where(price_delta < 0, 0.0).abs()
+    positive_sum = positive_flow.rolling(window).sum()
+    negative_sum = negative_flow.rolling(window).sum()
+    money_ratio = positive_sum / negative_sum.replace(0, pd.NA)
+    mfi = 100 - (100 / (1 + money_ratio))
+    return mfi.fillna(50.0)
+
+
 def build_score_breakdown(snapshot: pd.Series, history: pd.DataFrame, benchmark_history: pd.DataFrame) -> list[dict[str, Any]]:
     if history.empty or len(history) < 60:
         return []
@@ -154,16 +176,23 @@ def build_score_breakdown(snapshot: pd.Series, history: pd.DataFrame, benchmark_
     volume_progress = _safe_mean(float(recent["up_score"].max()), float(recent["pullback_score"].max()))
     volume_comment = f"近10日放量上涨强度 {recent['up_score'].max():.0%}，缩量整理强度 {recent['pullback_score'].max():.0%}"
 
-    inflow_ratio = float(snapshot.get("main_net_inflow_ratio", 0) or 0)
+    df["cmf21"] = _compute_cmf(df, window=21)
+    df["mfi14"] = _compute_mfi(df, window=14)
+    latest_cmf = float(df["cmf21"].iloc[-1])
+    latest_mfi = float(df["mfi14"].iloc[-1])
     sector_change = float(snapshot.get("sector_change", 0) or 0)
     sector_up_ratio = float(snapshot.get("sector_up_ratio", 0) or 0)
     benchmark_pct = float(benchmark_latest["pct_change"] * 100)
     capital_progress = _safe_mean(
-        _ratio_over(inflow_ratio, 0.05),
+        _range_ratio(latest_cmf, 0.05, 0.20),
+        _range_ratio(latest_mfi, 60, 80),
         1.0 if sector_change > benchmark_pct else _ratio_over(sector_change - benchmark_pct + 0.5, 1.0),
         _ratio_over(sector_up_ratio, 0.6),
     )
-    capital_comment = f"主力净流入占比 {inflow_ratio:.2%}，板块涨幅 {sector_change:.2f}% ，上涨占比 {sector_up_ratio:.0%}"
+    capital_comment = (
+        f"CMF(21) {latest_cmf:.2%}，MFI(14) {latest_mfi:.1f}，"
+        f"板块涨幅 {sector_change:.2f}% ，上涨占比 {sector_up_ratio:.0%}"
+    )
 
     rolling_low = float(df["close"].tail(120).min())
     prior_20_high = float(df["prior_20_high"].iloc[-1])
@@ -207,11 +236,16 @@ def build_score_breakdown(snapshot: pd.Series, history: pd.DataFrame, benchmark_
         f"突破新鲜度 {freshness:.0%}{breakout_age_text}"
     )
 
+    benchmark_close_ratio = float(benchmark_latest["close"]) / max(float(benchmark_latest["ma20"]), 0.01)
+    benchmark_ma20_ratio = float(benchmark_latest["ma20"]) / max(float(benchmark_prev["ma20"]), 0.01)
     benchmark_progress = _safe_mean(
-        _ratio_over(float(benchmark_latest["close"]), float(benchmark_latest["ma20"])),
-        1.0 if benchmark_latest["ma20"] > benchmark_prev["ma20"] else _ratio_over(float(benchmark_latest["ma20"]), float(benchmark_prev["ma20"])),
+        _range_ratio(benchmark_close_ratio, 1.0, 1.02),
+        _range_ratio(benchmark_ma20_ratio, 1.0, 1.002),
     )
-    benchmark_comment = f"指数收盘相对 MA20 为 {float(benchmark_latest['close']) / float(benchmark_latest['ma20']):.2f} 倍"
+    benchmark_comment = (
+        f"指数收盘/MA20 {benchmark_close_ratio:.4f}，"
+        f"MA20 相对前一日 {benchmark_ma20_ratio:.4f}"
+    )
 
     return [
         _score_item("均线多头", 24, ma_progress, 0.75, ma_comment),
