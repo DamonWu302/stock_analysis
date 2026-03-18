@@ -19,6 +19,7 @@
                 <p class="subtitle">{{ task.message or '等待任务更新' }}</p>
             </div>
             <div class="detail-stats">
+                <div class="mini-card"><span>阶段</span><strong>{{ task.phase_label }}</strong></div>
                 <div class="mini-card"><span>状态</span><strong>{{ task.status }}</strong></div>
                 <div class="mini-card"><span>数据源</span><strong>{{ task.provider }}</strong></div>
                 <div class="mini-card"><span>进度</span><strong>{{ task.progress_current }}/{{ task.progress_total }}</strong></div>
@@ -52,6 +53,14 @@
             <article class="card">
                 <span>指数缓存</span>
                 <strong>{{ task.benchmark_cache_mode or '-' }}</strong>
+            </article>
+            <article class="card">
+                <span>单只平均耗时</span>
+                <strong>{{ task.avg_item_text }}</strong>
+            </article>
+            <article class="card">
+                <span>预计完成时间</span>
+                <strong>{{ task.eta_text|fmt_dt }}</strong>
             </article>
         </section>
 
@@ -96,8 +105,10 @@
                     {% endif %}
                 </div>
             </div>
-            <p class="summary-block">开始时间：{{ task.started_at }}</p>
-            <p class="summary-block">结束时间：{{ task.finished_at or '运行中' }}</p>
+            <p class="summary-block">开始时间：{{ task.started_at|fmt_dt }}</p>
+            <p class="summary-block">结束时间：{{ (task.finished_at or '运行中')|fmt_dt }}</p>
+            <p class="summary-block">单只平均耗时：{{ task.avg_item_text }}</p>
+            <p class="summary-block">预计完成时间：{{ task.eta_text|fmt_dt }}</p>
             <p class="summary-block">当前说明：{{ task.message or '无' }}</p>
         </section>
 
@@ -128,7 +139,7 @@
                         <td>{{ item.latest_price }}</td>
                         <td class="{{ 'up' if item.pct_change >= 0 else 'down' }}">{{ item.pct_change }}%</td>
                         <td>{{ item.score }}</td>
-                        <td>{{ item.updated_at }}</td>
+                        <td>{{ item.updated_at|fmt_dt }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>

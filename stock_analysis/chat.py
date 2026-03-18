@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 import json
+import socket
 
 import pandas as pd
 import requests
@@ -16,25 +17,28 @@ class StockChatService:
             raise RuntimeError("未配置 LLM_API_KEY，暂时无法使用股票对话功能。")
 
         prompt = self._build_prompt(detail, user_message, history or [])
-        response = requests.post(
-            f"{settings.llm_api_base.rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.llm_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.llm_model,
-                "messages": prompt,
-                "temperature": 0.4,
-            },
-            timeout=settings.llm_timeout_seconds,
-        )
+        try:
+            response = requests.post(
+                f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.llm_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.llm_model,
+                    "messages": prompt,
+                    "temperature": 0.4,
+                },
+                timeout=settings.llm_timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(self._format_llm_connection_error(exc)) from exc
         if not response.ok:
             try:
                 error_payload = response.json()
             except Exception:
                 error_payload = response.text
-            raise RuntimeError(f"模型接口请求失败：HTTP {response.status_code}，返回内容：{error_payload}")
+            raise RuntimeError(f"llm api request failed: HTTP {response.status_code}, payload: {error_payload}")
 
         payload = response.json()
         return payload["choices"][0]["message"]["content"].strip()
@@ -49,45 +53,48 @@ class StockChatService:
             raise RuntimeError("未配置 LLM_API_KEY，暂时无法使用股票对话功能。")
 
         prompt = self._build_prompt(detail, user_message, history or [])
-        with requests.post(
-            f"{settings.llm_api_base.rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.llm_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.llm_model,
-                "messages": prompt,
-                "temperature": 0.4,
-                "stream": True,
-            },
-            timeout=settings.llm_timeout_seconds,
-            stream=True,
-        ) as response:
-            if not response.ok:
-                try:
-                    error_payload = response.json()
-                except Exception:
-                    error_payload = response.text
-                raise RuntimeError(f"模型接口请求失败：HTTP {response.status_code}，返回内容：{error_payload}")
+        try:
+            with requests.post(
+                f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.llm_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.llm_model,
+                    "messages": prompt,
+                    "temperature": 0.4,
+                    "stream": True,
+                },
+                timeout=settings.llm_timeout_seconds,
+                stream=True,
+            ) as response:
+                if not response.ok:
+                    try:
+                        error_payload = response.json()
+                    except Exception:
+                        error_payload = response.text
+                    raise RuntimeError(f"llm api request failed: HTTP {response.status_code}, payload: {error_payload}")
 
-            for raw_line in response.iter_lines(decode_unicode=True):
-                if not raw_line:
-                    continue
-                line = raw_line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    payload = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                delta = payload.get("choices", [{}])[0].get("delta", {})
-                content = delta.get("content")
-                if content:
-                    yield content
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    line = raw_line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = payload.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+        except requests.RequestException as exc:
+            raise RuntimeError(self._format_llm_connection_error(exc)) from exc
 
     @staticmethod
     def _build_prompt(detail: dict[str, Any], user_message: str, history: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -119,7 +126,10 @@ class StockChatService:
             f"- {item['label']}: {'已命中' if item['matched'] else '未命中'}，当前系统得分 {item['score']}/{item['weight']}"
             for item in score_breakdown
         ) or "暂无拆解数据"
-        stock_key_metrics = StockChatService._build_stock_key_metrics(detail.get("history", []))
+        stock_key_metrics = StockChatService._build_stock_key_metrics(
+            detail.get("history", []),
+            detail.get("daily_factor"),
+        )
         benchmark_key_metrics = StockChatService._build_benchmark_key_metrics(detail.get("benchmark_history", []))
 
         system = (
@@ -286,7 +296,18 @@ class StockChatService:
         return f"{change:.2f}%"
 
     @staticmethod
-    def _build_stock_key_metrics(history: list[dict[str, Any]]) -> str:
+    def _build_stock_key_metrics(history: list[dict[str, Any]], daily_factor: dict[str, Any] | None = None) -> str:
+        if daily_factor:
+            return (
+                f"- 最新收盘价: {StockChatService._fmt_number(daily_factor.get('close'))}\n"
+                f"- MA20: {StockChatService._fmt_number(daily_factor.get('ma20'))}\n"
+                f"- MA30: {StockChatService._fmt_number(daily_factor.get('ma30'))}\n"
+                f"- MA60: {StockChatService._fmt_number(daily_factor.get('ma60'))}\n"
+                f"- CMF(21): {StockChatService._fmt_percent(daily_factor.get('cmf21'))}\n"
+                f"- MFI(14): {StockChatService._fmt_number(daily_factor.get('mfi14'))}\n"
+                f"- 近120日最低收盘价: 暂未提供\n"
+                f"- 前20日高点(不含当日): {StockChatService._fmt_number(daily_factor.get('prior_20_high'))}"
+            )
         if not history:
             return "暂无数据"
         df = pd.DataFrame(history).copy()
@@ -370,3 +391,11 @@ class StockChatService:
         money_ratio = positive_sum / negative_sum.replace(0, pd.NA)
         mfi = 100 - (100 / (1 + money_ratio))
         return mfi.fillna(50.0)
+
+    @staticmethod
+    def _format_llm_connection_error(exc: requests.RequestException) -> str:
+        message = str(exc)
+        lower = message.lower()
+        if "10054" in lower or "reset" in lower or isinstance(getattr(exc, "__cause__", None), (ConnectionResetError, socket.error)):
+            return f"llm api connection reset: {message}"
+        return f"llm api request failed: {message}"

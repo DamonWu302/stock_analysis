@@ -42,6 +42,10 @@
         {% if task %}
         <section class="stats">
             <article class="card">
+                <span>任务阶段</span>
+                <strong>{{ task.phase_label }}</strong>
+            </article>
+            <article class="card">
                 <span>最近任务</span>
                 <strong>{{ task.status }}</strong>
             </article>

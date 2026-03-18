@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 import os
+import socket
 
 import pandas as pd
 import requests
@@ -154,6 +155,8 @@ class AkshareDataProvider(MarketDataProvider):
 
 class BaostockDataProvider(MarketDataProvider):
     name = "baostock"
+    _max_retries = 3
+    _retryable_error_keywords = ("网络接收错误", "网络通信错误", "连接", "reset", "10054", "timed out")
 
     def __init__(self) -> None:
         try:
@@ -172,9 +175,9 @@ class BaostockDataProvider(MarketDataProvider):
             pass
 
     def _login(self) -> None:
-        result = self.bs.login()
+        result = self._call_with_retry(self.bs.login, operation="login")
         if result.error_code != "0":
-            raise RuntimeError(f"baostock 登录失败：{result.error_msg}")
+            raise RuntimeError(f"baostock login failed: {result.error_msg}")
 
     def fetch_market_snapshot(self, limit: int) -> pd.DataFrame:
         trading_day, rows = self._query_all_stock_with_fallback()
@@ -211,16 +214,18 @@ class BaostockDataProvider(MarketDataProvider):
         return self._fetch_stock_history_range(symbol=symbol, start_date=start_date, end_date=end_date, days=days)
 
     def _fetch_stock_history_range(self, symbol: str, start_date: str, end_date: str, days: int) -> pd.DataFrame:
-        rs = self.bs.query_history_k_data_plus(
+        rs = self._call_with_retry(
+            self.bs.query_history_k_data_plus,
             self._to_bs_symbol(symbol),
             "date,code,open,high,low,close,volume,amount,pctChg",
             start_date=start_date,
             end_date=end_date,
             frequency="d",
             adjustflag="2",
+            operation=f"history {symbol}",
         )
         if rs.error_code != "0":
-            raise RuntimeError(f"baostock 历史数据获取失败：{rs.error_msg}")
+            raise RuntimeError(f"baostock history fetch failed for {symbol}: {rs.error_msg}")
 
         rows: list[list[str]] = []
         while rs.next():
@@ -239,15 +244,17 @@ class BaostockDataProvider(MarketDataProvider):
     def fetch_benchmark_history(self, days: int) -> pd.DataFrame:
         start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
         end_date = datetime.now().strftime("%Y-%m-%d")
-        rs = self.bs.query_history_k_data_plus(
+        rs = self._call_with_retry(
+            self.bs.query_history_k_data_plus,
             "sh.000001",
             "date,code,open,high,low,close,volume,amount,pctChg",
             start_date=start_date,
             end_date=end_date,
             frequency="d",
+            operation="benchmark history",
         )
         if rs.error_code != "0":
-            raise RuntimeError(f"baostock 指数历史获取失败：{rs.error_msg}")
+            raise RuntimeError(f"baostock benchmark fetch failed: {rs.error_msg}")
 
         rows: list[list[str]] = []
         while rs.next():
@@ -266,7 +273,7 @@ class BaostockDataProvider(MarketDataProvider):
         return trading_day
 
     def _load_industry_map(self) -> dict[str, str]:
-        rs = self.bs.query_stock_industry()
+        rs = self._call_with_retry(self.bs.query_stock_industry, operation="industry map")
         if rs.error_code != "0":
             return {}
         rows: list[list[str]] = []
@@ -310,7 +317,7 @@ class BaostockDataProvider(MarketDataProvider):
 
     def _query_all_stock_with_fallback(self) -> tuple[str, list[list[str]]]:
         for trading_day in self._candidate_trade_days():
-            rs = self.bs.query_all_stock(day=trading_day)
+            rs = self._call_with_retry(self.bs.query_all_stock, day=trading_day, operation=f"all stock {trading_day}")
             if rs.error_code != "0":
                 continue
             rows: list[list[str]] = []
@@ -318,7 +325,49 @@ class BaostockDataProvider(MarketDataProvider):
                 rows.append(rs.get_row_data())
             if rows:
                 return trading_day, rows
-        raise RuntimeError("baostock 最近 10 天都没有返回股票列表，请稍后再试。")
+        raise RuntimeError("baostock all stock query failed: no rows returned in the last 10 days")
+
+    def _call_with_retry(self, func, *args, operation: str, **kwargs):
+        last_exc: Exception | None = None
+        last_result = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                result = func(*args, **kwargs)
+                last_result = result
+                error_code = getattr(result, "error_code", "0")
+                error_msg = str(getattr(result, "error_msg", "") or "")
+                if error_code == "0":
+                    return result
+                if attempt < self._max_retries and self._is_retryable_error(error_msg):
+                    self._reconnect()
+                    continue
+                return result
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self._max_retries or not self._is_retryable_exception(exc):
+                    break
+                self._reconnect()
+        if last_exc:
+            raise RuntimeError(f"baostock network reset during {operation}: {last_exc}") from last_exc
+        error_msg = str(getattr(last_result, "error_msg", "") or "unknown error")
+        raise RuntimeError(f"baostock network reset during {operation}: {error_msg}")
+
+    def _reconnect(self) -> None:
+        try:
+            self.bs.logout()
+        except Exception:
+            pass
+        result = self.bs.login()
+        if result.error_code != "0":
+            raise RuntimeError(f"baostock network reset during reconnect: {result.error_msg}")
+
+    def _is_retryable_error(self, message: str) -> bool:
+        lower = message.lower()
+        return any(keyword in message or keyword in lower for keyword in self._retryable_error_keywords)
+
+    def _is_retryable_exception(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return isinstance(exc, (ConnectionError, TimeoutError, socket.error, OSError)) or "10054" in message or "reset" in message
 
 
 def build_provider(name: str) -> MarketDataProvider:

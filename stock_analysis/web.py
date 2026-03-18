@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, stream_with_context, url_for
@@ -21,6 +22,17 @@ def create_app() -> Flask:
     )
     service = StockAnalysisService()
     chat_service = StockChatService()
+
+    @app.template_filter("fmt_dt")
+    def format_datetime(value):
+        if value in (None, "", "-"):
+            return "-"
+        if value == "已完成":
+            return value
+        try:
+            return datetime.fromisoformat(str(value)).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return str(value)
 
     @app.get("/")
     def index():
@@ -94,6 +106,43 @@ def create_app() -> Flask:
         paged["page_numbers"] = _build_page_numbers(page, total_pages)
         paged["searched_stock"] = service.lookup_stock_score(query_symbol) if query_symbol else None
         return render_template("results.html", data=paged)
+
+    @app.get("/api/backtest/config")
+    def backtest_config():
+        return jsonify(service.backtest_config_schema())
+
+    @app.get("/api/backtest/runs")
+    def backtest_runs():
+        limit = max(int(request.args.get("limit", "20")), 1)
+        return jsonify({"runs": service.recent_backtests(limit=limit)})
+
+    @app.get("/api/backtest/runs/<int:run_id>")
+    def backtest_run_detail(run_id: int):
+        detail = service.backtest_detail(run_id)
+        if not detail:
+            return jsonify({"error": f"未找到回测 {run_id}"}), 404
+        return jsonify(detail)
+
+    @app.post("/api/backtest/runs")
+    def create_backtest_run():
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({"error": "回测配置格式不正确"}), 400
+        try:
+            result = service.run_backtest(payload)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+        return jsonify(result)
+
+    @app.post("/api/daily/backfill")
+    def backfill_daily_tables():
+        payload = request.get_json(silent=True) or {}
+        days = int(payload.get("days", 120) or 120)
+        try:
+            result = service.backfill_daily_tables(days=days)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+        return jsonify(result)
 
     @app.post("/analyze")
     def analyze():

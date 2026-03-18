@@ -3,11 +3,24 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 import json
+import sqlite3
 import threading
+import time
 
 import pandas as pd
 
-from .analyzer import AnalysisResult, build_score_breakdown, score_stock
+from .analyzer import (
+    AnalysisResult,
+    _prepare_history,
+    build_daily_factor_snapshot,
+    build_daily_factor_snapshot_prepared,
+    build_daily_score_snapshot,
+    build_daily_score_snapshot_prepared,
+    build_score_breakdown,
+    score_stock,
+)
+from .backtest import build_backtest_config_schema
+from .backtest_runner import BacktestRunner
 from .config import settings
 from .data_source import build_provider
 from .db import Database
@@ -19,12 +32,16 @@ class CacheStats:
     incremental_updates: int = 0
     full_refreshes: int = 0
     benchmark_cache_mode: str = "unknown"
+    stock_failures: int = 0
+    last_failure_symbol: str | None = None
+    last_failure_reason: str | None = None
 
 
 class StockAnalysisService:
     def __init__(self) -> None:
         self.db = Database(settings.database_path)
         self.db.initialize()
+        self.backtest_runner = BacktestRunner(self.db)
         self._last_cache_mode = "unknown"
         self._recover_stale_tasks()
 
@@ -34,10 +51,10 @@ class StockAnalysisService:
             cursor = conn.execute(
                 """
                 INSERT INTO analysis_task
-                (provider, status, started_at, progress_current, progress_total, message)
-                VALUES (?, ?, ?, 0, 0, ?)
+                (provider, status, phase, started_at, progress_current, progress_total, message)
+                VALUES (?, ?, ?, ?, 0, 0, ?)
                 """,
-                (provider_name, "running", datetime.now().isoformat(timespec="seconds"), "任务已创建，等待扫描"),
+                (provider_name, "running", "pending", datetime.now().isoformat(timespec="seconds"), "任务已创建，等待扫描"),
             )
             task_id = int(cursor.lastrowid)
 
@@ -51,8 +68,13 @@ class StockAnalysisService:
             self._update_task(
                 task_id,
                 status="completed",
+                phase="completed",
                 finished_at=datetime.now().isoformat(timespec="seconds"),
-                message="扫描完成",
+                message=(
+                    "扫描完成"
+                    if not result.get("stock_failures")
+                    else f"扫描完成，跳过 {result['stock_failures']} 只；最近失败 {result.get('last_failure_symbol') or '-'}: {self._short_error(result.get('last_failure_reason') or 'unknown')}"
+                ),
                 run_id=result["run_id"],
                 progress_current=result["sample_size"],
                 progress_total=result["sample_size"],
@@ -65,8 +87,9 @@ class StockAnalysisService:
             self._update_task(
                 task_id,
                 status="failed",
+                phase="failed",
                 finished_at=datetime.now().isoformat(timespec="seconds"),
-                message=str(exc),
+                message=self._format_task_error(exc),
             )
 
     def run(self, provider_name: str | None = None, limit: int | None = None, task_id: int | None = None) -> dict:
@@ -76,42 +99,68 @@ class StockAnalysisService:
             self._update_task(task_id, message="正在加载股票池", progress_current=0, progress_total=0)
         snapshot = provider.fetch_market_snapshot(limit=limit or settings.analysis_limit)
         trade_date = provider.latest_trade_date()
+        if task_id:
+            self._update_task(task_id, phase="scanning", message="正在加载股票池")
         cache_stats = CacheStats()
         benchmark = self._get_benchmark_with_cache(provider, settings.history_days, cache_stats, trade_date)
+        if task_id:
+            self._update_task(task_id, phase="scanning", progress_total=len(snapshot))
 
         if task_id:
             self._update_task(task_id, progress_total=len(snapshot), message="股票池加载完成，开始扫描")
 
         enriched_rows: list[dict] = []
-        results: list[AnalysisResult] = []
+        history_cache: dict[str, pd.DataFrame] = {}
 
         for index, (_, stock) in enumerate(snapshot.iterrows(), start=1):
-            history = self._get_history_with_cache(provider, str(stock["symbol"]), settings.history_days, cache_stats, trade_date)
+            symbol = str(stock["symbol"])
+            try:
+                history = self._get_history_with_cache(provider, symbol, settings.history_days, cache_stats, trade_date)
+            except Exception as exc:
+                cache_stats.stock_failures += 1
+                cache_stats.last_failure_symbol = symbol
+                cache_stats.last_failure_reason = str(exc)
+                if task_id and (cache_stats.stock_failures <= 3 or cache_stats.stock_failures % 20 == 0):
+                    self._update_task(
+                        task_id,
+                        phase="scanning",
+                        progress_current=index,
+                        last_symbol=symbol,
+                        message=(
+                            f"扫描跳过 {symbol}，失败 {cache_stats.stock_failures} 只；"
+                            f"最近原因: {self._short_error(str(exc))}"
+                        ),
+                        cache_hits=cache_stats.cache_hits,
+                        incremental_updates=cache_stats.incremental_updates,
+                        full_refreshes=cache_stats.full_refreshes,
+                        benchmark_cache_mode=cache_stats.benchmark_cache_mode,
+                    )
+                continue
             if history.empty:
                 continue
-            self._save_history(str(stock["symbol"]), history)
+            self._save_history(symbol, history)
+            history_cache[symbol] = history
             stock = self._hydrate_snapshot_from_history(stock.copy(), history)
             enriched_rows.append(stock.to_dict())
-            result = score_stock(stock, history, benchmark)
-            if result:
-                results.append(result)
+            preview_result = score_stock(stock, history, benchmark)
             if task_id:
                 self._save_task_item(
                     task_id=task_id,
-                    symbol=str(stock["symbol"]),
+                    symbol=symbol,
                     name=str(stock.get("name", "")),
                     cache_mode=self._last_cache_mode,
                     latest_price=float(stock.get("latest_price") or 0),
                     pct_change=float(stock.get("pct_change") or 0),
-                    score=float(result.score if result else 0),
+                    score=float(preview_result.score if preview_result else 0),
                 )
 
             if task_id and (index == 1 or index % 20 == 0 or index == len(snapshot)):
                 self._update_task(
                     task_id,
+                    phase="scanning",
                     progress_current=index,
-                    last_symbol=str(stock["symbol"]),
-                    message=f"正在扫描 {stock['symbol']}，已完成 {index}/{len(snapshot)}",
+                    last_symbol=symbol,
+                    message=self._build_progress_message(index, len(snapshot), symbol, cache_stats),
                     cache_hits=cache_stats.cache_hits,
                     incremental_updates=cache_stats.incremental_updates,
                     full_refreshes=cache_stats.full_refreshes,
@@ -119,15 +168,36 @@ class StockAnalysisService:
                 )
 
         enriched_snapshot = pd.DataFrame(enriched_rows) if enriched_rows else snapshot
+        if task_id:
+            self._update_task(
+                task_id,
+                phase="summarizing",
+                progress_current=len(snapshot),
+                progress_total=len(snapshot),
+                message="正在汇总结果并写入数据库",
+                cache_hits=cache_stats.cache_hits,
+                incremental_updates=cache_stats.incremental_updates,
+                full_refreshes=cache_stats.full_refreshes,
+                benchmark_cache_mode=cache_stats.benchmark_cache_mode,
+            )
         enriched_snapshot = self._enrich_sector_metrics(enriched_snapshot)
-        results = self._apply_sector_metrics_to_results(results, enriched_snapshot)
+        results, daily_factors, daily_scores = self._build_daily_outputs(enriched_snapshot, history_cache, benchmark)
         results.sort(key=lambda item: (item.score, item.pct_change), reverse=True)
         top_results = results[: settings.top_n]
 
+        if task_id:
+            self._update_task(task_id, phase="writing")
         self._save_snapshot(trade_date, enriched_snapshot)
-        run_id = self._save_run(provider.name, benchmark, len(enriched_snapshot), top_results, cache_stats)
+        self._save_daily_factors(daily_factors)
+        self._save_daily_scores(daily_scores)
+        run_id = self._save_run(
+            provider=provider.name,
+            trade_date=trade_date,
+            sample_size=len(enriched_snapshot),
+            cache_stats=cache_stats,
+        )
 
-        return {
+        result = {
             "run_id": run_id,
             "provider": provider.name,
             "trade_date": trade_date,
@@ -139,32 +209,50 @@ class StockAnalysisService:
             "cache_hits": cache_stats.cache_hits,
             "incremental_updates": cache_stats.incremental_updates,
             "full_refreshes": cache_stats.full_refreshes,
+            "stock_failures": cache_stats.stock_failures,
+            "last_failure_symbol": cache_stats.last_failure_symbol,
+            "last_failure_reason": cache_stats.last_failure_reason,
             "results": [asdict(item) for item in top_results],
             "average_score": round(sum(item.score for item in top_results) / len(top_results), 2) if top_results else 0,
         }
+        if task_id:
+            self._mark_task_completed(task_id, result)
+        return result
 
     def latest_results(self) -> dict | None:
         with self.db.connect() as conn:
-            run = conn.execute(
+            latest_daily_trade_date_row = conn.execute(
                 """
-                SELECT id, provider, created_at, benchmark_name, benchmark_change, sample_size,
-                       cache_hits, incremental_updates, full_refreshes, benchmark_cache_mode
-                FROM analysis_run
-                ORDER BY id DESC
-                LIMIT 1
+                SELECT MAX(trade_date) AS trade_date
+                FROM daily_score
                 """
             ).fetchone()
-            if not run:
+            latest_daily_trade_date = latest_daily_trade_date_row["trade_date"] if latest_daily_trade_date_row else None
+            if not latest_daily_trade_date:
                 return None
+
+            run = conn.execute(
+                """
+                SELECT id, provider, created_at, trade_date, sample_size,
+                       cache_hits, incremental_updates, full_refreshes, benchmark_cache_mode
+                FROM analysis_run
+                WHERE trade_date = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (latest_daily_trade_date,),
+            ).fetchone()
             rows = conn.execute(
                 """
-                SELECT symbol, name, score, latest_price, pct_change, sector, summary, signals,
-                       score_breakdown, score_source, review_updated_at
-                FROM analysis_result
-                WHERE run_id = ?
-                ORDER BY score DESC, pct_change DESC
+                SELECT ds.symbol, ms.name, ds.score_total AS score, ms.latest_price, ms.pct_change, ms.sector,
+                       ds.summary, ds.signals, ds.score_breakdown, ds.score_source, ds.review_updated_at
+                FROM daily_score ds
+                LEFT JOIN market_snapshot ms
+                  ON ms.trade_date = ds.trade_date AND ms.symbol = ds.symbol
+                WHERE ds.trade_date = ?
+                ORDER BY ds.score_total DESC, ms.pct_change DESC, ds.symbol ASC
                 """,
-                (run["id"],),
+                (latest_daily_trade_date,),
             ).fetchall()
 
         results = []
@@ -175,26 +263,96 @@ class StockAnalysisService:
             results.append(payload)
 
         return {
-            "run_id": run["id"],
-            "provider": run["provider"],
-            "trade_date": str(run["created_at"])[:10],
-            "benchmark_name": run["benchmark_name"],
-            "benchmark_change": run["benchmark_change"],
-            "benchmark_cache_mode": run["benchmark_cache_mode"],
-            "sample_size": run["sample_size"],
+            "run_id": run["id"] if run else None,
+            "provider": run["provider"] if run else settings.default_provider,
+            "trade_date": latest_daily_trade_date,
+            "benchmark_name": "上证指数",
+            "benchmark_change": self._latest_benchmark_change(latest_daily_trade_date),
+            "benchmark_cache_mode": run["benchmark_cache_mode"] if run else "unknown",
+            "sample_size": len(results),
             "display_size": len(results),
-            "cache_hits": run["cache_hits"],
-            "incremental_updates": run["incremental_updates"],
-            "full_refreshes": run["full_refreshes"],
+            "cache_hits": run["cache_hits"] if run else 0,
+            "incremental_updates": run["incremental_updates"] if run else 0,
+            "full_refreshes": run["full_refreshes"] if run else 0,
             "results": results,
             "average_score": round(sum(item["score"] for item in results) / len(results), 2) if results else 0,
+        }
+
+    @staticmethod
+    def backtest_config_schema() -> dict:
+        return build_backtest_config_schema()
+
+    def run_backtest(self, config: dict | None = None) -> dict:
+        return self.backtest_runner.run(config)
+
+    def recent_backtests(self, limit: int = 20) -> list[dict]:
+        return self.backtest_runner.recent_runs(limit=limit)
+
+    def backtest_detail(self, run_id: int) -> dict | None:
+        return self.backtest_runner.run_detail(run_id)
+
+    def backfill_daily_tables(self, days: int = 120) -> dict:
+        target_dates = self._load_backfill_trade_dates(days)
+        if not target_dates:
+            return {"trade_dates": 0, "factor_rows": 0, "score_rows": 0, "symbols": 0}
+
+        sector_map = self._load_latest_sector_map()
+        benchmark = self._load_prepared_benchmark_for_backfill(target_dates[0], target_dates[-1])
+        benchmark_windows = self._build_benchmark_windows(benchmark, target_dates)
+        sector_metrics = self._build_historical_sector_metrics(target_dates, sector_map)
+        symbol_histories = self._load_prepared_symbol_histories_for_backfill(target_dates[0], target_dates[-1], set(sector_map.keys()))
+
+        factor_rows: list[dict] = []
+        score_rows: list[dict] = []
+        symbols_processed = 0
+
+        for symbol, history in symbol_histories.items():
+            if history.empty:
+                continue
+            symbols_processed += 1
+            sector = sector_map.get(symbol, "未分类")
+            trade_date_labels = history["trade_date"].dt.strftime("%Y-%m-%d")
+            matched_rows = history.index[trade_date_labels.isin(target_dates)].tolist()
+            for row_index in matched_rows:
+                if row_index < 59:
+                    continue
+                trade_date = str(trade_date_labels.iloc[row_index])
+                benchmark_window = benchmark_windows.get(trade_date)
+                if benchmark_window is None or len(benchmark_window) < 20:
+                    continue
+                metric = sector_metrics.get((trade_date, sector), {"sector_change": 0.0, "sector_up_ratio": 0.0})
+                snapshot = pd.Series(
+                    {
+                        "symbol": symbol,
+                        "sector": sector,
+                        "sector_change": metric["sector_change"],
+                        "sector_up_ratio": metric["sector_up_ratio"],
+                    }
+                )
+                history_window = history.iloc[: row_index + 1]
+                factor = build_daily_factor_snapshot_prepared(snapshot, history_window, benchmark_window, trade_date)
+                if factor:
+                    factor_rows.append(factor)
+                score = build_daily_score_snapshot_prepared(snapshot, history_window, benchmark_window, trade_date)
+                if score:
+                    score_rows.append(score)
+
+        self._save_daily_factors(factor_rows)
+        self._save_daily_scores(score_rows)
+        return {
+            "trade_dates": len(target_dates),
+            "factor_rows": len(factor_rows),
+            "score_rows": len(score_rows),
+            "symbols": symbols_processed,
+            "start_date": target_dates[0],
+            "end_date": target_dates[-1],
         }
 
     def latest_task(self) -> dict | None:
         with self.db.connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, provider, status, started_at, finished_at, progress_current, progress_total,
+                SELECT id, provider, status, phase, started_at, finished_at, progress_current, progress_total,
                        cache_hits, incremental_updates, full_refreshes, benchmark_cache_mode,
                        message, last_symbol, run_id
                 FROM analysis_task
@@ -202,13 +360,13 @@ class StockAnalysisService:
                 LIMIT 1
                 """
             ).fetchone()
-        return dict(row) if row else None
+        return self._enrich_task_timing(dict(row)) if row else None
 
     def recent_tasks(self, limit: int = 5) -> list[dict]:
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, provider, status, started_at, finished_at, progress_current, progress_total,
+                SELECT id, provider, status, phase, started_at, finished_at, progress_current, progress_total,
                        cache_hits, incremental_updates, full_refreshes, benchmark_cache_mode,
                        message, last_symbol, run_id
                 FROM analysis_task
@@ -217,13 +375,13 @@ class StockAnalysisService:
                 """,
                 (limit,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._enrich_task_timing(dict(row)) for row in rows]
 
     def task_detail(self, task_id: int) -> dict | None:
         with self.db.connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, provider, status, started_at, finished_at, progress_current, progress_total,
+                SELECT id, provider, status, phase, started_at, finished_at, progress_current, progress_total,
                        cache_hits, incremental_updates, full_refreshes, benchmark_cache_mode,
                        message, last_symbol, run_id
                 FROM analysis_task
@@ -247,19 +405,30 @@ class StockAnalysisService:
         total = payload.get("progress_total") or 0
         current = payload.get("progress_current") or 0
         payload["progress_percent"] = round((current / total) * 100, 1) if total else 0
-        return payload
+        return self._enrich_task_timing(payload)
 
     def stock_detail(self, symbol: str) -> dict | None:
         with self.db.connect() as conn:
-            latest_row = conn.execute(
+            latest_daily_score = conn.execute(
                 """
-                SELECT ar.run_id, ar.symbol, ar.name, ar.score, ar.latest_price, ar.pct_change, ar.sector,
-                       ar.summary, ar.signals, ar.score_breakdown, ar.score_source, ar.review_updated_at,
-                       r.created_at AS run_created_at
-                FROM analysis_result ar
-                LEFT JOIN analysis_run r ON ar.run_id = r.id
+                SELECT trade_date, symbol, score_total, score_ma_trend, score_volume_pattern,
+                       score_capital_sector, score_breakout, score_hold, score_benchmark,
+                       signals, score_breakdown, summary, score_source, review_updated_at, score_version
+                FROM daily_score
                 WHERE symbol = ?
-                ORDER BY run_id DESC
+                ORDER BY trade_date DESC
+                LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+            latest_daily_factor = conn.execute(
+                """
+                SELECT trade_date, symbol, close, pct_change, ma5, ma10, ma20, ma30, ma60,
+                       vol_ma5, atr14, prior_20_high, cmf21, mfi14, sector_change, sector_up_ratio,
+                       benchmark_close, benchmark_ma20, benchmark_prev_ma20
+                FROM daily_factor
+                WHERE symbol = ?
+                ORDER BY trade_date DESC
                 LIMIT 1
                 """,
                 (symbol,),
@@ -294,9 +463,7 @@ class StockAnalysisService:
                 (symbol,),
             ).fetchone()
             sector_value = None
-            if latest_row:
-                sector_value = latest_row["sector"]
-            elif snapshot_row:
+            if snapshot_row:
                 sector_value = snapshot_row["sector"]
 
             sector_rows = []
@@ -320,24 +487,19 @@ class StockAnalysisService:
         history_df = pd.DataFrame([dict(row) for row in history_rows])
         benchmark_df = pd.DataFrame([dict(row) for row in benchmark_rows])
         snapshot = pd.Series(dict(snapshot_row))
-        computed = score_stock(snapshot, history_df, benchmark_df)
-        if not computed:
-            return None
 
-        use_saved_ai_score = bool(
-            latest_row
-            and latest_row["score_source"] == "ai"
-            and latest_row["review_updated_at"]
-            and str(latest_row["review_updated_at"])[:10] >= snapshot_trade_date
+        detail = self._build_detail_from_daily_tables(
+            latest_daily_score=latest_daily_score,
+            latest_daily_factor=latest_daily_factor,
+            snapshot=snapshot,
+            snapshot_trade_date=snapshot_trade_date,
         )
-
-        if use_saved_ai_score:
-            detail = dict(latest_row)
-            detail["signals"] = json.loads(detail["signals"])
-            saved_breakdown = json.loads(detail["score_breakdown"]) if detail.get("score_breakdown") else []
-        else:
+        if detail is None:
+            computed = score_stock(snapshot, history_df, benchmark_df)
+            if not computed:
+                return None
             detail = {
-                "run_id": latest_row["run_id"] if latest_row else None,
+                "run_id": None,
                 "symbol": computed.symbol,
                 "name": computed.name,
                 "score": computed.score,
@@ -348,79 +510,81 @@ class StockAnalysisService:
                 "signals": computed.signals,
                 "score_breakdown": computed.score_breakdown,
                 "score_source": "system",
-                "review_updated_at": latest_row["review_updated_at"] if latest_row else None,
+                "review_updated_at": None,
+                "score_version": None,
+                "daily_factor": dict(latest_daily_factor) if latest_daily_factor else None,
             }
-            saved_breakdown = computed.score_breakdown
 
         detail["history"] = [dict(row) for row in history_rows]
         detail["benchmark_history"] = [dict(row) for row in benchmark_rows]
         detail["sector_members"] = [dict(row) for row in sector_rows]
         detail["history_count"] = len(detail["history"])
         detail["benchmark_count"] = len(detail["benchmark_history"])
-        if saved_breakdown:
-            detail["score_breakdown"] = saved_breakdown
-        elif snapshot_row:
-            snapshot = pd.Series(dict(snapshot_row))
-            detail["score_breakdown"] = build_score_breakdown(
-                snapshot,
-                pd.DataFrame(detail["history"]),
-                pd.DataFrame(detail["benchmark_history"]),
-            )
-        else:
-            detail["score_breakdown"] = []
         return detail
 
     def lookup_stock_score(self, symbol: str) -> dict | None:
-        detail = self.stock_detail(symbol)
-        if not detail:
+        with self.db.connect() as conn:
+            latest_daily_trade_date_row = conn.execute(
+                """
+                SELECT MAX(trade_date) AS trade_date
+                FROM daily_score
+                """
+            ).fetchone()
+            latest_daily_trade_date = latest_daily_trade_date_row["trade_date"] if latest_daily_trade_date_row else None
+            if not latest_daily_trade_date:
+                return None
+            row = conn.execute(
+                """
+                SELECT ds.symbol, ms.name, ds.score_total AS score, ms.latest_price, ms.pct_change, ms.sector,
+                       ds.summary, ds.signals, ds.score_breakdown, ds.score_source, ds.review_updated_at
+                FROM daily_score ds
+                LEFT JOIN market_snapshot ms
+                  ON ms.trade_date = ds.trade_date AND ms.symbol = ds.symbol
+                WHERE ds.trade_date = ? AND ds.symbol = ?
+                LIMIT 1
+                """,
+                (latest_daily_trade_date, symbol),
+            ).fetchone()
+        if not row:
             return None
-        return {
-            "symbol": detail["symbol"],
-            "name": detail["name"],
-            "score": detail["score"],
-            "latest_price": detail["latest_price"],
-            "pct_change": detail["pct_change"],
-            "sector": detail["sector"],
-            "summary": detail["summary"],
-            "signals": detail["signals"],
-            "score_breakdown": detail["score_breakdown"],
-            "score_source": detail.get("score_source", "system"),
-        }
+        payload = dict(row)
+        payload["signals"] = json.loads(payload["signals"]) if payload.get("signals") else []
+        payload["score_breakdown"] = json.loads(payload["score_breakdown"]) if payload.get("score_breakdown") else []
+        return payload
 
     def apply_review_score(self, symbol: str, proposal: dict) -> dict | None:
         with self.db.connect() as conn:
-            current = conn.execute(
+            current_daily = conn.execute(
                 """
-                SELECT run_id
-                FROM analysis_result
+                SELECT trade_date
+                FROM daily_score
                 WHERE symbol = ?
-                ORDER BY run_id DESC
+                ORDER BY trade_date DESC
                 LIMIT 1
                 """,
                 (symbol,),
             ).fetchone()
-            if not current:
+            if not current_daily:
                 return None
-
             conn.execute(
                 """
-                UPDATE analysis_result
-                SET score = ?,
-                    summary = ?,
+                UPDATE daily_score
+                SET score_total = ?,
                     signals = ?,
                     score_breakdown = ?,
+                    summary = ?,
                     score_source = ?,
                     review_updated_at = ?
-                WHERE run_id = ? AND symbol = ?
+                WHERE trade_date = ? AND symbol = ?
                 """,
                 (
                     float(proposal["score"]),
-                    str(proposal["summary"]),
                     json.dumps(proposal["signals"], ensure_ascii=False),
                     json.dumps(proposal["score_breakdown"], ensure_ascii=False),
+                    str(proposal["summary"]),
                     "ai",
                     datetime.now().isoformat(timespec="seconds"),
-                    int(current["run_id"]),
+                    str(current_daily["trade_date"]),
                     symbol,
                 ),
             )
@@ -433,6 +597,7 @@ class StockAnalysisService:
                 """
                 UPDATE analysis_task
                 SET status = 'failed',
+                    phase = 'failed',
                     finished_at = ?,
                     message = '任务在应用重启前中断，请重新发起扫描'
                 WHERE status = 'running'
@@ -440,13 +605,119 @@ class StockAnalysisService:
                 (datetime.now().isoformat(timespec="seconds"),),
             )
 
+    @staticmethod
+    def _format_task_error(exc: Exception) -> str:
+        message = str(exc)
+        lower = message.lower()
+        if "baostock" in lower and ("reset" in lower or "10054" in lower or "网络" in message):
+            return f"baostock network reset: {message}"
+        if "llm api" in lower and ("reset" in lower or "10054" in lower):
+            return f"llm api connection reset: {message}"
+        return message
+
+    @staticmethod
+    def _short_error(message: str, max_len: int = 120) -> str:
+        compact = " ".join(str(message).split())
+        return compact if len(compact) <= max_len else compact[: max_len - 3] + "..."
+
+    def _build_progress_message(self, current: int, total: int, symbol: str, cache_stats: CacheStats) -> str:
+        base = f"正在扫描 {symbol}，已完成 {current}/{total}"
+        if cache_stats.stock_failures <= 0:
+            return base
+        reason = self._short_error(cache_stats.last_failure_reason or "unknown")
+        failed_symbol = cache_stats.last_failure_symbol or "-"
+        return f"{base}；已跳过 {cache_stats.stock_failures} 只，最近失败 {failed_symbol}: {reason}"
+
+    @staticmethod
+    def _enrich_task_timing(task: dict) -> dict:
+        if not task:
+            return task
+        phase = str(task.get("phase") or "")
+        task["phase_label"] = StockAnalysisService._phase_label(
+            phase=phase,
+            finished=bool(task.get("finished_at")),
+            status=str(task.get("status") or ""),
+        )
+        started_at = task.get("started_at")
+        current = int(task.get("progress_current") or 0)
+        total = int(task.get("progress_total") or 0)
+        finished_at = task.get("finished_at")
+        avg_seconds = None
+        eta_at = None
+
+        if started_at:
+            try:
+                started_dt = datetime.fromisoformat(str(started_at))
+                end_dt = datetime.fromisoformat(str(finished_at)) if finished_at else datetime.now()
+                elapsed_seconds = max((end_dt - started_dt).total_seconds(), 0.0)
+                if current > 0:
+                    avg_seconds = elapsed_seconds / current
+                    if not finished_at and total > current:
+                        eta_seconds = avg_seconds * (total - current)
+                        eta_at = (datetime.now() + timedelta(seconds=eta_seconds)).isoformat(timespec="seconds")
+            except ValueError:
+                avg_seconds = None
+                eta_at = None
+
+        task["avg_item_seconds"] = round(avg_seconds, 2) if avg_seconds is not None else None
+        task["avg_item_text"] = f"{avg_seconds:.2f} 秒/只" if avg_seconds is not None else "-"
+        task["eta_at"] = eta_at
+        task["eta_text"] = eta_at or ("已完成" if finished_at else "-")
+        return task
+
+    @staticmethod
+    def _phase_label(phase: str, finished: bool, status: str) -> str:
+        if status == "completed" or phase == "completed" or finished:
+            return "已完成"
+        if status == "failed" or phase == "failed":
+            return "失败"
+        labels = {
+            "pending": "等待中",
+            "scanning": "扫描中",
+            "summarizing": "汇总中",
+            "writing": "写库中",
+        }
+        return labels.get(phase, "扫描中")
+
     def _update_task(self, task_id: int, **fields) -> None:
         if not fields:
             return
         assignments = ", ".join(f"{key} = ?" for key in fields.keys())
         values = list(fields.values()) + [task_id]
-        with self.db.connect() as conn:
-            conn.execute(f"UPDATE analysis_task SET {assignments} WHERE id = ?", values)
+        last_error = None
+        for attempt in range(3):
+            try:
+                with self.db.connect() as conn:
+                    conn.execute(f"UPDATE analysis_task SET {assignments} WHERE id = ?", values)
+                return
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+        if last_error:
+            raise last_error
+
+    def _mark_task_completed(self, task_id: int, result: dict) -> None:
+        self._update_task(
+            task_id,
+            status="completed",
+            phase="completed",
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            message=(
+                "扫描完成"
+                if not result.get("stock_failures")
+                else f"扫描完成，跳过 {result['stock_failures']} 只；最近失败 {result.get('last_failure_symbol') or '-'}: {self._short_error(result.get('last_failure_reason') or 'unknown')}"
+            ),
+            run_id=result["run_id"],
+            progress_current=result["sample_size"],
+            progress_total=result["sample_size"],
+            cache_hits=result["cache_hits"],
+            incremental_updates=result["incremental_updates"],
+            full_refreshes=result["full_refreshes"],
+            benchmark_cache_mode=result["benchmark_cache_mode"],
+        )
 
     def _save_task_item(
         self,
@@ -537,6 +808,129 @@ class StockAnalysisService:
             return pd.DataFrame(columns=["trade_date", "open", "close", "high", "low", "volume", "amount"])
         frame = pd.DataFrame([dict(row) for row in rows])
         return self._sanitize_benchmark_history(frame).tail(days).reset_index(drop=True)
+
+    def _load_backfill_trade_dates(self, days: int) -> list[str]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT trade_date
+                FROM price_history
+                ORDER BY trade_date ASC
+                """
+            ).fetchall()
+        trade_dates = [str(row["trade_date"]) for row in rows]
+        return trade_dates[-days:] if len(trade_dates) > days else trade_dates
+
+    def _load_latest_sector_map(self) -> dict[str, str]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT ms.symbol, ms.sector
+                FROM market_snapshot ms
+                JOIN (
+                    SELECT symbol, MAX(trade_date) AS latest_trade_date
+                    FROM market_snapshot
+                    GROUP BY symbol
+                ) latest
+                  ON latest.symbol = ms.symbol AND latest.latest_trade_date = ms.trade_date
+                """
+            ).fetchall()
+        return {str(row["symbol"]): str(row["sector"] or "未分类") for row in rows}
+
+    def _load_prepared_benchmark_for_backfill(self, start_date: str, end_date: str) -> pd.DataFrame:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_date, open, close, high, low, volume, amount
+                FROM benchmark_history
+                WHERE symbol = '000001' AND trade_date <= ?
+                ORDER BY trade_date ASC
+                """,
+                (end_date,),
+            ).fetchall()
+        frame = pd.DataFrame([dict(row) for row in rows])
+        return _prepare_history(self._sanitize_benchmark_history(frame))
+
+    def _load_prepared_symbol_histories_for_backfill(
+        self,
+        start_date: str,
+        end_date: str,
+        symbols: set[str],
+    ) -> dict[str, pd.DataFrame]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, trade_date, open, close, high, low, volume, amount
+                FROM price_history
+                WHERE trade_date <= ?
+                ORDER BY symbol ASC, trade_date ASC
+                """,
+                (end_date,),
+            ).fetchall()
+        frame = pd.DataFrame([dict(row) for row in rows])
+        histories: dict[str, pd.DataFrame] = {}
+        if frame.empty:
+            return histories
+        for symbol, group in frame.groupby("symbol", sort=False):
+            symbol_str = str(symbol)
+            if symbols and symbol_str not in symbols:
+                continue
+            prepared = _prepare_history(group.reset_index(drop=True))
+            if prepared.empty:
+                continue
+            histories[symbol_str] = prepared
+        return histories
+
+    @staticmethod
+    def _build_benchmark_windows(benchmark: pd.DataFrame, target_dates: list[str]) -> dict[str, pd.DataFrame]:
+        if benchmark.empty:
+            return {}
+        labels = benchmark["trade_date"].dt.strftime("%Y-%m-%d")
+        windows: dict[str, pd.DataFrame] = {}
+        for row_index in benchmark.index[labels.isin(target_dates)].tolist():
+            trade_date = str(labels.iloc[row_index])
+            windows[trade_date] = benchmark.iloc[: row_index + 1]
+        return windows
+
+    def _build_historical_sector_metrics(self, trade_dates: list[str], sector_map: dict[str, str]) -> dict[tuple[str, str], dict[str, float]]:
+        if not trade_dates:
+            return {}
+        with self.db.connect() as conn:
+            placeholders = ", ".join("?" for _ in trade_dates)
+            rows = conn.execute(
+                f"""
+                SELECT symbol, trade_date, close
+                FROM price_history
+                WHERE trade_date IN ({placeholders})
+                ORDER BY symbol ASC, trade_date ASC
+                """,
+                trade_dates,
+            ).fetchall()
+        frame = pd.DataFrame([dict(row) for row in rows])
+        if frame.empty:
+            return {}
+        frame["symbol"] = frame["symbol"].astype(str)
+        frame["sector"] = frame["symbol"].map(sector_map).fillna("未分类")
+        frame["trade_date"] = frame["trade_date"].astype(str)
+        frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+        frame = frame.sort_values(["symbol", "trade_date"]).reset_index(drop=True)
+        frame["prev_close"] = frame.groupby("symbol")["close"].shift(1)
+        frame["pct_change"] = ((frame["close"] - frame["prev_close"]) / frame["prev_close"]).fillna(0.0) * 100
+        grouped = (
+            frame.groupby(["trade_date", "sector"], dropna=False)
+            .agg(
+                sector_change=("pct_change", "mean"),
+                sector_up_ratio=("pct_change", lambda s: float((s > 0).mean())),
+            )
+            .reset_index()
+        )
+        return {
+            (str(row["trade_date"]), str(row["sector"])): {
+                "sector_change": round(float(row["sector_change"]), 4),
+                "sector_up_ratio": round(float(row["sector_up_ratio"]), 6),
+            }
+            for _, row in grouped.iterrows()
+        }
 
     def _get_history_with_cache(self, provider, symbol: str, days: int, cache_stats: CacheStats, trade_date: str) -> pd.DataFrame:
         cached = self._load_cached_history(symbol, days)
@@ -644,26 +1038,22 @@ class StockAnalysisService:
     def _save_run(
         self,
         provider: str,
-        benchmark: pd.DataFrame,
+        trade_date: str,
         sample_size: int,
-        results: list[AnalysisResult],
         cache_stats: CacheStats,
     ) -> int:
-        benchmark_change = self._benchmark_change(benchmark)
         with self.db.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO analysis_run
-                (provider, created_at, benchmark_symbol, benchmark_name, benchmark_change, sample_size,
+                (provider, created_at, trade_date, sample_size,
                  cache_hits, incremental_updates, full_refreshes, benchmark_cache_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     provider,
                     datetime.now().isoformat(timespec="seconds"),
-                    "000001",
-                    "上证指数",
-                    benchmark_change,
+                    trade_date,
                     sample_size,
                     cache_stats.cache_hits,
                     cache_stats.incremental_updates,
@@ -672,31 +1062,6 @@ class StockAnalysisService:
                 ),
             )
             run_id = int(cursor.lastrowid)
-            conn.executemany(
-                """
-                INSERT OR REPLACE INTO analysis_result
-                (run_id, symbol, name, score, latest_price, pct_change, sector, summary, signals,
-                 score_breakdown, score_source, review_updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        run_id,
-                        item.symbol,
-                        item.name,
-                        item.score,
-                        item.latest_price,
-                        item.pct_change,
-                        item.sector,
-                        item.summary,
-                        json.dumps(item.signals, ensure_ascii=False),
-                        json.dumps(item.score_breakdown, ensure_ascii=False),
-                        "system",
-                        None,
-                    )
-                    for item in results
-                ],
-            )
         return run_id
 
     @staticmethod
@@ -783,3 +1148,161 @@ class StockAnalysisService:
                     item.summary = " / ".join(item.signals)
             adjusted.append(item)
         return adjusted
+
+    @staticmethod
+    def _build_daily_outputs(
+        snapshot: pd.DataFrame,
+        history_cache: dict[str, pd.DataFrame],
+        benchmark: pd.DataFrame,
+    ) -> tuple[list[AnalysisResult], list[dict], list[dict]]:
+        results: list[AnalysisResult] = []
+        daily_factors: list[dict] = []
+        daily_scores: list[dict] = []
+
+        if snapshot.empty:
+            return results, daily_factors, daily_scores
+
+        for _, row in snapshot.iterrows():
+            symbol = str(row["symbol"])
+            history = history_cache.get(symbol)
+            if history is None or history.empty:
+                continue
+            stock = pd.Series(row)
+            result = score_stock(stock, history, benchmark)
+            if result:
+                results.append(result)
+            factor = build_daily_factor_snapshot(stock, history, benchmark)
+            if factor:
+                daily_factors.append(factor)
+            score_record = build_daily_score_snapshot(stock, history, benchmark)
+            if score_record:
+                daily_scores.append(score_record)
+
+        return results, daily_factors, daily_scores
+
+    def _save_daily_factors(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        with self.db.connect() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO daily_factor
+                (trade_date, symbol, close, pct_change, ma5, ma10, ma20, ma30, ma60,
+                 vol_ma5, atr14, prior_20_high, cmf21, mfi14, sector_change, sector_up_ratio,
+                 benchmark_close, benchmark_ma20, benchmark_prev_ma20)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        row["trade_date"],
+                        row["symbol"],
+                        row["close"],
+                        row["pct_change"],
+                        row["ma5"],
+                        row["ma10"],
+                        row["ma20"],
+                        row["ma30"],
+                        row["ma60"],
+                        row["vol_ma5"],
+                        row["atr14"],
+                        row["prior_20_high"],
+                        row["cmf21"],
+                        row["mfi14"],
+                        row["sector_change"],
+                        row["sector_up_ratio"],
+                        row["benchmark_close"],
+                        row["benchmark_ma20"],
+                        row["benchmark_prev_ma20"],
+                    )
+                    for row in rows
+                ],
+            )
+
+    def _save_daily_scores(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        with self.db.connect() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO daily_score
+                (trade_date, symbol, score_total, score_ma_trend, score_volume_pattern,
+                 score_capital_sector, score_breakout, score_hold, score_benchmark,
+                 signals, score_breakdown, summary, score_source, review_updated_at, score_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        row["trade_date"],
+                        row["symbol"],
+                        row["score_total"],
+                        row["score_ma_trend"],
+                        row["score_volume_pattern"],
+                        row["score_capital_sector"],
+                        row["score_breakout"],
+                        row["score_hold"],
+                        row["score_benchmark"],
+                        json.dumps(row["signals"], ensure_ascii=False),
+                        json.dumps(row["score_breakdown"], ensure_ascii=False),
+                        row["summary"],
+                        row["score_source"],
+                        row["review_updated_at"],
+                        row["score_version"],
+                    )
+                    for row in rows
+                ],
+            )
+
+    def _latest_benchmark_change(self, trade_date: str) -> float:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_date, close
+                FROM benchmark_history
+                WHERE symbol = '000001' AND trade_date <= ?
+                ORDER BY trade_date DESC
+                LIMIT 2
+                """,
+                (trade_date,),
+            ).fetchall()
+        if len(rows) < 2:
+            return 0.0
+        latest_close = float(rows[0]["close"])
+        prev_close = float(rows[1]["close"])
+        if not prev_close:
+            return 0.0
+        return round(((latest_close - prev_close) / prev_close) * 100, 2)
+
+    @staticmethod
+    def _build_detail_from_daily_tables(
+        latest_daily_score,
+        latest_daily_factor,
+        snapshot: pd.Series,
+        snapshot_trade_date: str,
+    ) -> dict | None:
+        if not latest_daily_score:
+            return None
+
+        daily_trade_date = str(latest_daily_score["trade_date"])
+        if daily_trade_date != snapshot_trade_date:
+            return None
+
+        signals = json.loads(latest_daily_score["signals"]) if latest_daily_score["signals"] else []
+        score_breakdown = json.loads(latest_daily_score["score_breakdown"]) if latest_daily_score["score_breakdown"] else []
+        daily_factor = dict(latest_daily_factor) if latest_daily_factor else None
+
+        return {
+            "run_id": None,
+            "symbol": str(snapshot["symbol"]),
+            "name": str(snapshot.get("name", "")),
+            "score": float(latest_daily_score["score_total"]),
+            "latest_price": round(float(snapshot.get("latest_price", daily_factor["close"] if daily_factor else 0) or 0), 2),
+            "pct_change": round(float(snapshot.get("pct_change", daily_factor["pct_change"] if daily_factor else 0) or 0), 2),
+            "sector": str(snapshot.get("sector", "未分类") or "未分类"),
+            "summary": str(latest_daily_score["summary"] or ""),
+            "signals": signals,
+            "score_breakdown": score_breakdown,
+            "score_source": str(latest_daily_score["score_source"] or "system"),
+            "review_updated_at": latest_daily_score["review_updated_at"],
+            "score_version": latest_daily_score["score_version"],
+            "daily_factor": daily_factor,
+        }

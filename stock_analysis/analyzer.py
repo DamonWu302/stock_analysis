@@ -5,6 +5,8 @@ from typing import Any
 
 import pandas as pd
 
+SCORE_VERSION = "2026-03-cmf-mfi-v1"
+
 
 @dataclass(slots=True)
 class AnalysisResult:
@@ -152,6 +154,125 @@ def _compute_mfi(df: pd.DataFrame, window: int = 14) -> pd.Series:
     return mfi.fillna(50.0)
 
 
+def _ensure_auxiliary_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    frame = df.copy()
+    if "cmf21" not in frame.columns:
+        frame["cmf21"] = _compute_cmf(frame, window=21)
+    if "mfi14" not in frame.columns:
+        frame["mfi14"] = _compute_mfi(frame, window=14)
+    return frame
+
+
+def _build_score_breakdown_from_prepared(
+    snapshot: pd.Series,
+    prepared_history: pd.DataFrame,
+    prepared_benchmark: pd.DataFrame,
+    trade_date: str | pd.Timestamp,
+) -> list[dict[str, Any]]:
+    df = prepared_history[prepared_history["trade_date"] <= pd.to_datetime(trade_date)].copy()
+    benchmark = prepared_benchmark[prepared_benchmark["trade_date"] <= pd.to_datetime(trade_date)].copy()
+    if df.empty or len(df) < 60 or benchmark.empty or len(benchmark) < 20:
+        return []
+
+    df = _ensure_auxiliary_indicators(df)
+    benchmark = _ensure_auxiliary_indicators(benchmark)
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    benchmark_latest = benchmark.iloc[-1]
+    benchmark_prev = benchmark.iloc[-2]
+
+    ma_score, ma_comment = _compute_ma_trend_score(df, window=5)
+    ma_progress = _clip_ratio(ma_score / 24.0)
+
+    recent = df.tail(10).copy()
+    recent["up_gain_score"] = (recent["pct_change"] / 0.02).clip(lower=0, upper=1)
+    recent["up_volume_score"] = (recent["volume"] / (recent["vol_ma5"] * 1.5)).clip(lower=0, upper=1)
+    recent["up_score"] = recent[["up_gain_score", "up_volume_score"]].min(axis=1)
+    recent["pullback_pct_score"] = (1 - recent["pct_change"].abs() / 0.02).clip(lower=0, upper=1)
+    recent["pullback_volume_score"] = (1 - (recent["volume"] / recent["vol_ma5"] - 0.8) / 0.8).clip(lower=0, upper=1)
+    recent["pullback_score"] = recent[["pullback_pct_score", "pullback_volume_score"]].min(axis=1)
+    volume_progress = _safe_mean(float(recent["up_score"].max()), float(recent["pullback_score"].max()))
+    volume_comment = f"近10日放量上涨强度 {recent['up_score'].max():.0%}，缩量整理强度 {recent['pullback_score'].max():.0%}"
+
+    latest_cmf = float(df["cmf21"].iloc[-1])
+    latest_mfi = float(df["mfi14"].iloc[-1])
+    sector_change = float(snapshot.get("sector_change", 0) or 0)
+    sector_up_ratio = float(snapshot.get("sector_up_ratio", 0) or 0)
+    benchmark_pct = float(benchmark_latest["pct_change"] * 100)
+    capital_progress = _safe_mean(
+        _range_ratio(latest_cmf, 0.05, 0.20),
+        _range_ratio(latest_mfi, 60, 80),
+        1.0 if sector_change > benchmark_pct else _ratio_over(sector_change - benchmark_pct + 0.5, 1.0),
+        _ratio_over(sector_up_ratio, 0.6),
+    )
+    capital_comment = (
+        f"CMF(21) {latest_cmf:.2%}，MFI(14) {latest_mfi:.1f}，"
+        f"板块涨幅 {sector_change:.2f}% ，上涨占比 {sector_up_ratio:.0%}"
+    )
+
+    rolling_low = float(df["close"].tail(120).min())
+    prior_20_high = float(df["prior_20_high"].iloc[-1])
+    atr14 = float(latest["atr14"]) if pd.notna(latest["atr14"]) else max(float(latest["close"]) * 0.02, 0.01)
+    benchmark_regime_strong = bool(
+        pd.notna(benchmark_latest["ma120"]) and benchmark_latest["close"] > benchmark_latest["ma120"]
+    )
+    low_ceiling = 0.35 if benchmark_regime_strong else 0.30
+    atr_ceiling = 10.0 if benchmark_regime_strong else 8.0
+    low_position = (latest["close"] - rolling_low) / rolling_low if rolling_low else 1.0
+    low_position_atr = (latest["close"] - rolling_low) / max(atr14, 0.01)
+    breakout_distance = (latest["close"] / prior_20_high) if prior_20_high and pd.notna(prior_20_high) else 0.0
+    low_component = 0.6 * _ratio_under(low_position, low_ceiling) + 0.4 * _ratio_under(low_position_atr, atr_ceiling)
+    breakout_component = _range_ratio(breakout_distance, 0.99, 1.02)
+    breakout_progress = 0.4 * low_component + 0.6 * breakout_component
+    breakout_comment = (
+        f"距120日低点 {low_position:.2%}，约 {low_position_atr:.1f} 个 ATR；"
+        f"相对前20日高点 {breakout_distance:.3f} 倍，突破确认强度 {breakout_component:.0%}"
+    )
+
+    recent_after_breakout = df.tail(4)
+    breakout_floor = max(prior_20_high - 1.2 * atr14, prior_20_high * 0.96) if prior_20_high and pd.notna(prior_20_high) else None
+    if breakout_floor:
+        hold_ratio = float(recent_after_breakout["low"].min() / breakout_floor)
+        breakout_validity = breakout_component
+        freshness, breakout_age = _compute_breakout_freshness(df, lookback=15)
+        hold_support = _range_ratio(hold_ratio, 0.995, 1.01)
+        hold_progress = breakout_validity * hold_support * freshness
+    else:
+        hold_progress = 0.0
+        hold_ratio = 0.0
+        breakout_validity = 0.0
+        hold_support = 0.0
+        freshness = 0.25
+        breakout_age = None
+    breakout_floor_text = f"{breakout_floor:.2f}" if breakout_floor else "暂无数据"
+    breakout_age_text = f"，距最近一次突破 {breakout_age} 天" if breakout_age is not None else ""
+    hold_comment = (
+        f"突破成立强度 {breakout_validity:.0%}，防守位 {breakout_floor_text}，"
+        f"最近4日最低价相对防守位 {hold_ratio:.3f} 倍，守位强度 {hold_support:.0%}，"
+        f"突破新鲜度 {freshness:.0%}{breakout_age_text}"
+    )
+
+    benchmark_close_ratio = float(benchmark_latest["close"]) / max(float(benchmark_latest["ma20"]), 0.01)
+    benchmark_ma20_ratio = float(benchmark_latest["ma20"]) / max(float(benchmark_prev["ma20"]), 0.01)
+    benchmark_progress = _safe_mean(
+        _range_ratio(benchmark_close_ratio, 1.0, 1.02),
+        _range_ratio(benchmark_ma20_ratio, 1.0, 1.002),
+    )
+    benchmark_comment = (
+        f"指数收盘/MA20 {benchmark_close_ratio:.4f}，"
+        f"MA20 相对前一日 {benchmark_ma20_ratio:.4f}"
+    )
+
+    return [
+        _score_item("均线多头", 24, ma_progress, 0.75, ma_comment),
+        _score_item("放量上涨+缩量回调", 20, volume_progress, 0.8, volume_comment),
+        _score_item("资金流入+板块强势", 18, capital_progress, 0.8, capital_comment),
+        _score_item("低位启动突破", 16, breakout_progress, 0.8, breakout_comment),
+        _score_item("突破后未破位", 12, hold_progress, 0.85, hold_comment),
+        _score_item("大盘共振", 10, benchmark_progress, 0.8, benchmark_comment),
+    ]
+
+
 def build_score_breakdown(snapshot: pd.Series, history: pd.DataFrame, benchmark_history: pd.DataFrame) -> list[dict[str, Any]]:
     if history.empty or len(history) < 60:
         return []
@@ -255,6 +376,154 @@ def build_score_breakdown(snapshot: pd.Series, history: pd.DataFrame, benchmark_
         _score_item("突破后未破位", 12, hold_progress, 0.85, hold_comment),
         _score_item("大盘共振", 10, benchmark_progress, 0.8, benchmark_comment),
     ]
+
+
+def build_daily_factor_snapshot(
+    snapshot: pd.Series,
+    history: pd.DataFrame,
+    benchmark_history: pd.DataFrame,
+) -> dict[str, Any] | None:
+    if history.empty or len(history) < 60 or benchmark_history.empty or len(benchmark_history) < 20:
+        return None
+
+    df = _prepare_history(history)
+    benchmark = _prepare_history(benchmark_history)
+    if len(df) < 2 or len(benchmark) < 2:
+        return None
+
+    df["cmf21"] = _compute_cmf(df, window=21)
+    df["mfi14"] = _compute_mfi(df, window=14)
+    latest = df.iloc[-1]
+    benchmark_latest = benchmark.iloc[-1]
+    benchmark_prev = benchmark.iloc[-2]
+
+    return {
+        "trade_date": str(latest["trade_date"].date()),
+        "symbol": str(snapshot["symbol"]),
+        "close": round(float(latest["close"]), 4),
+        "pct_change": round(float(latest["pct_change"] * 100), 4),
+        "ma5": round(float(latest["ma5"]), 4) if pd.notna(latest["ma5"]) else None,
+        "ma10": round(float(latest["ma10"]), 4) if pd.notna(latest["ma10"]) else None,
+        "ma20": round(float(latest["ma20"]), 4) if pd.notna(latest["ma20"]) else None,
+        "ma30": round(float(latest["ma30"]), 4) if pd.notna(latest["ma30"]) else None,
+        "ma60": round(float(latest["ma60"]), 4) if pd.notna(latest["ma60"]) else None,
+        "vol_ma5": round(float(latest["vol_ma5"]), 4) if pd.notna(latest["vol_ma5"]) else None,
+        "atr14": round(float(latest["atr14"]), 4) if pd.notna(latest["atr14"]) else None,
+        "prior_20_high": round(float(latest["prior_20_high"]), 4) if pd.notna(latest["prior_20_high"]) else None,
+        "cmf21": round(float(latest["cmf21"]), 6) if pd.notna(latest["cmf21"]) else None,
+        "mfi14": round(float(latest["mfi14"]), 4) if pd.notna(latest["mfi14"]) else None,
+        "sector_change": round(float(snapshot.get("sector_change", 0) or 0), 4),
+        "sector_up_ratio": round(float(snapshot.get("sector_up_ratio", 0) or 0), 6),
+        "benchmark_close": round(float(benchmark_latest["close"]), 4),
+        "benchmark_ma20": round(float(benchmark_latest["ma20"]), 4) if pd.notna(benchmark_latest["ma20"]) else None,
+        "benchmark_prev_ma20": round(float(benchmark_prev["ma20"]), 4) if pd.notna(benchmark_prev["ma20"]) else None,
+    }
+
+
+def build_daily_factor_snapshot_prepared(
+    snapshot: pd.Series,
+    prepared_history: pd.DataFrame,
+    prepared_benchmark: pd.DataFrame,
+    trade_date: str | pd.Timestamp,
+) -> dict[str, Any] | None:
+    df = prepared_history[prepared_history["trade_date"] <= pd.to_datetime(trade_date)].copy()
+    benchmark = prepared_benchmark[prepared_benchmark["trade_date"] <= pd.to_datetime(trade_date)].copy()
+    if df.empty or len(df) < 60 or benchmark.empty or len(benchmark) < 20:
+        return None
+
+    df = _ensure_auxiliary_indicators(df)
+    latest = df.iloc[-1]
+    benchmark_latest = benchmark.iloc[-1]
+    benchmark_prev = benchmark.iloc[-2]
+
+    return {
+        "trade_date": str(latest["trade_date"].date()),
+        "symbol": str(snapshot["symbol"]),
+        "close": round(float(latest["close"]), 4),
+        "pct_change": round(float(latest["pct_change"] * 100), 4),
+        "ma5": round(float(latest["ma5"]), 4) if pd.notna(latest["ma5"]) else None,
+        "ma10": round(float(latest["ma10"]), 4) if pd.notna(latest["ma10"]) else None,
+        "ma20": round(float(latest["ma20"]), 4) if pd.notna(latest["ma20"]) else None,
+        "ma30": round(float(latest["ma30"]), 4) if pd.notna(latest["ma30"]) else None,
+        "ma60": round(float(latest["ma60"]), 4) if pd.notna(latest["ma60"]) else None,
+        "vol_ma5": round(float(latest["vol_ma5"]), 4) if pd.notna(latest["vol_ma5"]) else None,
+        "atr14": round(float(latest["atr14"]), 4) if pd.notna(latest["atr14"]) else None,
+        "prior_20_high": round(float(latest["prior_20_high"]), 4) if pd.notna(latest["prior_20_high"]) else None,
+        "cmf21": round(float(latest["cmf21"]), 6) if pd.notna(latest["cmf21"]) else None,
+        "mfi14": round(float(latest["mfi14"]), 4) if pd.notna(latest["mfi14"]) else None,
+        "sector_change": round(float(snapshot.get("sector_change", 0) or 0), 4),
+        "sector_up_ratio": round(float(snapshot.get("sector_up_ratio", 0) or 0), 6),
+        "benchmark_close": round(float(benchmark_latest["close"]), 4),
+        "benchmark_ma20": round(float(benchmark_latest["ma20"]), 4) if pd.notna(benchmark_latest["ma20"]) else None,
+        "benchmark_prev_ma20": round(float(benchmark_prev["ma20"]), 4) if pd.notna(benchmark_prev["ma20"]) else None,
+    }
+
+
+def build_daily_score_snapshot(
+    snapshot: pd.Series,
+    history: pd.DataFrame,
+    benchmark_history: pd.DataFrame,
+) -> dict[str, Any] | None:
+    breakdown = build_score_breakdown(snapshot, history, benchmark_history)
+    if not breakdown:
+        return None
+
+    latest_trade_date = pd.to_datetime(history["trade_date"]).max().date().isoformat()
+    score_map = {item["label"]: float(item["score"]) for item in breakdown}
+    signals = [item["label"] for item in breakdown if item["matched"]]
+    summary = " / ".join(signals) if signals else "暂未命中核心信号"
+
+    return {
+        "trade_date": latest_trade_date,
+        "symbol": str(snapshot["symbol"]),
+        "score_total": round(sum(item["score"] for item in breakdown), 2),
+        "score_ma_trend": score_map.get("均线多头", 0.0),
+        "score_volume_pattern": score_map.get("放量上涨+缩量回调", 0.0),
+        "score_capital_sector": score_map.get("资金流入+板块强势", 0.0),
+        "score_breakout": score_map.get("低位启动突破", 0.0),
+        "score_hold": score_map.get("突破后未破位", 0.0),
+        "score_benchmark": score_map.get("大盘共振", 0.0),
+        "signals": signals,
+        "score_breakdown": breakdown,
+        "summary": summary,
+        "score_source": "system",
+        "review_updated_at": None,
+        "score_version": SCORE_VERSION,
+    }
+
+
+def build_daily_score_snapshot_prepared(
+    snapshot: pd.Series,
+    prepared_history: pd.DataFrame,
+    prepared_benchmark: pd.DataFrame,
+    trade_date: str | pd.Timestamp,
+) -> dict[str, Any] | None:
+    breakdown = _build_score_breakdown_from_prepared(snapshot, prepared_history, prepared_benchmark, trade_date)
+    if not breakdown:
+        return None
+
+    latest_trade_date = pd.to_datetime(trade_date).date().isoformat()
+    score_map = {item["label"]: float(item["score"]) for item in breakdown}
+    signals = [item["label"] for item in breakdown if item["matched"]]
+    summary = " / ".join(signals) if signals else "暂未命中核心信号"
+
+    return {
+        "trade_date": latest_trade_date,
+        "symbol": str(snapshot["symbol"]),
+        "score_total": round(sum(item["score"] for item in breakdown), 2),
+        "score_ma_trend": score_map.get("均线多头", 0.0),
+        "score_volume_pattern": score_map.get("放量上涨+缩量回调", 0.0),
+        "score_capital_sector": score_map.get("资金流入+板块强势", 0.0),
+        "score_breakout": score_map.get("低位启动突破", 0.0),
+        "score_hold": score_map.get("突破后未破位", 0.0),
+        "score_benchmark": score_map.get("大盘共振", 0.0),
+        "signals": signals,
+        "score_breakdown": breakdown,
+        "summary": summary,
+        "score_source": "system",
+        "review_updated_at": None,
+        "score_version": SCORE_VERSION,
+    }
 
 
 def score_stock(snapshot: pd.Series, history: pd.DataFrame, benchmark_history: pd.DataFrame) -> AnalysisResult | None:

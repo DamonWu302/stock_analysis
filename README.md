@@ -162,8 +162,9 @@ stock_analysis/
 - `price_history`
 - `benchmark_history`
 - `market_snapshot`
-- `analysis_run`
-- `analysis_result`
+- `analysis_run`（仅保存任务/批次元信息）
+- `daily_factor`
+- `daily_score`
 - `analysis_task`
 - `analysis_task_item`
 
