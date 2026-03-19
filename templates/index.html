@@ -13,7 +13,7 @@
             <div>
                 <p class="eyebrow">A-SHARE STOCK ANALYSIS</p>
                 <h1>沪深 A 股全量扫描</h1>
-                <p class="subtitle">当前默认扫描主板 A 股，自动去掉 ST、创业板、科创板，再按最近交易日 K 线和趋势规则做评分。</p>
+                <p class="subtitle">扫描主板股票，预计算评分结果，并支持历史回填、回测准备和市场评分温度观察。</p>
             </div>
             <form class="control-panel" method="post" action="{{ url_for('analyze') }}">
                 <label>
@@ -26,31 +26,33 @@
                 </label>
                 <div class="hint">
                     <strong>扫描范围</strong>
-                    <span>沪深主板全量分批扫描，默认每批 {{ defaults.scan_batch_size }} 只。</span>
+                    <span>默认按批处理主板 A 股，每批约 {{ defaults.scan_batch_size }} 只。</span>
                 </div>
                 <button type="submit">开始全量扫描</button>
-                <a class="detail-link" href="{{ url_for('latest_status') }}">查看任务状态</a>
+                <a class="detail-link" href="{{ url_for('latest_status') }}">查看扫描任务</a>
+                <a class="detail-link" href="{{ url_for('backfill_latest_status') }}">历史回填任务</a>
+                <a class="detail-link" href="{{ url_for('backtests') }}">回测中心</a>
             </form>
         </section>
 
         {% if error %}
         <section class="alert">
-            <strong>分析失败：</strong>{{ error }}
+            <strong>操作失败：</strong>{{ error }}
         </section>
         {% endif %}
 
         {% if task %}
         <section class="stats">
             <article class="card">
-                <span>任务阶段</span>
+                <span>扫描阶段</span>
                 <strong>{{ task.phase_label }}</strong>
             </article>
             <article class="card">
-                <span>最近任务</span>
+                <span>扫描状态</span>
                 <strong>{{ task.status }}</strong>
             </article>
             <article class="card">
-                <span>进度</span>
+                <span>扫描进度</span>
                 <strong>{{ task.progress_current }}/{{ task.progress_total }}</strong>
             </article>
             <article class="card">
@@ -59,15 +61,51 @@
             </article>
             <article class="card">
                 <span>详情</span>
-                <strong><a class="detail-link" href="{{ url_for('task_status', task_id=task.id) }}">打开状态页</a></strong>
+                <strong><a class="detail-link" href="{{ url_for('task_status', task_id=task.id) }}">打开任务页</a></strong>
             </article>
         </section>
         {% endif %}
 
+        {% if backfill_task %}
+        <section class="stats">
+            <article class="card">
+                <span>最新回填任务</span>
+                <strong>#{{ backfill_task.id }}</strong>
+            </article>
+            <article class="card">
+                <span>回填阶段</span>
+                <strong>{{ backfill_task.phase_label }}</strong>
+            </article>
+            <article class="card">
+                <span>回填状态</span>
+                <strong>{{ backfill_task.status }}</strong>
+            </article>
+            <article class="card">
+                <span>回填范围</span>
+                <strong>{{ backfill_task.range_label }}</strong>
+            </article>
+            <article class="card">
+                <span>详情</span>
+                <strong><a class="detail-link" href="{{ url_for('backfill_task_status', task_id=backfill_task.id) }}">打开任务页</a></strong>
+            </article>
+        </section>
+        {% endif %}
+
+        <section class="chart-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>每日平均分走势</h2>
+                    <p>最近 20 个交易日全市场 `daily_score` 平均分，以及 5 日均线。</p>
+                </div>
+                <a class="detail-link" href="{{ url_for('backtests') }}">在回测页查看</a>
+            </div>
+            <div class="chart-box">{{ score_trend_svg|safe }}</div>
+        </section>
+
         {% if recent_tasks %}
         <section class="table-wrap">
             <div class="section-title">
-                <h2>最近任务</h2>
+                <h2>最近扫描任务</h2>
             </div>
             <table>
                 <thead>
@@ -107,7 +145,7 @@
                 <strong>{{ data.sample_size }}</strong>
             </article>
             <article class="card">
-                <span>页面展示数</span>
+                <span>展示股票数</span>
                 <strong>{{ data.display_size }}</strong>
             </article>
             <article class="card">
@@ -118,15 +156,15 @@
 
         <section class="stats">
             <article class="card">
-                <span>本次命中缓存</span>
+                <span>命中缓存</span>
                 <strong>{{ data.cache_hits }}</strong>
             </article>
             <article class="card">
-                <span>本次增量更新</span>
+                <span>增量更新</span>
                 <strong>{{ data.incremental_updates }}</strong>
             </article>
             <article class="card">
-                <span>本次完整回补</span>
+                <span>完整回补</span>
                 <strong>{{ data.full_refreshes }}</strong>
             </article>
             <article class="card">
@@ -134,11 +172,12 @@
                 <strong>{{ data.benchmark_cache_mode }}</strong>
             </article>
         </section>
+
         <section class="table-wrap">
             <div class="section-title">
                 <div>
                     <h2>评分结果</h2>
-                    <p>评分结果已经单独放到新页面，点击下面按钮进入，按每页 20 条分页浏览。</p>
+                    <p>评分结果已落到 `daily_score`，点击进入结果页查看明细。</p>
                 </div>
                 <a class="detail-link" href="{{ url_for('results') }}">查看评分结果</a>
             </div>
@@ -146,7 +185,7 @@
         {% else %}
         <section class="empty-state">
             <h2>还没有分析结果</h2>
-            <p>点击“开始全量扫描”后，系统会从主板股票池中分批抓取历史日线并生成结果。</p>
+            <p>先发起一次扫描，系统会抓取历史日线并生成最新评分。</p>
         </section>
         {% endif %}
     </main>

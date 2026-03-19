@@ -7,7 +7,7 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 import json
 import pandas as pd
 
-from .charts import build_candlestick_svg
+from .charts import build_candlestick_svg, build_score_trend_svg
 from .chat import StockChatService
 from .config import settings
 from .service import StockAnalysisService
@@ -36,11 +36,15 @@ def create_app() -> Flask:
 
     @app.get("/")
     def index():
+        score_trend = service.score_trend(20)
         return render_template(
             "index.html",
             data=service.latest_results(),
             task=service.latest_task(),
             recent_tasks=service.recent_tasks(),
+            backfill_task=service.latest_backfill_task(),
+            score_trend=score_trend,
+            score_trend_svg=build_score_trend_svg(score_trend),
             defaults=settings,
             error=request.args.get("error"),
         )
@@ -116,6 +120,30 @@ def create_app() -> Flask:
         limit = max(int(request.args.get("limit", "20")), 1)
         return jsonify({"runs": service.recent_backtests(limit=limit)})
 
+    @app.get("/backtests")
+    def backtests():
+        runs = service.recent_backtests(limit=20)
+        score_trend = service.score_trend(20)
+        return render_template(
+            "backtests.html",
+            runs=runs,
+            score_trend=score_trend,
+            score_trend_svg=build_score_trend_svg(score_trend),
+        )
+
+    @app.get("/backtests/<int:run_id>")
+    def backtest_detail_page(run_id: int):
+        detail = service.backtest_detail(run_id)
+        if not detail:
+            return redirect(url_for("backtests"))
+        score_trend = service.score_trend(20)
+        return render_template(
+            "backtest_detail.html",
+            detail=detail,
+            score_trend=score_trend,
+            score_trend_svg=build_score_trend_svg(score_trend),
+        )
+
     @app.get("/api/backtest/runs/<int:run_id>")
     def backtest_run_detail(run_id: int):
         detail = service.backtest_detail(run_id)
@@ -138,11 +166,85 @@ def create_app() -> Flask:
     def backfill_daily_tables():
         payload = request.get_json(silent=True) or {}
         days = int(payload.get("days", 120) or 120)
+        batch_size = int(payload.get("batch_size", 10) or 10)
+        start_date = str(payload.get("start_date", "") or "").strip() or None
+        end_date = str(payload.get("end_date", "") or "").strip() or None
         try:
-            result = service.backfill_daily_tables(days=days)
+            result = service.backfill_daily_tables(days=days, batch_size=batch_size, start_date=start_date, end_date=end_date)
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
         return jsonify(result)
+
+    @app.post("/api/daily/backfill/tasks")
+    def create_backfill_task_api():
+        payload = request.get_json(silent=True) or {}
+        days = int(payload.get("days", 120) or 120)
+        batch_size = int(payload.get("batch_size", 10) or 10)
+        start_date = str(payload.get("start_date", "") or "").strip() or None
+        end_date = str(payload.get("end_date", "") or "").strip() or None
+        resume_task_id = payload.get("resume_task_id")
+        try:
+            task_id = service.start_backfill_task(days=days, batch_size=batch_size, start_date=start_date, end_date=end_date, resume_task_id=resume_task_id)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+        return jsonify({"task_id": task_id, "task": service.backfill_task_detail(task_id)})
+
+    @app.get("/api/daily/backfill/tasks")
+    def backfill_tasks_api():
+        limit = max(int(request.args.get("limit", "10")), 1)
+        return jsonify({"tasks": service.recent_backfill_tasks(limit=limit)})
+
+    @app.get("/api/daily/backfill/tasks/<int:task_id>")
+    def backfill_task_detail_api(task_id: int):
+        task = service.backfill_task_detail(task_id)
+        if not task:
+            return jsonify({"error": f"未找到历史回填任务 {task_id}"}), 404
+        return jsonify(task)
+
+    @app.post("/backfill")
+    def start_backfill_task():
+        days = int(request.form.get("days", "120") or 120)
+        batch_size = int(request.form.get("batch_size", "10") or 10)
+        start_date = request.form.get("start_date", "").strip() or None
+        end_date = request.form.get("end_date", "").strip() or None
+        resume_task_id = request.form.get("resume_task_id")
+        try:
+            task_id = service.start_backfill_task(
+                days=days,
+                batch_size=batch_size,
+                start_date=start_date,
+                end_date=end_date,
+                resume_task_id=int(resume_task_id) if resume_task_id else None,
+            )
+        except Exception as exc:
+            return redirect(url_for("backfill_latest_status", error=str(exc)))
+        return redirect(url_for("backfill_task_status", task_id=task_id))
+
+    @app.get("/backfill/status")
+    def backfill_latest_status():
+        task = service.latest_backfill_task()
+        if not task:
+            return render_template(
+                "backfill_status.html",
+                task=None,
+                recent_tasks=[],
+                defaults={"days": 120, "batch_size": 10, "start_date": "", "end_date": ""},
+                error=request.args.get("error"),
+            )
+        return redirect(url_for("backfill_task_status", task_id=task["id"]))
+
+    @app.get("/backfill/status/<int:task_id>")
+    def backfill_task_status(task_id: int):
+        task = service.backfill_task_detail(task_id)
+        if not task:
+            return redirect(url_for("backfill_latest_status", error=f"未找到历史回填任务 {task_id}"))
+        return render_template(
+            "backfill_status.html",
+            task=task,
+            recent_tasks=service.recent_backfill_tasks(),
+            defaults={"days": task["days"], "batch_size": task["batch_size"], "start_date": task.get("start_date") or "", "end_date": task.get("end_date") or ""},
+            error=request.args.get("error"),
+        )
 
     @app.post("/analyze")
     def analyze():

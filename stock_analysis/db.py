@@ -217,6 +217,41 @@ CREATE TABLE IF NOT EXISTS backtest_nav (
     PRIMARY KEY (run_id, trade_date),
     FOREIGN KEY (run_id) REFERENCES backtest_run(id)
 );
+
+CREATE TABLE IF NOT EXISTS backfill_task (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'pending',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    days INTEGER NOT NULL,
+    start_date TEXT,
+    end_date TEXT,
+    batch_size INTEGER NOT NULL,
+    progress_current INTEGER NOT NULL DEFAULT 0,
+    progress_total INTEGER NOT NULL DEFAULT 0,
+    factor_rows INTEGER NOT NULL DEFAULT 0,
+    score_rows INTEGER NOT NULL DEFAULT 0,
+    last_trade_date TEXT,
+    message TEXT,
+    resume_from_task_id INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS backfill_task_batch (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    batch_index INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    start_trade_date TEXT,
+    end_trade_date TEXT,
+    completed_dates INTEGER NOT NULL DEFAULT 0,
+    factor_rows INTEGER NOT NULL DEFAULT 0,
+    score_rows INTEGER NOT NULL DEFAULT 0,
+    message TEXT,
+    FOREIGN KEY (task_id) REFERENCES backfill_task(id)
+);
 """
 
 
@@ -295,6 +330,50 @@ class Database:
                 "score_source": "TEXT NOT NULL DEFAULT 'system'",
                 "review_updated_at": "TEXT",
             },
+        )
+        Database._ensure_columns(
+            conn,
+            "backfill_task",
+            {
+                "phase": "TEXT NOT NULL DEFAULT 'pending'",
+                "days": "INTEGER NOT NULL DEFAULT 120",
+                "start_date": "TEXT",
+                "end_date": "TEXT",
+                "batch_size": "INTEGER NOT NULL DEFAULT 10",
+                "progress_current": "INTEGER NOT NULL DEFAULT 0",
+                "progress_total": "INTEGER NOT NULL DEFAULT 0",
+                "factor_rows": "INTEGER NOT NULL DEFAULT 0",
+                "score_rows": "INTEGER NOT NULL DEFAULT 0",
+                "last_trade_date": "TEXT",
+                "message": "TEXT",
+                "resume_from_task_id": "INTEGER",
+            },
+        )
+        Database._ensure_columns(
+            conn,
+            "backfill_task_batch",
+            {
+                "status": "TEXT NOT NULL DEFAULT 'running'",
+                "started_at": "TEXT",
+                "finished_at": "TEXT",
+                "start_trade_date": "TEXT",
+                "end_trade_date": "TEXT",
+                "completed_dates": "INTEGER NOT NULL DEFAULT 0",
+                "factor_rows": "INTEGER NOT NULL DEFAULT 0",
+                "score_rows": "INTEGER NOT NULL DEFAULT 0",
+                "message": "TEXT",
+            },
+        )
+        conn.execute(
+            """
+            UPDATE backfill_task
+            SET phase = CASE
+                WHEN status = 'completed' THEN 'completed'
+                WHEN status = 'failed' THEN 'failed'
+                ELSE phase
+            END
+            WHERE phase IS NULL OR phase = ''
+            """
         )
         Database._cleanup_benchmark_history(conn)
 

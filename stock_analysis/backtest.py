@@ -22,6 +22,10 @@ class BacktestDefaults:
     name: str = "120日策略回测"
     benchmark_symbol: str = "000001"
     lookback_days: int = 120
+    start_date: str | None = None
+    end_date: str | None = None
+    market_score_filter_min_avg: float = 41.0
+    market_score_filter_min_ma5: float = 41.0
     max_positions: int = 4
     initial_capital: float = DEFAULT_INITIAL_CAPITAL
     fee_rate: float = 0.001
@@ -47,7 +51,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "id": BUY_RULE_STRICT,
                 "label": "严格买入",
                 "enabled": True,
-                "description": "总分与趋势、突破、资金三项同时达标的主买点。",
+                "description": "总分、趋势、突破、资金三项同时达标时触发主买点。",
                 "conditions": [
                     {"field": "score_total", "operator": ">=", "value": 80.0},
                     {"field": "score_ma_trend", "operator": ">=", "value": 18.0},
@@ -60,7 +64,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "id": BUY_RULE_MOMENTUM,
                 "label": "增强买入",
                 "enabled": True,
-                "description": "总分略低但量价形态满分的右侧买点。",
+                "description": "总分略低但量价形态极强时触发右侧买点。",
                 "conditions": [
                     {"field": "score_total", "operator": ">=", "value": 75.0},
                     {"field": "score_volume_pattern", "operator": ">=", "value": 20.0},
@@ -99,7 +103,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "id": SELL_RULE_CAPITAL,
                 "label": "资金撤退",
                 "enabled": True,
-                "description": "CMF转负，视为资金开始撤退。",
+                "description": "CMF 转负时，视为资金开始撤退。",
                 "conditions": [
                     {"field": "cmf21", "operator": "<", "value": 0.0},
                 ],
@@ -109,7 +113,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "id": SELL_RULE_STALE,
                 "label": "新鲜度失效",
                 "enabled": True,
-                "description": "突破后迟迟不走强，考虑切换到更新鲜的标的。",
+                "description": "突破后迟迟不走强时，切换到更有活力的标的。",
                 "conditions": [
                     {"field": "score_hold_ratio", "operator": "<", "value": 0.5},
                     {"field": "position_return", "operator": "<", "value": 0.05},
@@ -128,10 +132,16 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "所有成交默认按下一交易日开盘价",
             ],
         },
+        "market_filter_rules": {
+            "enabled": True,
+            "min_avg_score": defaults.market_score_filter_min_avg,
+            "min_ma5_avg_score": defaults.market_score_filter_min_ma5,
+            "description": "当全市场评分温度低于阈值时，不再生成新的买入信号。",
+        },
         "execution_rules": {
             "signal_time": "T日收盘后",
             "buy_execution": "T+1日开盘",
-            "sell_execution": "触发条件后的T+1日开盘",
+            "sell_execution": "触发条件后的 T+1 日开盘",
             "benchmark_symbol": defaults.benchmark_symbol,
             "initial_capital": defaults.initial_capital,
             "fee_rate": defaults.fee_rate,

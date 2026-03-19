@@ -94,11 +94,34 @@ class BacktestRunner:
                 """,
                 (run_id,),
             ).fetchall()
+            signal_rows = conn.execute(
+                """
+                SELECT trade_date, symbol, score_total, rank_value, action, selected,
+                       buy_rule_hits, sell_rule_hits, breakout_floor, target_position, note
+                FROM backtest_signal
+                WHERE run_id = ?
+                ORDER BY trade_date ASC, action ASC, rank_value ASC, symbol ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            position_rows = conn.execute(
+                """
+                SELECT trade_date, symbol, shares, cost_price, close_price,
+                       market_value, weight, unrealized_pnl, hold_days
+                FROM backtest_position_daily
+                WHERE run_id = ?
+                ORDER BY trade_date ASC, weight DESC, symbol ASC
+                """,
+                (run_id,),
+            ).fetchall()
         payload = dict(run_row)
         payload["config"] = json.loads(payload["config_json"])
         payload["summary"] = json.loads(payload["summary_json"]) if payload.get("summary_json") else None
         payload["nav"] = [dict(row) for row in nav_rows]
         payload["trades"] = [dict(row) for row in trade_rows]
+        payload["signals"] = [self._deserialize_signal_row(dict(row)) for row in signal_rows]
+        payload["positions"] = [dict(row) for row in position_rows]
+        payload["signal_stats"] = self._build_signal_stats(payload["signals"])
         return payload
 
     def _normalize_config(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -114,10 +137,20 @@ class BacktestRunner:
         merged["name"] = str(merged.get("name") or defaults["name"])
         merged["benchmark_symbol"] = str(merged.get("benchmark_symbol") or defaults["benchmark_symbol"])
         merged["lookback_days"] = max(int(merged.get("lookback_days") or defaults["lookback_days"]), 2)
+        merged["start_date"] = str(merged.get("start_date") or "").strip() or None
+        merged["end_date"] = str(merged.get("end_date") or "").strip() or None
+        if merged["start_date"] and merged["end_date"] and merged["start_date"] > merged["end_date"]:
+            raise ValueError("回测开始日期不能晚于结束日期")
         merged["max_positions"] = max(int(merged.get("max_positions") or defaults["max_positions"]), 1)
         merged["initial_capital"] = float(merged.get("initial_capital") or DEFAULT_INITIAL_CAPITAL)
         merged["fee_rate"] = max(float(merged.get("fee_rate") or defaults["fee_rate"]), 0.0)
         merged["slippage_rate"] = max(float(merged.get("slippage_rate") or defaults["slippage_rate"]), 0.0)
+        merged["market_score_filter_min_avg"] = float(
+            merged.get("market_score_filter_min_avg") or defaults["market_score_filter_min_avg"]
+        )
+        merged["market_score_filter_min_ma5"] = float(
+            merged.get("market_score_filter_min_ma5") or defaults["market_score_filter_min_ma5"]
+        )
         merged["buy_timing"] = "next_open"
         merged["sell_timing"] = "next_open"
         merged["allow_pyramiding"] = False
@@ -157,13 +190,18 @@ class BacktestRunner:
             return int(cursor.lastrowid)
 
     def _execute_run(self, run_id: int, config: dict[str, Any]) -> dict[str, Any]:
-        trade_dates = self._load_trade_dates(config["lookback_days"])
+        trade_dates = self._load_trade_dates(
+            config["lookback_days"],
+            start_date=config.get("start_date"),
+            end_date=config.get("end_date"),
+        )
         if len(trade_dates) < 2:
             raise ValueError(f"可用于回测的 daily_score 交易日不足，当前仅有 {len(trade_dates)} 天。")
 
         start_date = trade_dates[0]
         end_date = trade_dates[-1]
         score_rows = self._load_score_rows(start_date, end_date)
+        market_score_map = self._load_market_score_map(start_date, end_date)
         benchmark_close_map = self._load_benchmark_close_map(start_date, end_date)
         price_map = self._load_price_map(start_date, end_date)
 
@@ -187,6 +225,8 @@ class BacktestRunner:
         position_rows: list[tuple] = []
         closed_returns: list[float] = []
         closed_holding_days: list[int] = []
+        market_filter_blocked_days = 0
+        market_filter_blocked_buy_signals = 0
 
         enabled_buy_rules = set(config["enabled_buy_rules"])
         enabled_sell_rules = set(config["enabled_sell_rules"])
@@ -325,10 +365,12 @@ class BacktestRunner:
             nav = round(cash + market_value, 4)
             nav_peak = max(nav_peak, nav)
             drawdown = round((nav_peak - nav) / nav_peak, 6) if nav_peak else 0.0
-            prev_nav = nav_rows[-1][3] if nav_rows else initial_capital
+            prev_nav = nav_rows[-1][4] if nav_rows else initial_capital
             daily_return = round((nav - prev_nav) / prev_nav, 6) if prev_nav else 0.0
             turnover = round(daily_turnover / max(prev_nav, 0.01), 6)
-            nav_rows.append((run_id, trade_date, round(cash, 4), round(market_value, 4), nav, daily_return, drawdown, len(positions), turnover))
+            nav_rows.append(
+                (run_id, trade_date, round(cash, 4), round(market_value, 4), nav, daily_return, drawdown, len(positions), turnover)
+            )
 
             daily_rows = by_date.get(trade_date, [])
             if not next_trade_date:
@@ -336,6 +378,9 @@ class BacktestRunner:
 
             available_slots = max(config["max_positions"] - len(positions), 0)
             buy_candidates: list[dict[str, Any]] = []
+            market_filter = market_score_map.get(trade_date, {})
+            market_filter_passed = self._passes_market_filter(market_filter, config)
+            blocked_today = False
             for rank_value, row in enumerate(daily_rows, start=1):
                 symbol = str(row["symbol"])
                 breakout_floor = self._breakout_floor(row)
@@ -371,6 +416,10 @@ class BacktestRunner:
                 buy_hits = self._evaluate_buy_rules(row, enabled_buy_rules=enabled_buy_rules)
                 if not buy_hits:
                     continue
+                if not market_filter_passed:
+                    blocked_today = True
+                    market_filter_blocked_buy_signals += 1
+                    continue
                 buy_candidates.append(
                     {
                         "symbol": symbol,
@@ -380,6 +429,9 @@ class BacktestRunner:
                         "breakout_floor": breakout_floor,
                     }
                 )
+
+            if blocked_today:
+                market_filter_blocked_days += 1
 
             if buy_candidates and available_slots > 0:
                 selected_buys = buy_candidates[:available_slots]
@@ -428,23 +480,40 @@ class BacktestRunner:
             "trade_count": len(trade_rows),
             "buy_count": sum(1 for row in trade_rows if row[2] == "buy"),
             "sell_count": sum(1 for row in trade_rows if row[2] == "sell"),
+            "signal_count": len(signal_rows),
+            "selected_buy_signal_count": sum(1 for row in signal_rows if row[6] == 1 and row[5] == "buy"),
+            "market_filter_blocked_days": market_filter_blocked_days,
+            "market_filter_blocked_buy_signals": market_filter_blocked_buy_signals,
+            "market_score_filter_min_avg": config["market_score_filter_min_avg"],
+            "market_score_filter_min_ma5": config["market_score_filter_min_ma5"],
             "win_rate": round(sum(1 for value in closed_returns if value > 0) / len(closed_returns), 6) if closed_returns else 0.0,
             "avg_holding_days": round(sum(closed_holding_days) / len(closed_holding_days), 2) if closed_holding_days else 0.0,
             "available_signal_days": len(trade_dates),
         }
         return summary
 
-    def _load_trade_dates(self, lookback_days: int) -> list[str]:
+    def _load_trade_dates(self, lookback_days: int, start_date: str | None = None, end_date: str | None = None) -> list[str]:
         with self.db.connect() as conn:
+            clauses: list[str] = []
+            params: list[str] = []
+            if start_date:
+                clauses.append("trade_date >= ?")
+                params.append(start_date)
+            if end_date:
+                clauses.append("trade_date <= ?")
+                params.append(end_date)
+            where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT trade_date
                 FROM daily_score
+                {where_clause}
                 ORDER BY trade_date ASC
-                """
+                """,
+                params,
             ).fetchall()
         trade_dates = [str(row["trade_date"]) for row in rows]
-        if len(trade_dates) <= lookback_days:
+        if start_date or end_date or len(trade_dates) <= lookback_days:
             return trade_dates
         return trade_dates[-lookback_days:]
 
@@ -464,6 +533,34 @@ class BacktestRunner:
                 (start_date, end_date),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def _load_market_score_map(self, start_date: str, end_date: str) -> dict[str, dict[str, float]]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT stats.trade_date,
+                       stats.avg_score,
+                       AVG(stats.avg_score) OVER (
+                           ORDER BY stats.trade_date
+                           ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+                       ) AS ma5_avg_score
+                FROM (
+                    SELECT trade_date, AVG(score_total) AS avg_score
+                    FROM daily_score
+                    WHERE trade_date BETWEEN ? AND ?
+                    GROUP BY trade_date
+                ) stats
+                ORDER BY stats.trade_date ASC
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        return {
+            str(row["trade_date"]): {
+                "avg_score": round(float(row["avg_score"]), 4) if row["avg_score"] is not None else 0.0,
+                "ma5_avg_score": round(float(row["ma5_avg_score"]), 4) if row["ma5_avg_score"] is not None else 0.0,
+            }
+            for row in rows
+        }
 
     def _load_benchmark_close_map(self, start_date: str, end_date: str) -> dict[str, float]:
         with self.db.connect() as conn:
@@ -614,6 +711,15 @@ class BacktestRunner:
                 hits.append(BUY_RULE_MOMENTUM)
         return hits
 
+    @staticmethod
+    def _passes_market_filter(market_filter: dict[str, float], config: dict[str, Any]) -> bool:
+        if not market_filter:
+            return False
+        return (
+            float(market_filter.get("avg_score") or 0.0) >= float(config["market_score_filter_min_avg"])
+            and float(market_filter.get("ma5_avg_score") or 0.0) >= float(config["market_score_filter_min_ma5"])
+        )
+
     def _evaluate_sell_rules(
         self,
         row: dict[str, Any],
@@ -642,6 +748,32 @@ class BacktestRunner:
         if SELL_RULE_STALE in enabled_sell_rules and score_hold_ratio < 0.5 and position_return < 0.05:
             hits.append(SELL_RULE_STALE)
         return hits
+
+    @staticmethod
+    def _deserialize_signal_row(row: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(row)
+        payload["buy_rule_hits"] = json.loads(payload["buy_rule_hits"]) if payload.get("buy_rule_hits") else []
+        payload["sell_rule_hits"] = json.loads(payload["sell_rule_hits"]) if payload.get("sell_rule_hits") else []
+        return payload
+
+    @staticmethod
+    def _build_signal_stats(signal_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        buy_rule_counts: dict[str, int] = {}
+        sell_rule_counts: dict[str, int] = {}
+        selected_buy_count = 0
+        for row in signal_rows:
+            if row.get("action") == "buy" and int(row.get("selected") or 0) == 1:
+                selected_buy_count += 1
+            for rule_id in row.get("buy_rule_hits") or []:
+                buy_rule_counts[rule_id] = buy_rule_counts.get(rule_id, 0) + 1
+            for rule_id in row.get("sell_rule_hits") or []:
+                sell_rule_counts[rule_id] = sell_rule_counts.get(rule_id, 0) + 1
+        return {
+            "buy_rule_counts": buy_rule_counts,
+            "sell_rule_counts": sell_rule_counts,
+            "selected_buy_count": selected_buy_count,
+            "signal_count": len(signal_rows),
+        }
 
     @staticmethod
     def _benchmark_return(benchmark_close_map: dict[str, float], start_date: str, end_date: str) -> float:

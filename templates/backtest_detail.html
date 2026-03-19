@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>回测详情</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero detail-hero">
+            <div>
+                <p class="eyebrow">BACKTEST DETAIL</p>
+                <h1>{{ detail.name }}</h1>
+                <p class="subtitle">{{ detail.start_date }} ~ {{ detail.end_date }}</p>
+            </div>
+            <div class="detail-stats">
+                <div class="mini-card"><span>状态</span><strong>{{ detail.status }}</strong></div>
+                <div class="mini-card"><span>总收益</span><strong>{{ '%.2f'|format(detail.summary.total_return * 100) if detail.summary else '0.00' }}%</strong></div>
+                <div class="mini-card"><span>最大回撤</span><strong>{{ '%.2f'|format(detail.summary.max_drawdown * 100) if detail.summary else '0.00' }}%</strong></div>
+                <div class="mini-card"><span>交易次数</span><strong>{{ detail.summary.trade_count if detail.summary else 0 }}</strong></div>
+                <div class="mini-card"><span>信号日数</span><strong>{{ detail.summary.available_signal_days if detail.summary else 0 }}</strong></div>
+            </div>
+        </section>
+
+        <section class="chart-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>每日平均分走势</h2>
+                    <p>回测期间可参考最近市场评分温度，辅助理解策略表现。</p>
+                </div>
+                <a class="detail-link" href="{{ url_for('backtests') }}">返回回测中心</a>
+            </div>
+            <div class="chart-box">{{ score_trend_svg|safe }}</div>
+        </section>
+
+        <section class="stats">
+            <article class="card">
+                <span>基准收益</span>
+                <strong>{{ '%.2f'|format(detail.summary.benchmark_return * 100) if detail.summary else '0.00' }}%</strong>
+            </article>
+            <article class="card">
+                <span>超额收益</span>
+                <strong>{{ '%.2f'|format(detail.summary.excess_return * 100) if detail.summary else '0.00' }}%</strong>
+            </article>
+            <article class="card">
+                <span>买入信号数</span>
+                <strong>{{ detail.signal_stats.selected_buy_count if detail.signal_stats else 0 }}</strong>
+            </article>
+            <article class="card">
+                <span>总信号数</span>
+                <strong>{{ detail.signal_stats.signal_count if detail.signal_stats else 0 }}</strong>
+            </article>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>规则命中统计</h2>
+            </div>
+            <p class="summary-block">买入规则：{{ detail.signal_stats.buy_rule_counts if detail.signal_stats else {} }}</p>
+            <p class="summary-block">卖出规则：{{ detail.signal_stats.sell_rule_counts if detail.signal_stats else {} }}</p>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>交易记录</h2>
+            </div>
+            {% if detail.trades %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>日期</th>
+                        <th>代码</th>
+                        <th>方向</th>
+                        <th>价格</th>
+                        <th>数量</th>
+                        <th>原因</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in detail.trades %}
+                    <tr>
+                        <td>{{ row.execution_date }}</td>
+                        <td>{{ row.symbol }}</td>
+                        <td>{{ row.side }}</td>
+                        <td>{{ row.price }}</td>
+                        <td>{{ row.shares }}</td>
+                        <td>{{ row.reason or '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="summary-block">当前回测没有成交记录。</p>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>

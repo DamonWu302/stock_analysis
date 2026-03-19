@@ -108,6 +108,77 @@ def build_candlestick_svg(history: pd.DataFrame, width: int = 900, height: int =
     return "".join(parts)
 
 
+def build_score_trend_svg(rows: list[dict], width: int = 900, height: int = 280) -> str:
+    if not rows:
+        return "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'><text x='24' y='48'>No chart data</text></svg>"
+
+    df = pd.DataFrame(rows).copy()
+    df["avg_score"] = pd.to_numeric(df["avg_score"], errors="coerce")
+    df["ma5_avg_score"] = pd.to_numeric(df["ma5_avg_score"], errors="coerce")
+    df = df.dropna(subset=["avg_score"]).reset_index(drop=True)
+    if df.empty:
+        return "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'><text x='24' y='48'>No chart data</text></svg>"
+
+    padding = 28
+    chart_width = width - padding * 2
+    chart_height = height - padding * 2
+    min_value = float(df[["avg_score", "ma5_avg_score"]].min(numeric_only=True).min())
+    max_value = float(df[["avg_score", "ma5_avg_score"]].max(numeric_only=True).max())
+    value_range = max(max_value - min_value, 0.01)
+    step_x = chart_width / max(len(df) - 1, 1)
+
+    def y_scale(value: float) -> float:
+        return padding + (max_value - value) / value_range * chart_height
+
+    def build_path(column: str, color: str) -> str:
+        points: list[str] = []
+        for index, value in enumerate(df[column]):
+            if pd.isna(value):
+                continue
+            x = padding + index * step_x
+            y = y_scale(float(value))
+            points.append(f"{x:.2f},{y:.2f}")
+        if len(points) < 2:
+            return ""
+        return f"<polyline fill='none' stroke='{color}' stroke-width='2.2' points='{' '.join(points)}' />"
+
+    grid_lines: list[str] = []
+    for step in range(5):
+        y = padding + chart_height * step / 4
+        value = max_value - (value_range * step / 4)
+        grid_lines.append(
+            f"<line x1='{padding}' x2='{width - padding}' y1='{y:.2f}' y2='{y:.2f}' stroke='rgba(31,41,51,.08)' stroke-width='1' />"
+        )
+        grid_lines.append(
+            f"<text x='{padding - 2}' y='{y - 6:.2f}' fill='#6b7280' font-size='11' text-anchor='end'>{value:.1f}</text>"
+        )
+
+    labels: list[str] = []
+    for index, row in enumerate(df.to_dict("records")):
+        if index not in {0, len(df) // 2, len(df) - 1}:
+            continue
+        x = padding + index * step_x
+        labels.append(
+            f"<text x='{x:.2f}' y='{height - 8}' fill='#6b7280' font-size='11' text-anchor='middle'>{html.escape(str(row['trade_date'])[5:])}</text>"
+        )
+
+    latest_avg = float(df.iloc[-1]["avg_score"])
+    latest_ma5 = float(df.iloc[-1]["ma5_avg_score"]) if not pd.isna(df.iloc[-1]["ma5_avg_score"]) else latest_avg
+    parts = [
+        f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {width} {height}' role='img' aria-label='每日平均分走势'>",
+        "<rect width='100%' height='100%' fill='#fffaf4' rx='20' />",
+        f"<text x='{padding}' y='20' fill='#6b7280' font-size='12'>最近 {len(df)} 个交易日每日平均分走势</text>",
+        f"<text x='{padding + 240}' y='20' fill='#b45309' font-size='12'>平均分 {latest_avg:.2f}</text>",
+        f"<text x='{padding + 360}' y='20' fill='#0f766e' font-size='12'>5日均线 {latest_ma5:.2f}</text>",
+        *grid_lines,
+        build_path("avg_score", "#b45309"),
+        build_path("ma5_avg_score", "#0f766e"),
+        *labels,
+        "</svg>",
+    ]
+    return "".join(parts)
+
+
 def _build_ma_path(df: pd.DataFrame, column: str, color: str, padding: int, step_x: float, y_scale) -> str:
     points: list[str] = []
     for index, value in enumerate(df[column]):

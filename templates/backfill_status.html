@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% if task and task.status == 'running' %}
+    <meta http-equiv="refresh" content="3">
+    {% endif %}
+    <title>历史回填任务</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero detail-hero">
+            <div>
+                <p class="eyebrow">HISTORICAL BACKFILL</p>
+                <h1>{% if task %}历史回填任务 #{{ task.id }}{% else %}历史回填任务{% endif %}</h1>
+                <p class="subtitle">
+                    {% if task %}
+                    {{ task.message or '等待任务更新' }}
+                    {% else %}
+                    用于按日期区间或最近交易日范围回填 `daily_factor` 和 `daily_score`。
+                    {% endif %}
+                </p>
+            </div>
+            <div class="detail-stats">
+                <div class="mini-card"><span>阶段</span><strong>{{ task.phase_label if task else '-' }}</strong></div>
+                <div class="mini-card"><span>状态</span><strong>{{ task.status if task else '-' }}</strong></div>
+                <div class="mini-card"><span>模式</span><strong>{{ task.mode_label if task else '普通回填' }}</strong></div>
+                <div class="mini-card"><span>进度</span><strong>{{ task.progress_current if task else 0 }}/{{ task.progress_total if task else 0 }}</strong></div>
+                <div class="mini-card"><span>范围</span><strong>{{ task.range_label if task else '-' }}</strong></div>
+            </div>
+        </section>
+
+        {% if error %}
+        <section class="alert">
+            <strong>操作失败：</strong>{{ error }}
+        </section>
+        {% endif %}
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>发起回填</h2>
+                <span>填写日期区间时将优先按区间回填；留空则按最近交易日数回填。</span>
+            </div>
+            <form class="control-panel" method="post" action="{{ url_for('start_backfill_task') }}">
+                <label>
+                    开始日期
+                    <input type="date" name="start_date" value="{{ defaults.start_date }}">
+                </label>
+                <label>
+                    结束日期
+                    <input type="date" name="end_date" value="{{ defaults.end_date }}">
+                </label>
+                <label>
+                    最近交易日数
+                    <input type="number" name="days" min="1" value="{{ defaults.days }}">
+                </label>
+                <label>
+                    分批天数
+                    <input type="number" name="batch_size" min="1" value="{{ defaults.batch_size }}">
+                </label>
+                <button type="submit">开始回填</button>
+                <a class="detail-link" href="{{ url_for('index') }}">返回首页</a>
+            </form>
+            {% if task and task.status != 'running' and task.progress_current < task.progress_total %}
+            <form class="control-panel" method="post" action="{{ url_for('start_backfill_task') }}">
+                <input type="hidden" name="resume_task_id" value="{{ task.id }}">
+                <input type="hidden" name="days" value="{{ task.days }}">
+                <input type="hidden" name="batch_size" value="{{ task.batch_size }}">
+                <input type="hidden" name="start_date" value="{{ task.start_date or '' }}">
+                <input type="hidden" name="end_date" value="{{ task.end_date or '' }}">
+                <button type="submit">从当前进度继续续补</button>
+            </form>
+            {% endif %}
+        </section>
+
+        {% if task %}
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>回填进度</h2>
+                <span>{{ task.progress_percent }}%</span>
+            </div>
+            <div class="progress-track">
+                <div class="progress-bar" style="width: {{ task.progress_percent }}%;"></div>
+            </div>
+        </section>
+
+        <section class="stats">
+            <article class="card">
+                <span>累计因子行数</span>
+                <strong>{{ task.factor_rows }}</strong>
+            </article>
+            <article class="card">
+                <span>累计评分行数</span>
+                <strong>{{ task.score_rows }}</strong>
+            </article>
+            <article class="card">
+                <span>单日平均耗时</span>
+                <strong>{{ task.avg_item_text }}</strong>
+            </article>
+            <article class="card">
+                <span>预计完成时间</span>
+                <strong>{{ task.eta_text|fmt_dt }}</strong>
+            </article>
+            <article class="card">
+                <span>最近处理日期</span>
+                <strong>{{ task.last_trade_date or '-' }}</strong>
+            </article>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>任务详情</h2>
+            </div>
+            <p class="summary-block">开始时间：{{ task.started_at|fmt_dt }}</p>
+            <p class="summary-block">结束时间：{{ (task.finished_at or '-')|fmt_dt }}</p>
+            <p class="summary-block">回填范围：{{ task.range_label }}</p>
+            <p class="summary-block">断点续补来源：{{ task.resume_from_task_id or '-' }}</p>
+            <p class="summary-block">当前说明：{{ task.message or '-' }}</p>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>批次明细日志</h2>
+                <span>查看每一批处理的日期范围、写入行数和当前状态</span>
+            </div>
+            {% if task.batches %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>批次</th>
+                        <th>状态</th>
+                        <th>日期范围</th>
+                        <th>完成日期数</th>
+                        <th>因子行数</th>
+                        <th>评分行数</th>
+                        <th>说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in task.batches %}
+                    <tr>
+                        <td>#{{ row.batch_index }}</td>
+                        <td>{{ row.status }}</td>
+                        <td>{{ row.start_trade_date or '-' }} ~ {{ row.end_trade_date or '-' }}</td>
+                        <td>{{ row.completed_dates }}</td>
+                        <td>{{ row.factor_rows }}</td>
+                        <td>{{ row.score_rows }}</td>
+                        <td>{{ row.message or '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="summary-block">当前还没有批次日志，任务可能刚创建或尚未进入批处理。</p>
+            {% endif %}
+        </section>
+        {% endif %}
+
+        {% if recent_tasks %}
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>最近回填任务</h2>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务</th>
+                        <th>状态</th>
+                        <th>阶段</th>
+                        <th>范围</th>
+                        <th>进度</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in recent_tasks %}
+                    <tr>
+                        <td>#{{ row.id }}</td>
+                        <td>{{ row.status }}</td>
+                        <td>{{ row.phase_label }}</td>
+                        <td>{{ row.range_label }}</td>
+                        <td>{{ row.progress_current }}/{{ row.progress_total }}</td>
+                        <td><a class="detail-link" href="{{ url_for('backfill_task_status', task_id=row.id) }}">查看状态</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+    </main>
+</body>
+</html>

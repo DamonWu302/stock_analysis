@@ -44,6 +44,7 @@ class StockAnalysisService:
         self.backtest_runner = BacktestRunner(self.db)
         self._last_cache_mode = "unknown"
         self._recover_stale_tasks()
+        self._recover_stale_backfill_tasks()
 
     def start_background_run(self, provider_name: str | None = None, limit: int | None = None) -> int:
         provider_name = provider_name or settings.default_provider
@@ -291,61 +292,356 @@ class StockAnalysisService:
     def backtest_detail(self, run_id: int) -> dict | None:
         return self.backtest_runner.run_detail(run_id)
 
-    def backfill_daily_tables(self, days: int = 120) -> dict:
-        target_dates = self._load_backfill_trade_dates(days)
-        if not target_dates:
-            return {"trade_dates": 0, "factor_rows": 0, "score_rows": 0, "symbols": 0}
+    def score_trend(self, days: int = 20) -> list[dict]:
+        days = max(int(days), 2)
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                WITH daily AS (
+                    SELECT trade_date, COUNT(*) AS sample_size, AVG(score_total) AS avg_score
+                    FROM daily_score
+                    GROUP BY trade_date
+                ),
+                recent AS (
+                    SELECT trade_date, sample_size, avg_score
+                    FROM daily
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                ),
+                chronological AS (
+                    SELECT trade_date, sample_size, avg_score
+                    FROM recent
+                    ORDER BY trade_date ASC
+                )
+                SELECT trade_date,
+                       sample_size,
+                       ROUND(avg_score, 4) AS avg_score,
+                       ROUND(AVG(avg_score) OVER (ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW), 4) AS ma5_avg_score
+                FROM chronological
+                ORDER BY trade_date ASC
+                """,
+                (days,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
+    def backfill_daily_tables(
+        self,
+        days: int = 120,
+        batch_size: int = 10,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        return self._backfill_daily_tables(
+            days=days,
+            batch_size=batch_size,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def start_backfill_task(
+        self,
+        days: int = 120,
+        batch_size: int = 10,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        resume_task_id: int | None = None,
+    ) -> int:
+        days = max(int(days), 1)
+        batch_size = max(int(batch_size), 1)
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("开始日期不能晚于结束日期")
+        started_at = datetime.now().isoformat(timespec="seconds")
+        with self.db.connect() as conn:
+            if resume_task_id:
+                row = conn.execute(
+                    """
+                    SELECT id, days, start_date, end_date, batch_size, progress_current, progress_total
+                    FROM backfill_task
+                    WHERE id = ?
+                    """,
+                    (resume_task_id,),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"未找到历史回填任务 {resume_task_id}")
+                days = int(row["days"])
+                start_date = row["start_date"]
+                end_date = row["end_date"]
+                batch_size = int(row["batch_size"])
+                conn.execute(
+                    """
+                    UPDATE backfill_task
+                    SET status = 'running',
+                        phase = 'pending',
+                        started_at = ?,
+                        finished_at = NULL,
+                        resume_from_task_id = ?,
+                        message = '正在恢复历史回填任务'
+                    WHERE id = ?
+                    """,
+                    (started_at, resume_task_id, resume_task_id),
+                )
+                task_id = int(resume_task_id)
+                start_offset = int(row["progress_current"] or 0)
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO backfill_task
+                    (status, phase, started_at, days, start_date, end_date, batch_size, progress_current, progress_total, message)
+                    VALUES ('running', 'pending', ?, ?, ?, ?, ?, 0, 0, ?)
+                    """,
+                    (started_at, days, start_date, end_date, batch_size, "任务已创建，等待回填"),
+                )
+                task_id = int(cursor.lastrowid)
+                start_offset = 0
+
+        thread = threading.Thread(
+            target=self._run_backfill_task,
+            args=(task_id, days, batch_size, start_date, end_date, start_offset, resume_task_id),
+            daemon=True,
+        )
+        thread.start()
+        return task_id
+
+    def latest_backfill_task(self) -> dict | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, status, phase, started_at, finished_at, days, start_date, end_date, batch_size,
+                       progress_current, progress_total, factor_rows, score_rows,
+                       last_trade_date, message, resume_from_task_id
+                FROM backfill_task
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._build_backfill_task_payload(dict(row)) if row else None
+
+    def recent_backfill_tasks(self, limit: int = 10) -> list[dict]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, status, phase, started_at, finished_at, days, start_date, end_date, batch_size,
+                       progress_current, progress_total, factor_rows, score_rows,
+                       last_trade_date, message, resume_from_task_id
+                FROM backfill_task
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._build_backfill_task_payload(dict(row)) for row in rows]
+
+    def backfill_task_detail(self, task_id: int) -> dict | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, status, phase, started_at, finished_at, days, start_date, end_date, batch_size,
+                       progress_current, progress_total, factor_rows, score_rows,
+                       last_trade_date, message, resume_from_task_id
+                FROM backfill_task
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            batches = conn.execute(
+                """
+                SELECT id, task_id, batch_index, status, started_at, finished_at,
+                       start_trade_date, end_trade_date, completed_dates,
+                       factor_rows, score_rows, message
+                FROM backfill_task_batch
+                WHERE task_id = ?
+                ORDER BY batch_index ASC, id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        if not row:
+            return None
+        payload = self._build_backfill_task_payload(dict(row))
+        payload["batches"] = [dict(batch) for batch in batches]
+        return payload
+
+    def _create_backfill_batch(
+        self,
+        task_id: int,
+        batch_index: int,
+        start_trade_date: str,
+        end_trade_date: str,
+    ) -> int:
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO backfill_task_batch
+                (task_id, batch_index, status, started_at, start_trade_date, end_trade_date, message)
+                VALUES (?, ?, 'running', ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    batch_index,
+                    datetime.now().isoformat(timespec="seconds"),
+                    start_trade_date,
+                    end_trade_date,
+                    f"?? {start_trade_date} ? {end_trade_date}",
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def _update_backfill_batch(self, batch_id: int, **fields) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in fields.keys())
+        values = list(fields.values()) + [batch_id]
+        with self.db.connect() as conn:
+            conn.execute(f"UPDATE backfill_task_batch SET {assignments} WHERE id = ?", values)
+
+    def _backfill_daily_tables(
+        self,
+        days: int = 120,
+        batch_size: int = 10,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        start_offset: int = 0,
+        progress_callback=None,
+    ) -> dict:
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("开始日期不能晚于结束日期")
+        target_dates = self._load_backfill_trade_dates(days=days, start_date=start_date, end_date=end_date)
+        if not target_dates:
+            return {
+                "trade_dates": 0,
+                "factor_rows": 0,
+                "score_rows": 0,
+                "symbols": 0,
+                "batches": 0,
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+
+        batch_size = max(int(batch_size), 1)
+        start_offset = max(int(start_offset), 0)
+        target_dates = target_dates[start_offset:]
+        if not target_dates:
+            return {
+                "trade_dates": 0,
+                "factor_rows": 0,
+                "score_rows": 0,
+                "symbols": 0,
+                "batches": 0,
+                "start_date": start_date,
+                "end_date": end_date,
+                "batch_size": batch_size,
+                "completed_dates": start_offset,
+            }
+
+        effective_start_date = target_dates[0]
+        effective_end_date = target_dates[-1]
         sector_map = self._load_latest_sector_map()
-        benchmark = self._load_prepared_benchmark_for_backfill(target_dates[0], target_dates[-1])
+        benchmark = self._load_prepared_benchmark_for_backfill(effective_start_date, effective_end_date)
         benchmark_windows = self._build_benchmark_windows(benchmark, target_dates)
         sector_metrics = self._build_historical_sector_metrics(target_dates, sector_map)
-        symbol_histories = self._load_prepared_symbol_histories_for_backfill(target_dates[0], target_dates[-1], set(sector_map.keys()))
+        symbol_histories = self._load_prepared_symbol_histories_for_backfill(
+            effective_start_date,
+            effective_end_date,
+            set(sector_map.keys()),
+        )
 
-        factor_rows: list[dict] = []
-        score_rows: list[dict] = []
         symbols_processed = 0
+        total_factor_rows = 0
+        total_score_rows = 0
+        batches_completed = 0
 
-        for symbol, history in symbol_histories.items():
-            if history.empty:
-                continue
-            symbols_processed += 1
-            sector = sector_map.get(symbol, "未分类")
-            trade_date_labels = history["trade_date"].dt.strftime("%Y-%m-%d")
-            matched_rows = history.index[trade_date_labels.isin(target_dates)].tolist()
-            for row_index in matched_rows:
-                if row_index < 59:
-                    continue
-                trade_date = str(trade_date_labels.iloc[row_index])
-                benchmark_window = benchmark_windows.get(trade_date)
-                if benchmark_window is None or len(benchmark_window) < 20:
-                    continue
-                metric = sector_metrics.get((trade_date, sector), {"sector_change": 0.0, "sector_up_ratio": 0.0})
-                snapshot = pd.Series(
+        for batch_start in range(0, len(target_dates), batch_size):
+            batch_dates = target_dates[batch_start : batch_start + batch_size]
+            batch_end_offset = start_offset + batch_start + len(batch_dates)
+            batch_index = (batch_start // batch_size) + 1
+            batch_id = None
+            if progress_callback:
+                batch_id = progress_callback(
                     {
-                        "symbol": symbol,
-                        "sector": sector,
-                        "sector_change": metric["sector_change"],
-                        "sector_up_ratio": metric["sector_up_ratio"],
+                        "event": "batch_started",
+                        "batch_index": batch_index,
+                        "start_trade_date": batch_dates[0],
+                        "end_trade_date": batch_dates[-1],
                     }
                 )
-                history_window = history.iloc[: row_index + 1]
-                factor = build_daily_factor_snapshot_prepared(snapshot, history_window, benchmark_window, trade_date)
-                if factor:
-                    factor_rows.append(factor)
-                score = build_daily_score_snapshot_prepared(snapshot, history_window, benchmark_window, trade_date)
-                if score:
-                    score_rows.append(score)
+                progress_callback(
+                    {
+                        "phase": "calculating",
+                        "completed_dates": start_offset + batch_start,
+                        "factor_rows": total_factor_rows,
+                        "score_rows": total_score_rows,
+                        "last_trade_date": batch_dates[-1],
+                        "message": f"正在计算 {batch_dates[0]} 至 {batch_dates[-1]} 的历史因子",
+                        "batch_id": batch_id,
+                    }
+                )
 
-        self._save_daily_factors(factor_rows)
-        self._save_daily_scores(score_rows)
+            factor_rows: list[dict] = []
+            score_rows: list[dict] = []
+
+            for symbol, history in symbol_histories.items():
+                if history.empty:
+                    continue
+                if batch_start == 0:
+                    symbols_processed += 1
+                sector = sector_map.get(symbol, "未分类")
+                trade_date_labels = history["trade_date"].dt.strftime("%Y-%m-%d")
+                matched_rows = history.index[trade_date_labels.isin(batch_dates)].tolist()
+                for row_index in matched_rows:
+                    if row_index < 59:
+                        continue
+                    trade_date = str(trade_date_labels.iloc[row_index])
+                    benchmark_window = benchmark_windows.get(trade_date)
+                    if benchmark_window is None or len(benchmark_window) < 20:
+                        continue
+                    metric = sector_metrics.get((trade_date, sector), {"sector_change": 0.0, "sector_up_ratio": 0.0})
+                    snapshot = pd.Series(
+                        {
+                            "symbol": symbol,
+                            "sector": sector,
+                            "sector_change": metric["sector_change"],
+                            "sector_up_ratio": metric["sector_up_ratio"],
+                        }
+                    )
+                    history_window = history.iloc[: row_index + 1]
+                    factor = build_daily_factor_snapshot_prepared(snapshot, history_window, benchmark_window, trade_date)
+                    if factor:
+                        factor_rows.append(factor)
+                    score = build_daily_score_snapshot_prepared(snapshot, history_window, benchmark_window, trade_date)
+                    if score:
+                        score_rows.append(score)
+
+            self._save_daily_factors(factor_rows)
+            self._save_daily_scores(score_rows)
+            total_factor_rows += len(factor_rows)
+            total_score_rows += len(score_rows)
+            batches_completed += 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "writing",
+                        "completed_dates": batch_end_offset,
+                        "factor_rows": total_factor_rows,
+                        "score_rows": total_score_rows,
+                        "last_trade_date": batch_dates[-1],
+                        "message": f"已完成到 {batch_dates[-1]}，累计评分 {total_score_rows} 条",
+                        "batch_id": batch_id,
+                        "batch_status": "completed",
+                        "batch_factor_rows": len(factor_rows),
+                        "batch_score_rows": len(score_rows),
+                    }
+                )
+
         return {
             "trade_dates": len(target_dates),
-            "factor_rows": len(factor_rows),
-            "score_rows": len(score_rows),
+            "factor_rows": total_factor_rows,
+            "score_rows": total_score_rows,
             "symbols": symbols_processed,
-            "start_date": target_dates[0],
-            "end_date": target_dates[-1],
+            "start_date": effective_start_date,
+            "end_date": effective_end_date,
+            "batch_size": batch_size,
+            "batches": batches_completed,
+            "completed_dates": start_offset + len(target_dates),
         }
 
     def latest_task(self) -> dict | None:
@@ -605,11 +901,35 @@ class StockAnalysisService:
                 (datetime.now().isoformat(timespec="seconds"),),
             )
 
+    def _recover_stale_backfill_tasks(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE backfill_task_batch
+                SET status = 'failed',
+                    finished_at = ?,
+                    message = '历史回填批次在应用重启前中断，可重新续补'
+                WHERE status = 'running'
+                """,
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+            conn.execute(
+                """
+                UPDATE backfill_task
+                SET status = 'failed',
+                    phase = 'failed',
+                    finished_at = ?,
+                    message = '历史回填任务在应用重启前中断，可从当前进度继续续补'
+                WHERE status = 'running'
+                """,
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+
     @staticmethod
     def _format_task_error(exc: Exception) -> str:
         message = str(exc)
         lower = message.lower()
-        if "baostock" in lower and ("reset" in lower or "10054" in lower or "网络" in message):
+        if "baostock" in lower and ("reset" in lower or "10054" in lower or "??" in message):
             return f"baostock network reset: {message}"
         if "llm api" in lower and ("reset" in lower or "10054" in lower):
             return f"llm api connection reset: {message}"
@@ -660,20 +980,24 @@ class StockAnalysisService:
                 eta_at = None
 
         task["avg_item_seconds"] = round(avg_seconds, 2) if avg_seconds is not None else None
-        task["avg_item_text"] = f"{avg_seconds:.2f} 秒/只" if avg_seconds is not None else "-"
+        task["avg_item_text"] = f"{avg_seconds:.2f} 秒/项" if avg_seconds is not None else "-"
         task["eta_at"] = eta_at
         task["eta_text"] = eta_at or ("已完成" if finished_at else "-")
+        if not eta_at and finished_at:
+            task["eta_text"] = "失败" if str(task.get("status") or "") == "failed" else "已完成"
         return task
 
     @staticmethod
     def _phase_label(phase: str, finished: bool, status: str) -> str:
-        if status == "completed" or phase == "completed" or finished:
-            return "已完成"
         if status == "failed" or phase == "failed":
             return "失败"
+        if status == "completed" or phase == "completed" or finished:
+            return "已完成"
         labels = {
             "pending": "等待中",
             "scanning": "扫描中",
+            "loading": "加载中",
+            "calculating": "计算中",
             "summarizing": "汇总中",
             "writing": "写库中",
         }
@@ -698,6 +1022,171 @@ class StockAnalysisService:
                 time.sleep(0.5 * (attempt + 1))
         if last_error:
             raise last_error
+
+    def _update_backfill_task(self, task_id: int, **fields) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in fields.keys())
+        values = list(fields.values()) + [task_id]
+        last_error = None
+        for attempt in range(3):
+            try:
+                with self.db.connect() as conn:
+                    conn.execute(f"UPDATE backfill_task SET {assignments} WHERE id = ?", values)
+                return
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                time.sleep(0.5 * (attempt + 1))
+        if last_error:
+            raise last_error
+
+    def _build_backfill_task_payload(self, task: dict) -> dict:
+        if not task:
+            return task
+        total = int(task.get("progress_total") or 0)
+        current = int(task.get("progress_current") or 0)
+        task["progress_percent"] = round((current / total) * 100, 1) if total else 0
+        task["mode_label"] = "断点续补" if task.get("resume_from_task_id") else "普通回填"
+        start_date = task.get("start_date")
+        end_date = task.get("end_date")
+        task["range_label"] = f"{start_date} ~ {end_date}" if start_date and end_date else (start_date or end_date or f"最近 {task.get('days') or 0} 个交易日")
+        message = str(task.get("message") or "")
+        if not message or self._looks_garbled(message):
+            task["message"] = self._default_backfill_message(task)
+        return self._enrich_task_timing(task)
+
+    @staticmethod
+    def _looks_garbled(message: str) -> bool:
+        text = str(message or "")
+        if not text:
+            return False
+        return ("?" in text and len(text.replace("?", "").strip()) < max(4, len(text) // 3)) or ("锟" in text)
+
+    @staticmethod
+    def _default_backfill_message(task: dict) -> str:
+        status = str(task.get("status") or "")
+        phase = str(task.get("phase") or "")
+        if status == "failed" or phase == "failed":
+            return "历史回填任务失败，可从当前进度继续续补"
+        if status == "completed" or phase == "completed":
+            return (
+                f"历史回填完成，共处理 {int(task.get('progress_total') or 0)} 个交易日，"
+                f"写入 {int(task.get('score_rows') or 0)} 条评分"
+            )
+        if phase == "loading":
+            return "正在加载历史交易日与缓存数据"
+        if phase == "calculating":
+            return "正在计算历史因子和评分"
+        if phase == "writing":
+            return "正在写入 daily_factor 和 daily_score"
+        return "任务已创建，等待回填"
+
+    def _run_backfill_task(
+        self,
+        task_id: int,
+        days: int,
+        batch_size: int,
+        start_date: str | None,
+        end_date: str | None,
+        start_offset: int,
+        resume_task_id: int | None,
+    ) -> None:
+        try:
+            with self.db.connect() as conn:
+                conn.execute("DELETE FROM backfill_task_batch WHERE task_id = ?", (task_id,))
+            target_dates = self._load_backfill_trade_dates(days=days, start_date=start_date, end_date=end_date)
+            total_dates = len(target_dates)
+            self._update_backfill_task(
+                task_id,
+                phase="loading",
+                progress_total=total_dates,
+                progress_current=min(start_offset, total_dates),
+                message="正在加载历史交易日与缓存数据",
+                started_at=datetime.now().isoformat(timespec="seconds"),
+            )
+
+            def progress_callback(payload: dict):
+                event = str(payload.get("event") or "")
+                if event == "batch_started":
+                    return self._create_backfill_batch(
+                        task_id=task_id,
+                        batch_index=int(payload.get("batch_index") or 0),
+                        start_trade_date=str(payload.get("start_trade_date") or ""),
+                        end_trade_date=str(payload.get("end_trade_date") or ""),
+                    )
+
+                completed_dates = int(payload.get("completed_dates") or start_offset)
+                phase = str(payload.get("phase") or "calculating")
+                self._update_backfill_task(
+                    task_id,
+                    phase=phase,
+                    progress_total=total_dates,
+                    progress_current=min(completed_dates, total_dates),
+                    factor_rows=int(payload.get("factor_rows") or 0),
+                    score_rows=int(payload.get("score_rows") or 0),
+                    last_trade_date=payload.get("last_trade_date"),
+                    message=payload.get("message") or "正在回填历史因子和评分",
+                )
+
+                batch_id = payload.get("batch_id")
+                if batch_id:
+                    batch_fields = {
+                        "status": str(payload.get("batch_status") or ("running" if phase != "writing" else "completed")),
+                        "completed_dates": int(payload.get("completed_dates") or 0),
+                        "factor_rows": int(payload.get("batch_factor_rows") or 0),
+                        "score_rows": int(payload.get("batch_score_rows") or 0),
+                        "message": payload.get("message") or "-",
+                    }
+                    if str(payload.get("batch_status") or "") == "completed":
+                        batch_fields["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                    self._update_backfill_batch(int(batch_id), **batch_fields)
+                return batch_id
+
+            result = self._backfill_daily_tables(
+                days=days,
+                batch_size=batch_size,
+                start_date=start_date,
+                end_date=end_date,
+                start_offset=start_offset,
+                progress_callback=progress_callback,
+            )
+            self._update_backfill_task(
+                task_id,
+                status="completed",
+                phase="completed",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                progress_total=total_dates,
+                progress_current=min(int(result.get("completed_dates") or total_dates), total_dates),
+                factor_rows=int(result.get("factor_rows") or 0),
+                score_rows=int(result.get("score_rows") or 0),
+                last_trade_date=result.get("end_date") or result.get("last_trade_date"),
+                message=(
+                    f"历史回填完成，共处理 {result.get('trade_dates', 0)} 个交易日，"
+                    f"写入 {result.get('score_rows', 0)} 条评分"
+                ),
+            )
+        except Exception as exc:
+            with self.db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE backfill_task_batch
+                    SET status = 'failed',
+                        finished_at = ?,
+                        message = ?
+                    WHERE task_id = ? AND status = 'running'
+                    """,
+                    (datetime.now().isoformat(timespec="seconds"), self._format_task_error(exc), task_id),
+                )
+            self._update_backfill_task(
+                task_id,
+                status="failed",
+                phase="failed",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                message=self._format_task_error(exc),
+            )
 
     def _mark_task_completed(self, task_id: int, result: dict) -> None:
         self._update_task(
@@ -809,16 +1298,29 @@ class StockAnalysisService:
         frame = pd.DataFrame([dict(row) for row in rows])
         return self._sanitize_benchmark_history(frame).tail(days).reset_index(drop=True)
 
-    def _load_backfill_trade_dates(self, days: int) -> list[str]:
+    def _load_backfill_trade_dates(self, days: int, start_date: str | None = None, end_date: str | None = None) -> list[str]:
         with self.db.connect() as conn:
+            clauses: list[str] = []
+            params: list[str] = []
+            if start_date:
+                clauses.append("trade_date >= ?")
+                params.append(start_date)
+            if end_date:
+                clauses.append("trade_date <= ?")
+                params.append(end_date)
+            where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT trade_date
                 FROM price_history
+                {where_clause}
                 ORDER BY trade_date ASC
-                """
+                """,
+                params,
             ).fetchall()
         trade_dates = [str(row["trade_date"]) for row in rows]
+        if start_date or end_date:
+            return trade_dates
         return trade_dates[-days:] if len(trade_dates) > days else trade_dates
 
     def _load_latest_sector_map(self) -> dict[str, str]:

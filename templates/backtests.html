@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>回测中心</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero">
+            <div>
+                <p class="eyebrow">BACKTEST HUB</p>
+                <h1>回测中心</h1>
+                <p class="subtitle">查看最近回测任务，并结合最近 20 个交易日的全市场平均分走势判断策略环境。</p>
+            </div>
+            <div class="control-panel">
+                <div class="hint">
+                    <strong>当前状态</strong>
+                    <span>回测执行引擎已接入 `daily_score / daily_factor / price_history`，可直接读取历史评分运行。</span>
+                </div>
+                <a class="detail-link" href="{{ url_for('index') }}">返回首页</a>
+            </div>
+        </section>
+
+        <section class="chart-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>每日平均分走势</h2>
+                    <p>用于观察最近市场环境强弱，辅助判断回测结果是否处于弱势区间。</p>
+                </div>
+            </div>
+            <div class="chart-box">{{ score_trend_svg|safe }}</div>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>最近回测</h2>
+            </div>
+            {% if runs %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>回测</th>
+                        <th>区间</th>
+                        <th>状态</th>
+                        <th>总收益</th>
+                        <th>最大回撤</th>
+                        <th>交易次数</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for run in runs %}
+                    <tr>
+                        <td>#{{ run.id }} {{ run.name }}</td>
+                        <td>{{ run.start_date }} ~ {{ run.end_date }}</td>
+                        <td>{{ run.status }}</td>
+                        <td>{{ '%.2f'|format((run.summary.total_return if run.summary else 0) * 100) }}%</td>
+                        <td>{{ '%.2f'|format((run.summary.max_drawdown if run.summary else 0) * 100) }}%</td>
+                        <td>{{ run.summary.trade_count if run.summary else 0 }}</td>
+                        <td><a class="detail-link" href="{{ url_for('backtest_detail_page', run_id=run.id) }}">查看详情</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="summary-block">当前还没有回测记录。</p>
+            {% endif %}
+        </section>
+    </main>
+</body>
+</html>
