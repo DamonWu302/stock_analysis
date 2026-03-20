@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -218,6 +220,33 @@ CREATE TABLE IF NOT EXISTS backtest_nav (
     FOREIGN KEY (run_id) REFERENCES backtest_run(id)
 );
 
+CREATE TABLE IF NOT EXISTS backtest_task (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'pending',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    progress_current INTEGER NOT NULL DEFAULT 0,
+    progress_total INTEGER NOT NULL DEFAULT 0,
+    last_trade_date TEXT,
+    message TEXT,
+    run_id INTEGER,
+    config_json TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES backtest_run(id)
+);
+
+CREATE TABLE IF NOT EXISTS backtest_template (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_key TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    config_json TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_builtin INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS backfill_task (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     status TEXT NOT NULL,
@@ -275,6 +304,7 @@ class Database:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             self._migrate(conn)
+            self._seed_backtest_templates(conn)
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -364,6 +394,19 @@ class Database:
                 "message": "TEXT",
             },
         )
+        Database._ensure_columns(
+            conn,
+            "backtest_task",
+            {
+                "phase": "TEXT NOT NULL DEFAULT 'pending'",
+                "progress_current": "INTEGER NOT NULL DEFAULT 0",
+                "progress_total": "INTEGER NOT NULL DEFAULT 0",
+                "last_trade_date": "TEXT",
+                "message": "TEXT",
+                "run_id": "INTEGER",
+                "config_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+        )
         conn.execute(
             """
             UPDATE backfill_task
@@ -375,7 +418,47 @@ class Database:
             WHERE phase IS NULL OR phase = ''
             """
         )
+        conn.execute(
+            """
+            UPDATE backtest_task
+            SET phase = CASE
+                WHEN status = 'completed' THEN 'completed'
+                WHEN status = 'failed' THEN 'failed'
+                ELSE phase
+            END
+            WHERE phase IS NULL OR phase = ''
+            """
+        )
         Database._cleanup_benchmark_history(conn)
+
+    @staticmethod
+    def _seed_backtest_templates(conn: sqlite3.Connection) -> None:
+        from .backtest import build_backtest_templates
+
+        now = datetime.now().isoformat(timespec="seconds")
+        for item in build_backtest_templates():
+            conn.execute(
+                """
+                INSERT INTO backtest_template
+                (template_key, name, description, config_json, sort_order, is_builtin, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(template_key) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    config_json = excluded.config_json,
+                    sort_order = excluded.sort_order,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    item["template_key"],
+                    item["name"],
+                    item.get("description"),
+                    json.dumps(item.get("config") or {}, ensure_ascii=False),
+                    int(item.get("sort_order") or 0),
+                    now,
+                    now,
+                ),
+            )
 
     @staticmethod
     def _ensure_columns(conn: sqlite3.Connection, table_name: str, columns: dict[str, str]) -> None:

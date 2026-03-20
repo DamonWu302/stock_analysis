@@ -7,7 +7,7 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 import json
 import pandas as pd
 
-from .charts import build_candlestick_svg, build_score_trend_svg
+from .charts import build_candlestick_svg, build_nav_svg, build_score_trend_svg
 from .chat import StockChatService
 from .config import settings
 from .service import StockAnalysisService
@@ -123,12 +123,32 @@ def create_app() -> Flask:
     @app.get("/backtests")
     def backtests():
         runs = service.recent_backtests(limit=20)
+        tasks = service.recent_backtest_tasks(limit=10)
         score_trend = service.score_trend(20)
+        schema = service.backtest_config_schema()
+        templates = service.backtest_templates()
+        selected_template_id = request.args.get("template_id", type=int)
+        selected_template = None
+        if templates:
+            selected_template = next((item for item in templates if item["id"] == selected_template_id), templates[0])
+            selected_template_id = int(selected_template["id"])
+        defaults = dict(schema["defaults"])
+        if selected_template:
+            selected_config = dict(selected_template.get("config") or {})
+            for key, value in selected_config.items():
+                defaults[key] = value
         return render_template(
             "backtests.html",
             runs=runs,
+            tasks=tasks,
             score_trend=score_trend,
             score_trend_svg=build_score_trend_svg(score_trend),
+            schema=schema,
+            defaults=defaults,
+            templates=templates,
+            selected_template_id=selected_template_id,
+            error=request.args.get("error"),
+            success=request.args.get("success"),
         )
 
     @app.get("/backtests/<int:run_id>")
@@ -142,6 +162,7 @@ def create_app() -> Flask:
             detail=detail,
             score_trend=score_trend,
             score_trend_svg=build_score_trend_svg(score_trend),
+            nav_svg=build_nav_svg(detail.get("nav") or [], detail.get("trades") or []),
         )
 
     @app.get("/api/backtest/runs/<int:run_id>")
@@ -161,6 +182,49 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"error": str(exc)}), 500
         return jsonify(result)
+
+    @app.get("/api/backtest/tasks")
+    def backtest_tasks():
+        limit = max(int(request.args.get("limit", "10")), 1)
+        return jsonify({"tasks": service.recent_backtest_tasks(limit=limit)})
+
+    @app.get("/api/backtest/tasks/<int:task_id>")
+    def backtest_task_detail(task_id: int):
+        detail = service.backtest_task_detail(task_id)
+        if not detail:
+            return jsonify({"error": f"未找到回测任务 {task_id}"}), 404
+        return jsonify(detail)
+
+    @app.get("/backtests/tasks/<int:task_id>")
+    def backtest_task_page(task_id: int):
+        detail = service.backtest_task_detail(task_id)
+        if not detail:
+            return redirect(url_for("backtests", error=f"未找到回测任务 {task_id}"))
+        return render_template("backtest_task_status.html", task=detail, success=request.args.get("success"))
+
+    @app.post("/backtests")
+    def create_backtest_run_form():
+        form = request.form
+        payload = {
+            "template_id": int(form.get("template_id", "0") or 0) or None,
+            "name": (form.get("name") or "").strip() or None,
+            "start_date": (form.get("start_date") or "").strip() or None,
+            "end_date": (form.get("end_date") or "").strip() or None,
+            "lookback_days": int(form.get("lookback_days", "120") or 120),
+            "max_positions": int(form.get("max_positions", "4") or 4),
+            "initial_capital": float(form.get("initial_capital", "1000000") or 1000000),
+            "fee_rate": float(form.get("fee_rate", "0.001") or 0.001),
+            "slippage_rate": float(form.get("slippage_rate", "0.001") or 0.001),
+            "market_score_filter_min_avg": float(form.get("market_score_filter_min_avg", "41") or 41),
+            "market_score_filter_min_ma5": float(form.get("market_score_filter_min_ma5", "41") or 41),
+            "enabled_buy_rules": form.getlist("enabled_buy_rules"),
+            "enabled_sell_rules": form.getlist("enabled_sell_rules"),
+        }
+        try:
+            task_id = service.start_backtest_task(payload)
+        except Exception as exc:
+            return redirect(url_for("backtests", error=str(exc)))
+        return redirect(url_for("backtest_task_page", task_id=task_id, success="回测任务已创建"))
 
     @app.post("/api/daily/backfill")
     def backfill_daily_tables():

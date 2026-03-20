@@ -13,15 +13,124 @@
             <div>
                 <p class="eyebrow">BACKTEST HUB</p>
                 <h1>回测中心</h1>
-                <p class="subtitle">查看最近回测任务，并结合最近 20 个交易日的全市场平均分走势判断策略环境。</p>
+                <p class="subtitle">左侧选择回测模板，右侧直接发起任务。模板会自动填充时间窗口、买卖规则、仓位和市场过滤参数。</p>
             </div>
             <div class="control-panel">
                 <div class="hint">
-                    <strong>当前状态</strong>
-                    <span>回测执行引擎已接入 `daily_score / daily_factor / price_history`，可直接读取历史评分运行。</span>
+                    <strong>当前能力</strong>
+                    <span>支持模板化配置、市场评分过滤、无加仓、最多持有 4 只，以及更接近日线实盘的开盘成交约束。</span>
                 </div>
                 <a class="detail-link" href="{{ url_for('index') }}">返回首页</a>
             </div>
+        </section>
+
+        {% if error %}
+        <div class="alert">{{ error }}</div>
+        {% endif %}
+        {% if success %}
+        <div class="alert success">{{ success }}</div>
+        {% endif %}
+
+        <section class="hero backtest-builder" style="margin-top: 24px;">
+            <aside class="template-sidebar">
+                <div>
+                    <p class="eyebrow">TEMPLATES</p>
+                    <h2>回测配置模板</h2>
+                    <p class="subtitle">点击模板后会立即覆盖右侧表单。应用模板后仍可以继续微调参数。</p>
+                </div>
+                <div class="template-list">
+                    {% for template in templates %}
+                    <button
+                        type="button"
+                        class="template-card{% if template.id == selected_template_id %} is-active{% endif %}"
+                        data-template-id="{{ template.id }}"
+                        data-template-config='{{ template.config|tojson }}'
+                    >
+                        <strong>{{ template.name }}</strong>
+                        <span>{{ template.description or '未填写模板说明' }}</span>
+                    </button>
+                    {% endfor %}
+                </div>
+            </aside>
+
+            <form class="control-panel" id="backtest-form" method="post" action="{{ url_for('create_backtest_run_form') }}">
+                <input type="hidden" id="template-id" name="template_id" value="{{ selected_template_id or '' }}">
+
+                <div>
+                    <p class="eyebrow">NEW RUN</p>
+                    <h2>发起回测</h2>
+                    <p class="subtitle">“开始日期/结束日期”和“最近交易日数”二选一。填写日期区间时，后端会优先按日期区间执行。</p>
+                </div>
+
+                <label>
+                    回测名称
+                    <input type="text" id="name" name="name" value="{{ defaults.name }}">
+                </label>
+
+                <div class="option-group">
+                    <strong>时间范围</strong>
+                    <label>
+                        开始日期
+                        <input type="date" id="start-date" name="start_date" value="{{ defaults.start_date or '' }}">
+                    </label>
+                    <label>
+                        结束日期
+                        <input type="date" id="end-date" name="end_date" value="{{ defaults.end_date or '' }}">
+                    </label>
+                    <label>
+                        最近交易日数
+                        <input type="number" id="lookback-days" name="lookback_days" min="2" value="{{ defaults.lookback_days }}">
+                    </label>
+                    <p class="summary-block" id="time-mode-hint">当前模式：最近交易日数</p>
+                </div>
+
+                <label>
+                    最大持仓数
+                    <input type="number" id="max-positions" name="max_positions" min="1" max="8" value="{{ defaults.max_positions }}">
+                </label>
+                <label>
+                    初始资金
+                    <input type="number" id="initial-capital" name="initial_capital" min="10000" step="10000" value="{{ defaults.initial_capital }}">
+                </label>
+                <label>
+                    手续费
+                    <input type="number" id="fee-rate" name="fee_rate" min="0" step="0.0001" value="{{ defaults.fee_rate }}">
+                </label>
+                <label>
+                    滑点
+                    <input type="number" id="slippage-rate" name="slippage_rate" min="0" step="0.0001" value="{{ defaults.slippage_rate }}">
+                </label>
+                <label>
+                    平均分过滤阈值
+                    <input type="number" id="market-score-filter-min-avg" name="market_score_filter_min_avg" min="0" step="0.1" value="{{ defaults.market_score_filter_min_avg }}">
+                </label>
+                <label>
+                    5日均值过滤阈值
+                    <input type="number" id="market-score-filter-min-ma5" name="market_score_filter_min_ma5" min="0" step="0.1" value="{{ defaults.market_score_filter_min_ma5 }}">
+                </label>
+
+                <div class="option-group">
+                    <strong>买入规则</strong>
+                    {% for rule in schema.buy_rules %}
+                    <label class="checkbox-row">
+                        <input type="checkbox" name="enabled_buy_rules" value="{{ rule.id }}" {% if rule.id in defaults.enabled_buy_rules %}checked{% endif %}>
+                        <span>{{ rule.label }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+
+                <div class="option-group">
+                    <strong>卖出规则</strong>
+                    {% for rule in schema.sell_rules %}
+                    <label class="checkbox-row">
+                        <input type="checkbox" name="enabled_sell_rules" value="{{ rule.id }}" {% if rule.id in defaults.enabled_sell_rules %}checked{% endif %}>
+                        <span>{{ rule.label }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+
+                <button type="submit">开始回测</button>
+            </form>
         </section>
 
         <section class="chart-wrap">
@@ -32,6 +141,45 @@
                 </div>
             </div>
             <div class="chart-box">{{ score_trend_svg|safe }}</div>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>最近回测任务</h2>
+            </div>
+            {% if tasks %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务</th>
+                        <th>状态</th>
+                        <th>阶段</th>
+                        <th>进度</th>
+                        <th>最近交易日</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for task in tasks %}
+                    <tr>
+                        <td>#{{ task.id }}</td>
+                        <td>{{ task.status }}</td>
+                        <td>{{ task.phase_label }}</td>
+                        <td>{{ task.progress_current }}/{{ task.progress_total }}</td>
+                        <td>{{ task.last_trade_date or '-' }}</td>
+                        <td>
+                            <a class="detail-link" href="{{ url_for('backtest_task_page', task_id=task.id) }}">查看任务</a>
+                            {% if task.run_id %}
+                            <a class="detail-link" href="{{ url_for('backtest_detail_page', run_id=task.run_id) }}">查看结果</a>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="summary-block">当前还没有回测任务。</p>
+            {% endif %}
         </section>
 
         <section class="table-wrap">
@@ -48,6 +196,7 @@
                         <th>总收益</th>
                         <th>最大回撤</th>
                         <th>交易次数</th>
+                        <th>过滤拦截</th>
                         <th>操作</th>
                     </tr>
                 </thead>
@@ -60,6 +209,7 @@
                         <td>{{ '%.2f'|format((run.summary.total_return if run.summary else 0) * 100) }}%</td>
                         <td>{{ '%.2f'|format((run.summary.max_drawdown if run.summary else 0) * 100) }}%</td>
                         <td>{{ run.summary.trade_count if run.summary else 0 }}</td>
+                        <td>{{ run.summary.market_filter_blocked_days if run.summary else 0 }} 天 / {{ run.summary.market_filter_blocked_buy_signals if run.summary else 0 }} 信号</td>
                         <td><a class="detail-link" href="{{ url_for('backtest_detail_page', run_id=run.id) }}">查看详情</a></td>
                     </tr>
                     {% endfor %}
@@ -70,5 +220,87 @@
             {% endif %}
         </section>
     </main>
+
+    <script>
+    (() => {
+        const form = document.getElementById('backtest-form');
+        const templateInput = document.getElementById('template-id');
+        const templateCards = Array.from(document.querySelectorAll('[data-template-id]'));
+        const startDate = document.getElementById('start-date');
+        const endDate = document.getElementById('end-date');
+        const lookbackDays = document.getElementById('lookback-days');
+        const hint = document.getElementById('time-mode-hint');
+
+        if (!form || !startDate || !endDate || !lookbackDays || !hint) return;
+
+        const setCheckboxGroup = (name, selectedValues) => {
+            const values = new Set(selectedValues || []);
+            form.querySelectorAll(`input[name="${name}"]`).forEach((node) => {
+                node.checked = values.has(node.value);
+            });
+        };
+
+        const applyTemplate = (templateId, config) => {
+            if (templateInput) templateInput.value = templateId || '';
+            templateCards.forEach((card) => {
+                card.classList.toggle('is-active', String(card.dataset.templateId) === String(templateId));
+            });
+            if (!config) return;
+            const setValue = (id, value) => {
+                const node = document.getElementById(id);
+                if (!node) return;
+                node.value = value ?? '';
+            };
+            setValue('name', config.name);
+            setValue('start-date', config.start_date);
+            setValue('end-date', config.end_date);
+            setValue('lookback-days', config.lookback_days);
+            setValue('max-positions', config.max_positions);
+            setValue('initial-capital', config.initial_capital);
+            setValue('fee-rate', config.fee_rate);
+            setValue('slippage-rate', config.slippage_rate);
+            setValue('market-score-filter-min-avg', config.market_score_filter_min_avg);
+            setValue('market-score-filter-min-ma5', config.market_score_filter_min_ma5);
+            setCheckboxGroup('enabled_buy_rules', config.enabled_buy_rules);
+            setCheckboxGroup('enabled_sell_rules', config.enabled_sell_rules);
+            syncTimeMode();
+        };
+
+        const syncTimeMode = () => {
+            const hasRange = Boolean(startDate.value || endDate.value);
+            if (hasRange) {
+                lookbackDays.disabled = true;
+                hint.textContent = '当前模式：按开始/结束日期回测';
+            } else {
+                lookbackDays.disabled = false;
+                hint.textContent = '当前模式：最近交易日数';
+            }
+        };
+
+        const clearDateRangeIfLookbackChanged = () => {
+            if (!lookbackDays.value) return;
+            startDate.value = '';
+            endDate.value = '';
+            syncTimeMode();
+        };
+
+        templateCards.forEach((card) => {
+            card.addEventListener('click', () => {
+                let config = {};
+                try {
+                    config = JSON.parse(card.dataset.templateConfig || '{}');
+                } catch (error) {
+                    config = {};
+                }
+                applyTemplate(card.dataset.templateId, config);
+            });
+        });
+
+        startDate.addEventListener('change', syncTimeMode);
+        endDate.addEventListener('change', syncTimeMode);
+        lookbackDays.addEventListener('input', clearDateRangeIfLookbackChanged);
+        syncTimeMode();
+    })();
+    </script>
 </body>
 </html>

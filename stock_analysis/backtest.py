@@ -64,7 +64,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "id": BUY_RULE_MOMENTUM,
                 "label": "增强买入",
                 "enabled": True,
-                "description": "总分略低但量价形态极强时触发右侧买点。",
+                "description": "总分略低但量价形态非常强时，触发右侧动量买点。",
                 "conditions": [
                     {"field": "score_total", "operator": ">=", "value": 75.0},
                     {"field": "score_volume_pattern", "operator": ">=", "value": 20.0},
@@ -77,7 +77,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "id": SELL_RULE_STOP,
                 "label": "硬止损",
                 "enabled": True,
-                "description": "跌破突破防守位时，视为突破失败。",
+                "description": "跌破突破防守位时，视为突破失效。",
                 "conditions": [
                     {
                         "field": "close_vs_breakout_floor",
@@ -104,9 +104,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 "label": "资金撤退",
                 "enabled": True,
                 "description": "CMF 转负时，视为资金开始撤退。",
-                "conditions": [
-                    {"field": "cmf21", "operator": "<", "value": 0.0},
-                ],
+                "conditions": [{"field": "cmf21", "operator": "<", "value": 0.0}],
                 "logic": "all",
             },
             {
@@ -148,6 +146,71 @@ def build_backtest_config_schema() -> dict[str, Any]:
             "slippage_rate": defaults.slippage_rate,
         },
     }
+
+
+def build_backtest_templates() -> list[dict[str, Any]]:
+    return [
+        {
+            "template_key": "balanced_default",
+            "name": "均衡默认",
+            "description": "双买点、四卖点都开启，适合先跑全量评估。",
+            "sort_order": 10,
+            "config": {
+                "name": "均衡默认模板",
+                "lookback_days": 120,
+                "max_positions": 4,
+                "market_score_filter_min_avg": 41.0,
+                "market_score_filter_min_ma5": 41.0,
+                "enabled_buy_rules": [BUY_RULE_STRICT, BUY_RULE_MOMENTUM],
+                "enabled_sell_rules": [SELL_RULE_STOP, SELL_RULE_TREND, SELL_RULE_CAPITAL, SELL_RULE_STALE],
+            },
+        },
+        {
+            "template_key": "strict_trend",
+            "name": "严格趋势",
+            "description": "只做严格买点，市场过滤更高，适合偏保守环境。",
+            "sort_order": 20,
+            "config": {
+                "name": "严格趋势模板",
+                "lookback_days": 120,
+                "max_positions": 3,
+                "market_score_filter_min_avg": 45.0,
+                "market_score_filter_min_ma5": 45.0,
+                "enabled_buy_rules": [BUY_RULE_STRICT],
+                "enabled_sell_rules": [SELL_RULE_STOP, SELL_RULE_TREND, SELL_RULE_CAPITAL],
+            },
+        },
+        {
+            "template_key": "momentum_attack",
+            "name": "动量进攻",
+            "description": "偏向增强买点，持仓更满，适合想验证高弹性票的时期。",
+            "sort_order": 30,
+            "config": {
+                "name": "动量进攻模板",
+                "lookback_days": 120,
+                "max_positions": 4,
+                "market_score_filter_min_avg": 43.0,
+                "market_score_filter_min_ma5": 43.0,
+                "enabled_buy_rules": [BUY_RULE_MOMENTUM],
+                "enabled_sell_rules": [SELL_RULE_TREND, SELL_RULE_CAPITAL, SELL_RULE_STALE],
+            },
+        },
+        {
+            "template_key": "defensive_low_exposure",
+            "name": "防守低仓",
+            "description": "更少持仓、更高过滤，只保留强信号，适合弱势环境。",
+            "sort_order": 40,
+            "config": {
+                "name": "防守低仓模板",
+                "lookback_days": 120,
+                "max_positions": 2,
+                "market_score_filter_min_avg": 46.0,
+                "market_score_filter_min_ma5": 46.0,
+                "enabled_buy_rules": [BUY_RULE_STRICT],
+                "enabled_sell_rules": [SELL_RULE_STOP, SELL_RULE_TREND, SELL_RULE_CAPITAL, SELL_RULE_STALE],
+            },
+        },
+    ]
 
 
 def default_backtest_config() -> dict[str, Any]:

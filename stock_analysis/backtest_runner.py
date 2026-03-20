@@ -32,11 +32,11 @@ class BacktestRunner:
     def __init__(self, db: Database):
         self.db = db
 
-    def run(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    def run(self, config: dict[str, Any] | None = None, progress_callback=None) -> dict[str, Any]:
         normalized = self._normalize_config(config or {})
         run_id = self._create_run(normalized)
         try:
-            result = self._execute_run(run_id, normalized)
+            result = self._execute_run(run_id, normalized, progress_callback=progress_callback)
             self._complete_run(run_id, result)
             return result
         except Exception as exc:
@@ -114,10 +114,25 @@ class BacktestRunner:
                 """,
                 (run_id,),
             ).fetchall()
+            benchmark_rows = []
+            if nav_rows:
+                benchmark_rows = conn.execute(
+                    """
+                    SELECT trade_date, close
+                    FROM benchmark_history
+                    WHERE symbol = ? AND trade_date BETWEEN ? AND ?
+                    ORDER BY trade_date ASC
+                    """,
+                    (
+                        str(run_row["benchmark_symbol"] or "000001"),
+                        str(nav_rows[0]["trade_date"]),
+                        str(nav_rows[-1]["trade_date"]),
+                    ),
+                ).fetchall()
         payload = dict(run_row)
         payload["config"] = json.loads(payload["config_json"])
         payload["summary"] = json.loads(payload["summary_json"]) if payload.get("summary_json") else None
-        payload["nav"] = [dict(row) for row in nav_rows]
+        payload["nav"] = self._attach_benchmark_nav(nav_rows, benchmark_rows)
         payload["trades"] = [dict(row) for row in trade_rows]
         payload["signals"] = [self._deserialize_signal_row(dict(row)) for row in signal_rows]
         payload["positions"] = [dict(row) for row in position_rows]
@@ -189,7 +204,9 @@ class BacktestRunner:
             )
             return int(cursor.lastrowid)
 
-    def _execute_run(self, run_id: int, config: dict[str, Any]) -> dict[str, Any]:
+    def _execute_run(self, run_id: int, config: dict[str, Any], progress_callback=None) -> dict[str, Any]:
+        if progress_callback:
+            progress_callback({"phase": "loading", "message": "正在加载回测所需历史数据"})
         trade_dates = self._load_trade_dates(
             config["lookback_days"],
             start_date=config.get("start_date"),
@@ -204,6 +221,16 @@ class BacktestRunner:
         market_score_map = self._load_market_score_map(start_date, end_date)
         benchmark_close_map = self._load_benchmark_close_map(start_date, end_date)
         price_map = self._load_price_map(start_date, end_date)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "preparing",
+                    "message": "正在整理每日候选股票和市场过滤条件",
+                    "progress_current": 0,
+                    "progress_total": len(trade_dates),
+                    "last_trade_date": start_date,
+                }
+            )
 
         self._update_run_dates(run_id, start_date, end_date)
 
@@ -227,9 +254,24 @@ class BacktestRunner:
         closed_holding_days: list[int] = []
         market_filter_blocked_days = 0
         market_filter_blocked_buy_signals = 0
+        buy_execution_blocked = 0
+        sell_execution_deferred = 0
+        buy_execution_blocked_breakdown: dict[str, int] = {}
+        sell_execution_deferred_breakdown: dict[str, int] = {}
 
         enabled_buy_rules = set(config["enabled_buy_rules"])
         enabled_sell_rules = set(config["enabled_sell_rules"])
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "executing",
+                    "message": "正在执行回测交易逻辑",
+                    "progress_current": 0,
+                    "progress_total": len(trade_dates),
+                    "last_trade_date": start_date,
+                }
+            )
 
         for index, trade_date in enumerate(trade_dates):
             next_trade_date = trade_dates[index + 1] if index + 1 < len(trade_dates) else None
@@ -240,7 +282,14 @@ class BacktestRunner:
                 symbol = str(order["symbol"])
                 position = positions.get(symbol)
                 price_row = price_map.get((trade_date, symbol))
-                if position is None or price_row is None or price_row.get("open") is None:
+                tradability = self._execution_tradability("sell", price_row)
+                if position is None or tradability != "tradable":
+                    if tradability != "tradable":
+                        sell_execution_deferred_breakdown[tradability] = (
+                            sell_execution_deferred_breakdown.get(tradability, 0) + 1
+                        )
+                    if tradability in {"limit_down", "missing"}:
+                        sell_execution_deferred += 1
                     if next_trade_date:
                         pending_sells.setdefault(next_trade_date, []).append(order)
                     continue
@@ -285,7 +334,12 @@ class BacktestRunner:
                 for order in buy_orders:
                     symbol = str(order["symbol"])
                     price_row = price_map.get((trade_date, symbol))
-                    if price_row is None or price_row.get("open") is None:
+                    tradability = self._execution_tradability("buy", price_row)
+                    if tradability != "tradable":
+                        buy_execution_blocked += 1
+                        buy_execution_blocked_breakdown[tradability] = (
+                            buy_execution_blocked_breakdown.get(tradability, 0) + 1
+                        )
                         continue
                     open_price = float(price_row["open"])
                     execution_price = round(open_price * (1 + config["slippage_rate"]), 4)
@@ -461,8 +515,27 @@ class BacktestRunner:
                             "rule_hits": candidate["buy_rule_hits"],
                         }
                     )
+            if progress_callback and (index == 0 or (index + 1) % 5 == 0 or index + 1 == len(trade_dates)):
+                progress_callback(
+                    {
+                        "phase": "executing",
+                        "message": f"正在执行回测，已完成 {index + 1}/{len(trade_dates)} 个交易日",
+                        "progress_current": index + 1,
+                        "progress_total": len(trade_dates),
+                        "last_trade_date": trade_date,
+                    }
+                )
 
-        self._persist_run_rows(run_id, signal_rows, trade_rows, position_rows, nav_rows)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "summarizing",
+                    "message": "正在汇总收益、回撤和执行约束统计",
+                    "progress_current": len(trade_dates),
+                    "progress_total": len(trade_dates),
+                    "last_trade_date": end_date,
+                }
+            )
         benchmark_return = self._benchmark_return(benchmark_close_map, start_date, end_date)
         final_nav = nav_rows[-1][4] if nav_rows else initial_capital
         total_return = round((final_nav - initial_capital) / initial_capital, 6) if initial_capital else 0.0
@@ -484,12 +557,27 @@ class BacktestRunner:
             "selected_buy_signal_count": sum(1 for row in signal_rows if row[6] == 1 and row[5] == "buy"),
             "market_filter_blocked_days": market_filter_blocked_days,
             "market_filter_blocked_buy_signals": market_filter_blocked_buy_signals,
+            "buy_execution_blocked": buy_execution_blocked,
+            "sell_execution_deferred": sell_execution_deferred,
+            "buy_execution_blocked_breakdown": buy_execution_blocked_breakdown,
+            "sell_execution_deferred_breakdown": sell_execution_deferred_breakdown,
             "market_score_filter_min_avg": config["market_score_filter_min_avg"],
             "market_score_filter_min_ma5": config["market_score_filter_min_ma5"],
             "win_rate": round(sum(1 for value in closed_returns if value > 0) / len(closed_returns), 6) if closed_returns else 0.0,
             "avg_holding_days": round(sum(closed_holding_days) / len(closed_holding_days), 2) if closed_holding_days else 0.0,
             "available_signal_days": len(trade_dates),
         }
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "writing",
+                    "message": "正在写入回测结果到数据库",
+                    "progress_current": len(trade_dates),
+                    "progress_total": len(trade_dates),
+                    "last_trade_date": end_date,
+                }
+            )
+        self._persist_run_rows(run_id, signal_rows, trade_rows, position_rows, nav_rows)
         return summary
 
     def _load_trade_dates(self, lookback_days: int, start_date: str | None = None, end_date: str | None = None) -> list[str]:
@@ -579,7 +667,13 @@ class BacktestRunner:
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT symbol, trade_date, open, close
+                SELECT symbol,
+                       trade_date,
+                       open,
+                       close,
+                       high,
+                       low,
+                       LAG(close) OVER (PARTITION BY symbol ORDER BY trade_date) AS prev_close
                 FROM price_history
                 WHERE trade_date BETWEEN ? AND ?
                 """,
@@ -589,6 +683,9 @@ class BacktestRunner:
             (str(row["trade_date"]), str(row["symbol"])): {
                 "open": float(row["open"]) if row["open"] is not None else None,
                 "close": float(row["close"]) if row["close"] is not None else None,
+                "high": float(row["high"]) if row["high"] is not None else None,
+                "low": float(row["low"]) if row["low"] is not None else None,
+                "prev_close": float(row["prev_close"]) if row["prev_close"] is not None else None,
             }
             for row in rows
         }
@@ -712,6 +809,24 @@ class BacktestRunner:
         return hits
 
     @staticmethod
+    def _execution_tradability(side: str, price_row: dict[str, float | None] | None) -> str:
+        if not price_row:
+            return "missing"
+        open_price = price_row.get("open")
+        prev_close = price_row.get("prev_close")
+        if open_price is None:
+            return "missing"
+        if prev_close is None or prev_close <= 0:
+            return "tradable"
+        upper_limit = prev_close * 1.098
+        lower_limit = prev_close * 0.902
+        if side == "buy" and float(open_price) >= upper_limit:
+            return "limit_up"
+        if side == "sell" and float(open_price) <= lower_limit:
+            return "limit_down"
+        return "tradable"
+
+    @staticmethod
     def _passes_market_filter(market_filter: dict[str, float], config: dict[str, Any]) -> bool:
         if not market_filter:
             return False
@@ -755,6 +870,26 @@ class BacktestRunner:
         payload["buy_rule_hits"] = json.loads(payload["buy_rule_hits"]) if payload.get("buy_rule_hits") else []
         payload["sell_rule_hits"] = json.loads(payload["sell_rule_hits"]) if payload.get("sell_rule_hits") else []
         return payload
+
+    @staticmethod
+    def _attach_benchmark_nav(nav_rows: list[Any], benchmark_rows: list[Any]) -> list[dict[str, Any]]:
+        nav_payload = [dict(row) for row in nav_rows]
+        if not nav_payload:
+            return nav_payload
+        benchmark_map = {str(row["trade_date"]): float(row["close"]) for row in benchmark_rows if row["close"] is not None}
+        start_trade_date = str(nav_payload[0]["trade_date"])
+        base_close = benchmark_map.get(start_trade_date)
+        base_nav = float(nav_payload[0]["nav"])
+        for row in nav_payload:
+            trade_date = str(row["trade_date"])
+            benchmark_close = benchmark_map.get(trade_date)
+            row["benchmark_close"] = benchmark_close
+            row["benchmark_nav"] = (
+                round((benchmark_close / base_close) * base_nav, 4)
+                if benchmark_close is not None and base_close
+                else None
+            )
+        return nav_payload
 
     @staticmethod
     def _build_signal_stats(signal_rows: list[dict[str, Any]]) -> dict[str, Any]:

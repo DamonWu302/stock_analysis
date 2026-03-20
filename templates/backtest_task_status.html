@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>回测任务状态</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page" data-task-id="{{ task.id }}">
+        {% if success %}
+        <div class="alert success">{{ success }}</div>
+        {% endif %}
+
+        <section class="hero">
+            <div>
+                <p class="eyebrow">BACKTEST TASK</p>
+                <h1>回测任务 #{{ task.id }}</h1>
+                <p class="subtitle" id="task-subtitle">{{ task.phase_label }} · {{ task.message or '-' }}</p>
+            </div>
+            <div class="control-panel">
+                <div class="hint">
+                    <strong>回测区间</strong>
+                    <span>{{ task.config.start_date or '-' }} ~ {{ task.config.end_date or '-' }}</span>
+                </div>
+                <a class="detail-link" href="{{ url_for('backtests') }}">返回回测中心</a>
+                <a
+                    class="detail-link"
+                    id="result-link"
+                    href="{% if task.run_id %}{{ url_for('backtest_detail_page', run_id=task.run_id) }}{% else %}#{% endif %}"
+                    {% if not task.run_id %}style="display:none"{% endif %}
+                >
+                    查看回测结果
+                </a>
+            </div>
+        </section>
+
+        <section class="stats">
+            <article class="card">
+                <span>状态</span>
+                <strong id="task-status">{{ task.status }}</strong>
+            </article>
+            <article class="card">
+                <span>阶段</span>
+                <strong id="task-phase">{{ task.phase_label }}</strong>
+            </article>
+            <article class="card">
+                <span>进度</span>
+                <strong id="task-progress">{{ task.progress_current }}/{{ task.progress_total }}</strong>
+            </article>
+            <article class="card">
+                <span>最近交易日</span>
+                <strong id="task-last-date">{{ task.last_trade_date or '-' }}</strong>
+            </article>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>任务摘要</h2>
+            </div>
+            <p class="summary-block">开始时间：<span id="task-started">{{ task.started_at|fmt_dt }}</span></p>
+            <p class="summary-block">结束时间：<span id="task-finished">{{ task.finished_at|fmt_dt }}</span></p>
+            <p class="summary-block">单日平均耗时：<span id="task-avg">{{ task.avg_item_text }}</span></p>
+            <p class="summary-block">预计完成时间：<span id="task-eta">{{ task.eta_at|fmt_dt if task.eta_at else task.eta_text }}</span></p>
+            <p class="summary-block">当前消息：<span id="task-message">{{ task.message or '-' }}</span></p>
+            <p class="summary-block">阶段说明：<span id="task-phase-hint">{{ task.phase_hint or '-' }}</span></p>
+            <p class="summary-block" id="task-redirect-row" style="display:none">自动跳转：<span id="task-redirect-text">等待完成</span></p>
+        </section>
+
+        <section class="table-wrap" id="task-error-section" {% if task.status != 'failed' %}style="display:none"{% endif %}>
+            <div class="section-title">
+                <h2>失败原因</h2>
+            </div>
+            <p class="summary-block">摘要：<span id="task-error-summary">{{ task.error_summary or '-' }}</span></p>
+            <p class="summary-block">详细原因：<span id="task-error-detail">{{ task.error_detail or '-' }}</span></p>
+            <p class="summary-block">处理建议：<span id="task-error-hint">{{ task.error_hint or '-' }}</span></p>
+        </section>
+    </main>
+
+    <script>
+    (() => {
+        const root = document.querySelector('[data-task-id]');
+        if (!root) return;
+        const taskId = root.dataset.taskId;
+        let pollTimerId = null;
+        let redirectTimerId = null;
+        let countdownTimerId = null;
+
+        const fmtDateTime = (value) => {
+            if (!value || value === '-' || value === '已完成' || value === '失败') return value || '-';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return value;
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        };
+
+        const updateText = (id, value) => {
+            const node = document.getElementById(id);
+            if (node) node.textContent = value ?? '-';
+        };
+
+        const stopPolling = () => {
+            if (pollTimerId) {
+                clearInterval(pollTimerId);
+                pollTimerId = null;
+            }
+        };
+
+        const stopRedirect = () => {
+            if (redirectTimerId) {
+                clearTimeout(redirectTimerId);
+                redirectTimerId = null;
+            }
+            if (countdownTimerId) {
+                clearInterval(countdownTimerId);
+                countdownTimerId = null;
+            }
+        };
+
+        const startRedirectCountdown = (runId) => {
+            if (!runId) return;
+            stopRedirect();
+            const row = document.getElementById('task-redirect-row');
+            const text = document.getElementById('task-redirect-text');
+            if (!row || !text) return;
+            row.style.display = '';
+            let remain = 3;
+            text.textContent = `${remain} 秒后跳转到回测结果`;
+            countdownTimerId = setInterval(() => {
+                remain -= 1;
+                if (remain <= 0) {
+                    clearInterval(countdownTimerId);
+                    countdownTimerId = null;
+                    text.textContent = '正在跳转...';
+                    return;
+                }
+                text.textContent = `${remain} 秒后跳转到回测结果`;
+            }, 1000);
+            redirectTimerId = setTimeout(() => {
+                window.location.href = `/backtests/${runId}`;
+            }, 3000);
+        };
+
+        const refreshTask = async () => {
+            const resp = await fetch(`/api/backtest/tasks/${taskId}`, { cache: 'no-store' });
+            if (!resp.ok) return;
+            const task = await resp.json();
+            updateText('task-subtitle', `${task.phase_label} · ${task.message || '-'}`);
+            updateText('task-status', task.status);
+            updateText('task-phase', task.phase_label);
+            updateText('task-progress', `${task.progress_current}/${task.progress_total}`);
+            updateText('task-last-date', task.last_trade_date || '-');
+            updateText('task-started', fmtDateTime(task.started_at));
+            updateText('task-finished', fmtDateTime(task.finished_at || '-'));
+            updateText('task-avg', task.avg_item_text || '-');
+            updateText('task-eta', task.eta_at ? fmtDateTime(task.eta_at) : (task.eta_text || '-'));
+            updateText('task-message', task.message || '-');
+            updateText('task-phase-hint', task.phase_hint || '-');
+            updateText('task-error-summary', task.error_summary || '-');
+            updateText('task-error-detail', task.error_detail || '-');
+            updateText('task-error-hint', task.error_hint || '-');
+
+            const errorSection = document.getElementById('task-error-section');
+            if (errorSection) {
+                errorSection.style.display = task.status === 'failed' ? '' : 'none';
+            }
+
+            const resultLink = document.getElementById('result-link');
+            if (resultLink) {
+                if (task.run_id) {
+                    resultLink.style.display = '';
+                    resultLink.href = `/backtests/${task.run_id}`;
+                } else {
+                    resultLink.style.display = 'none';
+                }
+            }
+
+            if (task.status !== 'running') {
+                stopPolling();
+                if (task.status === 'completed' && task.run_id) {
+                    startRedirectCountdown(task.run_id);
+                } else {
+                    stopRedirect();
+                }
+            }
+        };
+
+        if (document.getElementById('task-status')?.textContent === 'running') {
+            pollTimerId = setInterval(() => {
+                refreshTask().catch(() => {});
+            }, 2000);
+        } else if (document.getElementById('task-status')?.textContent === 'completed') {
+            const href = document.getElementById('result-link')?.getAttribute('href') || '';
+            const runId = href.split('/').pop();
+            if (runId && runId !== '#') {
+                startRedirectCountdown(runId);
+            }
+        }
+    })();
+    </script>
+</body>
+</html>

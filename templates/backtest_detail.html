@@ -28,11 +28,21 @@
             <div class="section-title">
                 <div>
                     <h2>每日平均分走势</h2>
-                    <p>回测期间可参考最近市场评分温度，辅助理解策略表现。</p>
+                    <p>用于观察回测区间附近的市场评分温度。</p>
                 </div>
                 <a class="detail-link" href="{{ url_for('backtests') }}">返回回测中心</a>
             </div>
             <div class="chart-box">{{ score_trend_svg|safe }}</div>
+        </section>
+
+        <section class="chart-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>净值曲线</h2>
+                    <p>对比策略净值、基准净值和超额收益，并标记买卖点与持仓区间。</p>
+                </div>
+            </div>
+            <div class="chart-box">{{ nav_svg|safe }}</div>
         </section>
 
         <section class="stats">
@@ -52,6 +62,34 @@
                 <span>总信号数</span>
                 <strong>{{ detail.signal_stats.signal_count if detail.signal_stats else 0 }}</strong>
             </article>
+            <article class="card">
+                <span>过滤拦截天数</span>
+                <strong>{{ detail.summary.market_filter_blocked_days if detail.summary else 0 }}</strong>
+            </article>
+            <article class="card">
+                <span>过滤拦截信号</span>
+                <strong>{{ detail.summary.market_filter_blocked_buy_signals if detail.summary else 0 }}</strong>
+            </article>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>市场过滤参数</h2>
+            </div>
+            <p class="summary-block">
+                平均分阈值：{{ detail.summary.market_score_filter_min_avg if detail.summary else 0 }}
+                ，5日均值阈值：{{ detail.summary.market_score_filter_min_ma5 if detail.summary else 0 }}
+            </p>
+            <p class="summary-block">
+                买入成交受阻：{{ detail.summary.buy_execution_blocked if detail.summary else 0 }}
+                ，卖出顺延次数：{{ detail.summary.sell_execution_deferred if detail.summary else 0 }}
+            </p>
+            <p class="summary-block">
+                买入受阻明细：{{ detail.summary.buy_execution_blocked_breakdown_label if detail.summary else '-' }}
+            </p>
+            <p class="summary-block">
+                卖出顺延明细：{{ detail.summary.sell_execution_deferred_breakdown_label if detail.summary else '-' }}
+            </p>
         </section>
 
         <section class="table-wrap">
@@ -64,37 +102,203 @@
 
         <section class="table-wrap">
             <div class="section-title">
-                <h2>交易记录</h2>
+                <div>
+                    <h2>每日持仓表</h2>
+                    <p class="summary-block">点击下方交易日日历卡片，切换查看当日持仓明细。</p>
+                </div>
             </div>
-            {% if detail.trades %}
-            <table>
-                <thead>
-                    <tr>
-                        <th>日期</th>
-                        <th>代码</th>
-                        <th>方向</th>
-                        <th>价格</th>
-                        <th>数量</th>
-                        <th>原因</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for row in detail.trades %}
-                    <tr>
-                        <td>{{ row.execution_date }}</td>
-                        <td>{{ row.symbol }}</td>
-                        <td>{{ row.side }}</td>
-                        <td>{{ row.price }}</td>
-                        <td>{{ row.shares }}</td>
-                        <td>{{ row.reason or '-' }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            {% if detail.position_calendar %}
+            <div class="position-calendar-months" data-default-date="{{ detail.position_active_date }}">
+                {% for month in detail.position_calendar_months %}
+                {% set expanded = detail.position_active_date and detail.position_active_date[:7] == month.month %}
+                <section class="position-month-group{% if expanded %} is-expanded{% endif %}" data-month-group>
+                    <button
+                        type="button"
+                        class="position-month-header"
+                        data-month-toggle
+                        aria-expanded="{{ 'true' if expanded else 'false' }}"
+                    >
+                        <span class="position-month-main">
+                            <span class="position-month-title">{{ month.month }}</span>
+                            <span>{{ month.days|length }} 个交易日</span>
+                        </span>
+                        <span class="position-month-summary {% if month.net_change_pnl > 0 %}profit{% elif month.net_change_pnl < 0 %}loss{% endif %}">
+                            月度净值变化 {{ month.net_change_pnl_text }}
+                        </span>
+                        <span class="position-month-arrow" aria-hidden="true"></span>
+                    </button>
+                    <div class="position-calendar">
+                        {% for item in month.days %}
+                        <button
+                            type="button"
+                            class="position-day position-day-{{ item.tone }}{% if item.trade_date == detail.position_active_date %} is-active{% endif %}"
+                            data-trade-date="{{ item.trade_date }}"
+                        >
+                            <span class="position-day-date">{{ item.trade_date }}</span>
+                            <span class="position-day-meta">{{ item.position_count }} 只持仓</span>
+                            <span class="position-day-pnl">{{ item.daily_pnl_text }}</span>
+                        </button>
+                        {% endfor %}
+                    </div>
+                </section>
+                {% endfor %}
+            </div>
+
+            {% for item in detail.position_calendar %}
+            <section
+                class="position-panel{% if item.trade_date == detail.position_active_date %} is-active{% endif %}"
+                data-position-panel="{{ item.trade_date }}"
+            >
+                <div class="position-panel-head">
+                    <div>
+                        <h3>{{ item.trade_date }}</h3>
+                        <p>当日持仓 {{ item.position_count }} 只，组合当日盈亏
+                            <span class="{% if item.daily_pnl > 0 %}profit{% elif item.daily_pnl < 0 %}loss{% endif %}">{{ item.daily_pnl_text }}</span>
+                        </p>
+                    </div>
+                    <div class="position-panel-badge">
+                        <span>当日持仓市值</span>
+                        <strong>{{ item.market_value_text }}</strong>
+                    </div>
+                </div>
+
+                <p class="summary-block">
+                    所属月份净值变化：
+                    <span class="{% if item.month_net_change_pnl > 0 %}profit{% elif item.month_net_change_pnl < 0 %}loss{% endif %}">{{ item.month_net_change_pnl_text }}</span>
+                    ，月内已实现：
+                    <span class="{% if item.month_realized_pnl > 0 %}profit{% elif item.month_realized_pnl < 0 %}loss{% endif %}">{{ item.month_realized_pnl_text }}</span>
+                    ，月末浮盈：
+                    <span class="{% if item.month_end_unrealized_pnl > 0 %}profit{% elif item.month_end_unrealized_pnl < 0 %}loss{% endif %}">{{ item.month_end_unrealized_pnl_text }}</span>
+                </p>
+
+                <div class="data-table-wrap">
+                    <table class="data-table position-table">
+                        <thead>
+                            <tr>
+                                <th>代码</th>
+                                <th>持仓数量</th>
+                                <th>成本价</th>
+                                <th>收盘价</th>
+                                <th>持仓市值</th>
+                                <th>持仓权重</th>
+                                <th>当日盈亏</th>
+                                <th>浮盈亏</th>
+                                <th>持仓天数</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in detail.positions_by_date[item.trade_date] %}
+                            <tr>
+                                <td>
+                                    {{ row.symbol }}
+                                    {% if row.position_event_label %}
+                                    <span class="badge position-event-badge">{{ row.position_event_label }}</span>
+                                    {% endif %}
+                                    {% if row.position_exit_label %}
+                                    <span class="badge position-exit-badge">{{ row.position_exit_label }}</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ row.shares }}</td>
+                                <td>{{ row.cost_price_text }}</td>
+                                <td>{{ row.close_price_text }}</td>
+                                <td>{{ row.market_value_text }}</td>
+                                <td>{{ row.weight_text }}</td>
+                                <td class="{% if row.daily_pnl > 0 %}profit{% elif row.daily_pnl < 0 %}loss{% endif %}">{{ row.daily_pnl_text }}</td>
+                                <td class="{% if row.unrealized_pnl > 0 %}profit{% elif row.unrealized_pnl < 0 %}loss{% endif %}">{{ row.unrealized_pnl_text }}</td>
+                                <td>{{ row.hold_days }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="position-subsection">
+                    <div class="section-title">
+                        <h3>当日交易记录</h3>
+                    </div>
+                    {% set trade_rows = detail.trades_by_date.get(item.trade_date, []) %}
+                    {% if trade_rows %}
+                    <div class="data-table-wrap">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>代码</th>
+                                    <th>方向</th>
+                                    <th>价格</th>
+                                    <th>数量</th>
+                                    <th>原因</th>
+                                    <th>当日净值影响</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for row in trade_rows %}
+                                <tr>
+                                    <td>{{ row.symbol }}</td>
+                                    <td>{{ row.side_label }}</td>
+                                    <td>{{ '%.4f'|format(row.price) }}</td>
+                                    <td>{{ row.shares }}</td>
+                                    <td>{{ row.reason_label }}</td>
+                                    <td class="{% if row.daily_impact_amount is not none and row.daily_impact_amount > 0 %}profit{% elif row.daily_impact_amount is not none and row.daily_impact_amount < 0 %}loss{% endif %}">{{ row.daily_impact_text }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <p class="summary-block">当日无成交记录。</p>
+                    {% endif %}
+                </div>
+            </section>
+            {% endfor %}
             {% else %}
-            <p class="summary-block">当前回测没有成交记录。</p>
+            <p class="summary-block">当前回测没有持仓记录。</p>
             {% endif %}
         </section>
     </main>
+
+    <script>
+    (() => {
+        const calendar = document.querySelector('.position-calendar-months');
+        if (!calendar) return;
+        const buttons = Array.from(calendar.querySelectorAll('[data-trade-date]'));
+        const panels = Array.from(document.querySelectorAll('[data-position-panel]'));
+        const monthGroups = Array.from(calendar.querySelectorAll('[data-month-group]'));
+
+        const activate = (tradeDate) => {
+            buttons.forEach((button) => {
+                button.classList.toggle('is-active', button.dataset.tradeDate === tradeDate);
+            });
+            panels.forEach((panel) => {
+                panel.classList.toggle('is-active', panel.dataset.positionPanel === tradeDate);
+            });
+            monthGroups.forEach((group) => {
+                const hasActive = !!group.querySelector(`[data-trade-date="${tradeDate}"]`);
+                if (!hasActive) return;
+                group.classList.add('is-expanded');
+                const toggle = group.querySelector('[data-month-toggle]');
+                const content = group.querySelector('.position-calendar');
+                if (toggle) toggle.setAttribute('aria-expanded', 'true');
+                if (content) content.hidden = false;
+            });
+        };
+
+            monthGroups.forEach((group) => {
+                const toggle = group.querySelector('[data-month-toggle]');
+                if (!toggle) return;
+                toggle.addEventListener('click', () => {
+                    const expanded = toggle.getAttribute('aria-expanded') === 'true';
+                    const next = !expanded;
+                    toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
+                    group.classList.toggle('is-expanded', next);
+                });
+            });
+
+        buttons.forEach((button) => {
+            button.addEventListener('click', () => activate(button.dataset.tradeDate));
+        });
+
+        activate(calendar.dataset.defaultDate || buttons[0]?.dataset.tradeDate || '');
+    })();
+    </script>
 </body>
 </html>

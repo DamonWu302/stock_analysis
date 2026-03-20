@@ -162,6 +162,26 @@ def build_score_trend_svg(rows: list[dict], width: int = 900, height: int = 280)
             f"<text x='{x:.2f}' y='{height - 8}' fill='#6b7280' font-size='11' text-anchor='middle'>{html.escape(str(row['trade_date'])[5:])}</text>"
         )
 
+    holding_bands: list[str] = []
+    band_start_index: int | None = None
+    for index, row in enumerate(df.to_dict("records")):
+        is_holding = int(row.get("position_count") or 0) > 0
+        if is_holding and band_start_index is None:
+            band_start_index = index
+        is_band_end = band_start_index is not None and (not is_holding or index == len(df) - 1)
+        if not is_band_end:
+            continue
+        end_index = index if is_holding and index == len(df) - 1 else index - 1
+        if end_index >= band_start_index:
+            start_x = padding + band_start_index * step_x
+            end_x = padding + end_index * step_x
+            band_width = max(end_x - start_x + max(step_x, 6), 6)
+            holding_bands.append(
+                f"<rect x='{start_x:.2f}' y='{padding:.2f}' width='{band_width:.2f}' height='{chart_height:.2f}' "
+                "fill='rgba(180, 83, 9, 0.08)' rx='8' />"
+            )
+        band_start_index = None
+
     latest_avg = float(df.iloc[-1]["avg_score"])
     latest_ma5 = float(df.iloc[-1]["ma5_avg_score"]) if not pd.isna(df.iloc[-1]["ma5_avg_score"]) else latest_avg
     parts = [
@@ -174,6 +194,202 @@ def build_score_trend_svg(rows: list[dict], width: int = 900, height: int = 280)
         build_path("avg_score", "#b45309"),
         build_path("ma5_avg_score", "#0f766e"),
         *labels,
+        "</svg>",
+    ]
+    return "".join(parts)
+
+
+def build_nav_svg(rows: list[dict], trades: list[dict] | None = None, width: int = 900, height: int = 280) -> str:
+    if not rows:
+        return "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'><text x='24' y='48'>No chart data</text></svg>"
+
+    df = pd.DataFrame(rows).copy()
+    df["nav"] = pd.to_numeric(df["nav"], errors="coerce")
+    if "benchmark_nav" in df.columns:
+        df["benchmark_nav"] = pd.to_numeric(df["benchmark_nav"], errors="coerce")
+    df["drawdown"] = pd.to_numeric(df.get("drawdown"), errors="coerce")
+    df = df.dropna(subset=["nav"]).reset_index(drop=True)
+    if df.empty:
+        return "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'><text x='24' y='48'>No chart data</text></svg>"
+
+    padding = 28
+    chart_width = width - padding * 2
+    chart_height = height - padding * 2
+    min_value = float(df[["nav", "benchmark_nav"]].min(numeric_only=True).min()) if "benchmark_nav" in df.columns else float(df["nav"].min())
+    max_value = float(df[["nav", "benchmark_nav"]].max(numeric_only=True).max()) if "benchmark_nav" in df.columns else float(df["nav"].max())
+    value_range = max(max_value - min_value, 0.01)
+    step_x = chart_width / max(len(df) - 1, 1)
+
+    def y_scale(value: float) -> float:
+        return padding + (max_value - value) / value_range * chart_height
+
+    points: list[str] = []
+    for index, value in enumerate(df["nav"]):
+        x = padding + index * step_x
+        y = y_scale(float(value))
+        points.append(f"{x:.2f},{y:.2f}")
+
+    benchmark_points: list[str] = []
+    excess_points: list[str] = []
+    if "benchmark_nav" in df.columns:
+        base_nav = float(df.iloc[0]["nav"])
+        for index, value in enumerate(df["benchmark_nav"]):
+            if pd.isna(value):
+                continue
+            x = padding + index * step_x
+            y = y_scale(float(value))
+            benchmark_points.append(f"{x:.2f},{y:.2f}")
+            excess_value = float(df.iloc[index]["nav"]) - float(value) + base_nav
+            excess_y = y_scale(excess_value)
+            excess_points.append(f"{x:.2f},{excess_y:.2f}")
+
+    records = df.to_dict("records")
+
+    grid_lines: list[str] = []
+    for step in range(5):
+        y = padding + chart_height * step / 4
+        value = max_value - (value_range * step / 4)
+        grid_lines.append(
+            f"<line x1='{padding}' x2='{width - padding}' y1='{y:.2f}' y2='{y:.2f}' stroke='rgba(31,41,51,.08)' stroke-width='1' />"
+        )
+        grid_lines.append(
+            f"<text x='{padding - 2}' y='{y - 6:.2f}' fill='#6b7280' font-size='11' text-anchor='end'>{value:,.0f}</text>"
+        )
+
+    labels: list[str] = []
+    for index, row in enumerate(records):
+        if index not in {0, len(df) // 2, len(df) - 1}:
+            continue
+        x = padding + index * step_x
+        labels.append(
+            f"<text x='{x:.2f}' y='{height - 8}' fill='#6b7280' font-size='11' text-anchor='middle'>{html.escape(str(row['trade_date'])[5:])}</text>"
+        )
+
+    holding_bands: list[str] = []
+    band_start_index: int | None = None
+    for index, row in enumerate(records):
+        is_holding = int(row.get("position_count") or 0) > 0
+        if is_holding and band_start_index is None:
+            band_start_index = index
+        is_band_end = band_start_index is not None and (not is_holding or index == len(df) - 1)
+        if not is_band_end:
+            continue
+        end_index = index if is_holding and index == len(df) - 1 else index - 1
+        if end_index >= band_start_index:
+            start_x = padding + band_start_index * step_x
+            end_x = padding + end_index * step_x
+            band_width = max(end_x - start_x + max(step_x, 6), 6)
+            holding_bands.append(
+                f"<rect x='{start_x:.2f}' y='{padding:.2f}' width='{band_width:.2f}' height='{chart_height:.2f}' "
+                "fill='rgba(180, 83, 9, 0.08)' rx='8' />"
+            )
+        band_start_index = None
+
+    latest_nav = float(df.iloc[-1]["nav"])
+    latest_drawdown = float(df.iloc[-1]["drawdown"]) if "drawdown" in df.columns and not pd.isna(df.iloc[-1]["drawdown"]) else 0.0
+    latest_benchmark = (
+        float(df.iloc[-1]["benchmark_nav"])
+        if "benchmark_nav" in df.columns and not pd.isna(df.iloc[-1]["benchmark_nav"])
+        else None
+    )
+    latest_excess = latest_nav - latest_benchmark if latest_benchmark is not None else None
+    date_to_trades: dict[str, list[dict]] = {}
+    if trades:
+        for trade in trades:
+            trade_date = str(trade.get("execution_date") or "")
+            if not trade_date:
+                continue
+            date_to_trades.setdefault(trade_date, []).append(trade)
+    trade_markers: list[str] = []
+    if trades:
+        date_to_index = {str(row["trade_date"]): index for index, row in enumerate(records)}
+        buy_y = height - 28
+        sell_y = height - 14
+        for trade in trades:
+            trade_date = str(trade.get("execution_date") or "")
+            index = date_to_index.get(trade_date)
+            if index is None:
+                continue
+            x = padding + index * step_x
+            side = str(trade.get("side") or "")
+            if side == "buy":
+                trade_markers.append(
+                    f"<circle cx='{x:.2f}' cy='{buy_y:.2f}' r='4' fill='#b91c1c' />"
+                    f"<text x='{x:.2f}' y='{buy_y - 8:.2f}' fill='#b91c1c' font-size='10' text-anchor='middle'>B</text>"
+                )
+            elif side == "sell":
+                trade_markers.append(
+                    f"<circle cx='{x:.2f}' cy='{sell_y:.2f}' r='4' fill='#0f766e' />"
+                    f"<text x='{x:.2f}' y='{sell_y - 8:.2f}' fill='#0f766e' font-size='10' text-anchor='middle'>S</text>"
+                )
+    hover_layers: list[str] = []
+    for index, row in enumerate(records):
+        x = padding + index * step_x
+        hotspot_x = x - max(step_x / 2, 8)
+        hotspot_width = max(step_x, 16)
+        nav_value = float(row["nav"])
+        benchmark_value = row.get("benchmark_nav")
+        benchmark_text = f"{float(benchmark_value):,.2f}" if benchmark_value is not None and not pd.isna(benchmark_value) else "--"
+        excess_text = f"{(nav_value - float(benchmark_value)) if benchmark_value is not None and not pd.isna(benchmark_value) else 0:,.2f}"
+        holding_text = "持仓中" if int(row.get("position_count") or 0) > 0 else "空仓"
+        day_trades = date_to_trades.get(str(row["trade_date"]), [])
+        trade_text = " / ".join("买入" if str(item.get("side")) == "buy" else "卖出" for item in day_trades) if day_trades else "无交易"
+        tip_width = 172
+        tip_height = 88
+        tip_x = min(max(x - tip_width / 2, 10), width - tip_width - 10)
+        tip_y = max(padding + 6, y_scale(nav_value) - tip_height - 14)
+        hover_layers.append(
+            "<g class='nav-hotspot'>"
+            f"<rect x='{hotspot_x:.2f}' y='{padding:.2f}' width='{hotspot_width:.2f}' height='{chart_height:.2f}' fill='transparent' />"
+            f"<line x1='{x:.2f}' x2='{x:.2f}' y1='{padding:.2f}' y2='{padding + chart_height:.2f}' stroke='rgba(180,83,9,.18)' stroke-width='1.2' stroke-dasharray='4 4' class='nav-guide' />"
+            f"<circle cx='{x:.2f}' cy='{y_scale(nav_value):.2f}' r='4.5' fill='#b45309' stroke='#fffaf4' stroke-width='1.5' class='nav-guide' />"
+            f"<g class='nav-tooltip' transform='translate({tip_x:.2f},{tip_y:.2f})'>"
+            f"<rect width='{tip_width}' height='{tip_height}' rx='14' fill='rgba(26,32,44,.94)' stroke='rgba(255,255,255,.12)' stroke-width='1' />"
+            f"<text x='12' y='18' fill='#fff7ed' font-size='11' font-weight='700'>{html.escape(str(row['trade_date']))}</text>"
+            f"<text x='12' y='35' fill='#fed7aa' font-size='11'>策略净值 {nav_value:,.2f}</text>"
+            f"<text x='12' y='50' fill='#bfdbfe' font-size='11'>基准净值 {benchmark_text}</text>"
+            f"<text x='12' y='65' fill='#99f6e4' font-size='11'>超额 {excess_text}</text>"
+            f"<text x='12' y='80' fill='#e5e7eb' font-size='11'>{holding_text} · {trade_text}</text>"
+            "</g>"
+            "</g>"
+        )
+    parts = [
+        f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {width} {height}' role='img' aria-label='回测净值曲线'>",
+        """<style>
+        .nav-tooltip,.nav-guide{opacity:0;pointer-events:none;transition:opacity .16s ease}
+        .nav-hotspot:hover .nav-tooltip,.nav-hotspot:hover .nav-guide{opacity:1}
+        </style>""",
+        "<rect width='100%' height='100%' fill='#fffaf4' rx='20' />",
+        f"<text x='{padding}' y='20' fill='#6b7280' font-size='12'>回测区间净值 vs 基准</text>",
+        f"<text x='{padding + 180}' y='20' fill='#b45309' font-size='12'>策略 {latest_nav:,.2f}</text>",
+        (
+            f"<text x='{padding + 320}' y='20' fill='#2563eb' font-size='12'>基准 {latest_benchmark:,.2f}</text>"
+            if latest_benchmark is not None
+            else ""
+        ),
+        (
+            f"<text x='{padding + 470}' y='20' fill='#0f766e' font-size='12'>超额 {latest_excess:,.2f}</text>"
+            if latest_excess is not None
+            else ""
+        ),
+        f"<text x='{padding + 620}' y='20' fill='#7c3aed' font-size='12'>回撤 {latest_drawdown * 100:.2f}%</text>",
+        f"<text x='{padding + 760}' y='20' fill='#92400e' font-size='12'>阴影=持仓区间</text>",
+        *holding_bands,
+        *grid_lines,
+        f"<polyline fill='none' stroke='#b45309' stroke-width='2.2' points='{' '.join(points)}' />",
+        (
+            f"<polyline fill='none' stroke='#2563eb' stroke-width='2' stroke-dasharray='6 4' points='{' '.join(benchmark_points)}' />"
+            if benchmark_points
+            else ""
+        ),
+        (
+            f"<polyline fill='none' stroke='#0f766e' stroke-width='1.8' stroke-dasharray='2 4' points='{' '.join(excess_points)}' />"
+            if excess_points
+            else ""
+        ),
+        *hover_layers,
+        *labels,
+        *trade_markers,
         "</svg>",
     ]
     return "".join(parts)

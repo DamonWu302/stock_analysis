@@ -44,6 +44,7 @@ class StockAnalysisService:
         self.backtest_runner = BacktestRunner(self.db)
         self._last_cache_mode = "unknown"
         self._recover_stale_tasks()
+        self._recover_stale_backtest_tasks()
         self._recover_stale_backfill_tasks()
 
     def start_background_run(self, provider_name: str | None = None, limit: int | None = None) -> int:
@@ -283,14 +284,106 @@ class StockAnalysisService:
     def backtest_config_schema() -> dict:
         return build_backtest_config_schema()
 
+    def backtest_templates(self) -> list[dict]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, template_key, name, description, config_json, sort_order, is_builtin, updated_at
+                FROM backtest_template
+                ORDER BY sort_order ASC, id ASC
+                """
+            ).fetchall()
+        payload: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            item["config"] = json.loads(item["config_json"]) if item.get("config_json") else {}
+            payload.append(item)
+        return payload
+
     def run_backtest(self, config: dict | None = None) -> dict:
         return self.backtest_runner.run(config)
+
+    def start_backtest_task(self, config: dict | None = None) -> int:
+        payload = dict(config or {})
+        normalized = self.backtest_runner._normalize_config(payload)
+        started_at = datetime.now().isoformat(timespec="seconds")
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO backtest_task
+                (status, phase, started_at, progress_current, progress_total, message, config_json)
+                VALUES ('running', 'pending', ?, 0, 0, ?, ?)
+                """,
+                (started_at, "任务已创建，等待回测启动", json.dumps(normalized, ensure_ascii=False)),
+            )
+            task_id = int(cursor.lastrowid)
+        thread = threading.Thread(target=self._run_backtest_task, args=(task_id, normalized), daemon=True)
+        thread.start()
+        return task_id
 
     def recent_backtests(self, limit: int = 20) -> list[dict]:
         return self.backtest_runner.recent_runs(limit=limit)
 
     def backtest_detail(self, run_id: int) -> dict | None:
-        return self.backtest_runner.run_detail(run_id)
+        detail = self.backtest_runner.run_detail(run_id)
+        if not detail or not detail.get("summary"):
+            return detail
+        summary = detail["summary"]
+        summary["buy_execution_blocked_breakdown_label"] = self._label_execution_breakdown(
+            summary.get("buy_execution_blocked_breakdown") or {}
+        )
+        summary["sell_execution_deferred_breakdown_label"] = self._label_execution_breakdown(
+            summary.get("sell_execution_deferred_breakdown") or {}
+        )
+        for trade in detail.get("trades") or []:
+            trade["side_label"] = self._label_trade_side(str(trade.get("side") or ""))
+            trade["reason_label"] = self._label_trade_reason(str(trade.get("reason") or ""))
+        self._attach_backtest_trade_returns(detail)
+        self._attach_backtest_daily_pnl(detail)
+        self._decorate_backtest_positions(detail)
+        self._group_backtest_trades(detail)
+        self._group_backtest_positions(detail)
+        return detail
+
+    def latest_backtest_task(self) -> dict | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, status, phase, started_at, finished_at, progress_current, progress_total,
+                       last_trade_date, message, run_id, config_json
+                FROM backtest_task
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._build_backtest_task_payload(dict(row)) if row else None
+
+    def recent_backtest_tasks(self, limit: int = 10) -> list[dict]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, status, phase, started_at, finished_at, progress_current, progress_total,
+                       last_trade_date, message, run_id, config_json
+                FROM backtest_task
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._build_backtest_task_payload(dict(row)) for row in rows]
+
+    def backtest_task_detail(self, task_id: int) -> dict | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, status, phase, started_at, finished_at, progress_current, progress_total,
+                       last_trade_date, message, run_id, config_json
+                FROM backtest_task
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        return self._build_backtest_task_payload(dict(row)) if row else None
 
     def score_trend(self, days: int = 20) -> list[dict]:
         days = max(int(days), 2)
@@ -919,7 +1012,21 @@ class StockAnalysisService:
                 SET status = 'failed',
                     phase = 'failed',
                     finished_at = ?,
-                    message = '历史回填任务在应用重启前中断，可从当前进度继续续补'
+                    message = '历史回填任务在应用重启前中断，可从当前进度继续续跑'
+                WHERE status = 'running'
+                """,
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+
+    def _recover_stale_backtest_tasks(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE backtest_task
+                SET status = 'failed',
+                    phase = 'failed',
+                    finished_at = ?,
+                    message = '回测任务在应用重启前中断'
                 WHERE status = 'running'
                 """,
                 (datetime.now().isoformat(timespec="seconds"),),
@@ -940,6 +1047,412 @@ class StockAnalysisService:
         compact = " ".join(str(message).split())
         return compact if len(compact) <= max_len else compact[: max_len - 3] + "..."
 
+    @staticmethod
+    def _label_execution_breakdown(breakdown: dict[str, int]) -> str:
+        if not breakdown:
+            return "-"
+        labels = {
+            "limit_up": "涨停开盘买不到",
+            "limit_down": "跌停开盘卖不掉",
+            "missing": "缺少开盘价/停牌",
+        }
+        return "；".join(f"{labels.get(key, key)} {value}" for key, value in breakdown.items())
+
+    @staticmethod
+    def _label_trade_side(side: str) -> str:
+        labels = {
+            "buy": "买入",
+            "sell": "卖出",
+        }
+        return labels.get(side, side or "-")
+
+    @staticmethod
+    def _label_trade_reason(reason: str) -> str:
+        if not reason:
+            return "-"
+        labels = {
+            "buy_strict": "严格买入",
+            "buy_momentum": "增强买入",
+            "sell_stop": "硬止损",
+            "sell_trend": "趋势转弱",
+            "sell_capital": "资金撤退",
+            "sell_stale": "新鲜度失效",
+        }
+        parts = [labels.get(item.strip(), item.strip()) for item in reason.split(",") if item.strip()]
+        return "、".join(parts) if parts else reason
+
+    @staticmethod
+    def _format_percent(value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{value * 100:.2f}%"
+
+    @staticmethod
+    def _format_amount(value: float | None) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.2f}"
+
+    def _attach_backtest_trade_returns(self, detail: dict) -> None:
+        trades = detail.get("trades") or []
+        positions = detail.get("positions") or []
+        latest_position_by_symbol: dict[str, dict] = {}
+        for row in positions:
+            symbol = str(row.get("symbol") or "")
+            latest_position_by_symbol[symbol] = row
+
+        open_entries: dict[str, list[dict]] = {}
+        for trade in trades:
+            trade["pnl_amount"] = None
+            trade["return_rate"] = None
+            trade["return_text"] = "-"
+            trade["pnl_text"] = "-"
+            symbol = str(trade.get("symbol") or "")
+            side = str(trade.get("side") or "")
+            if side == "buy":
+                open_entries.setdefault(symbol, []).append(trade)
+                continue
+
+            entry_queue = open_entries.get(symbol) or []
+            if not entry_queue:
+                continue
+            entry = entry_queue.pop(0)
+            buy_cost = float(entry.get("net_amount") or 0.0)
+            sell_net = float(trade.get("net_amount") or 0.0)
+            pnl_amount = round(sell_net - buy_cost, 4)
+            return_rate = round(pnl_amount / buy_cost, 6) if buy_cost else 0.0
+            entry["pnl_amount"] = pnl_amount
+            entry["return_rate"] = return_rate
+            entry["return_text"] = self._format_percent(return_rate)
+            entry["pnl_text"] = self._format_amount(pnl_amount)
+            trade["pnl_amount"] = pnl_amount
+            trade["return_rate"] = return_rate
+            trade["return_text"] = self._format_percent(return_rate)
+            trade["pnl_text"] = self._format_amount(pnl_amount)
+
+        for symbol, queued in open_entries.items():
+            latest_position = latest_position_by_symbol.get(symbol)
+            for entry in queued:
+                if not latest_position:
+                    continue
+                pnl_amount = round(float(latest_position.get("unrealized_pnl") or 0.0), 4)
+                buy_cost = float(entry.get("net_amount") or 0.0)
+                return_rate = round(pnl_amount / buy_cost, 6) if buy_cost else 0.0
+                entry["pnl_amount"] = pnl_amount
+                entry["return_rate"] = return_rate
+                entry["return_text"] = f"{self._format_percent(return_rate)} (未实现)"
+                entry["pnl_text"] = f"{self._format_amount(pnl_amount)} (未实现)"
+
+    @staticmethod
+    def _decorate_backtest_positions(detail: dict) -> None:
+        position_dates_by_symbol: dict[str, list[str]] = {}
+        sell_dates_by_symbol: dict[str, list[str]] = {}
+        for row in detail.get("positions") or []:
+            symbol = str(row.get("symbol") or "")
+            position_dates_by_symbol.setdefault(symbol, []).append(str(row.get("trade_date") or ""))
+        for symbol, dates in position_dates_by_symbol.items():
+            position_dates_by_symbol[symbol] = sorted(dates)
+        for trade in detail.get("trades") or []:
+            if str(trade.get("side") or "") != "sell":
+                continue
+            symbol = str(trade.get("symbol") or "")
+            sell_dates_by_symbol.setdefault(symbol, []).append(str(trade.get("execution_date") or ""))
+
+        for row in detail.get("positions") or []:
+            symbol = str(row.get("symbol") or "")
+            trade_date = str(row.get("trade_date") or "")
+            weight = float(row.get("weight") or 0.0)
+            unrealized_pnl = float(row.get("unrealized_pnl") or 0.0)
+            row["weight_text"] = f"{weight * 100:.2f}%"
+            row["unrealized_pnl_text"] = f"{unrealized_pnl:.2f}"
+            row["market_value_text"] = f"{float(row.get('market_value') or 0.0):.2f}"
+            row["cost_price_text"] = f"{float(row.get('cost_price') or 0.0):.4f}"
+            row["close_price_text"] = f"{float(row.get('close_price') or 0.0):.4f}"
+            row["daily_pnl_text"] = f"{float(row.get('daily_pnl') or 0.0):.2f}"
+            row["position_exit_label"] = ""
+            later_position_dates = [item for item in position_dates_by_symbol.get(symbol, []) if item > trade_date]
+            later_sell_dates = [item for item in sell_dates_by_symbol.get(symbol, []) if item > trade_date]
+            if not later_position_dates and later_sell_dates:
+                row["position_exit_label"] = "当日最后持仓日"
+
+    @staticmethod
+    def _attach_backtest_daily_pnl(detail: dict) -> None:
+        nav_rows = detail.get("nav") or []
+        prev_nav = None
+        nav_daily: dict[str, float] = {}
+        for row in nav_rows:
+            nav_value = float(row.get("nav") or 0.0)
+            daily_pnl = round(nav_value - prev_nav, 4) if prev_nav is not None else 0.0
+            row["daily_pnl"] = daily_pnl
+            row["daily_pnl_text"] = f"{daily_pnl:.2f}"
+            nav_daily[str(row.get("trade_date") or "")] = daily_pnl
+            prev_nav = nav_value
+
+        positions_by_date: dict[str, list[dict]] = {}
+        for row in detail.get("positions") or []:
+            positions_by_date.setdefault(str(row.get("trade_date") or ""), []).append(row)
+
+        trades_by_date: dict[str, list[dict]] = {}
+        for row in detail.get("trades") or []:
+            row["daily_impact_amount"] = None
+            row["daily_impact_text"] = "-"
+            trades_by_date.setdefault(str(row.get("execution_date") or ""), []).append(row)
+
+        prev_unrealized_by_symbol: dict[str, float] = {}
+        prev_market_value_by_symbol: dict[str, float] = {}
+        for trade_date in sorted(set(positions_by_date.keys()) | set(trades_by_date.keys())):
+            rows = positions_by_date.get(trade_date, [])
+            buy_symbols_today = {
+                str(trade.get("symbol") or "")
+                for trade in trades_by_date.get(trade_date, [])
+                if str(trade.get("side") or "") == "buy"
+            }
+            current_unrealized_by_symbol: dict[str, float] = {}
+            current_market_value_by_symbol: dict[str, float] = {}
+            for row in rows:
+                symbol = str(row.get("symbol") or "")
+                current_unrealized = float(row.get("unrealized_pnl") or 0.0)
+                if symbol in prev_unrealized_by_symbol:
+                    daily_pnl = round(current_unrealized - prev_unrealized_by_symbol[symbol], 4)
+                else:
+                    daily_pnl = round(current_unrealized, 4)
+                row["daily_pnl"] = daily_pnl
+                row["daily_pnl_text"] = f"{daily_pnl:.2f}"
+                row["position_event_label"] = "当日新开仓" if symbol in buy_symbols_today else ""
+                current_unrealized_by_symbol[symbol] = current_unrealized
+                current_market_value_by_symbol[symbol] = float(row.get("market_value") or 0.0)
+
+            for trade in trades_by_date.get(trade_date, []):
+                symbol = str(trade.get("symbol") or "")
+                side = str(trade.get("side") or "")
+                if side == "buy":
+                    impact = round(
+                        current_market_value_by_symbol.get(symbol, 0.0) - float(trade.get("net_amount") or 0.0),
+                        4,
+                    )
+                else:
+                    impact = round(
+                        float(trade.get("net_amount") or 0.0) - prev_market_value_by_symbol.get(symbol, 0.0),
+                        4,
+                    )
+                trade["daily_impact_amount"] = impact
+                trade["daily_impact_text"] = f"{impact:.2f}"
+
+            prev_unrealized_by_symbol = current_unrealized_by_symbol
+            prev_market_value_by_symbol = current_market_value_by_symbol
+
+        detail["nav_daily_pnl"] = nav_daily
+
+    @staticmethod
+    def _group_backtest_positions(detail: dict) -> None:
+        position_grouped: dict[str, list[dict]] = {}
+        for row in detail.get("positions") or []:
+            position_grouped.setdefault(str(row.get("trade_date") or ""), []).append(row)
+
+        calendar: list[dict] = []
+        for nav_row in detail.get("nav") or []:
+            trade_date = str(nav_row.get("trade_date") or "")
+            rows = position_grouped.get(trade_date, [])
+            pnl = round(float(detail.get("nav_daily_pnl", {}).get(trade_date, 0.0)), 4)
+            market_value = round(sum(float(item.get("market_value") or 0.0) for item in rows), 4)
+            item = {
+                "trade_date": trade_date,
+                "position_count": len(rows),
+                "daily_pnl": pnl,
+                "daily_pnl_text": f"{pnl:.2f}",
+                "market_value": market_value,
+                "market_value_text": f"{market_value:.2f}",
+                "tone": "flat",
+            }
+            if pnl > 0:
+                item["tone"] = "up"
+            elif pnl < 0:
+                item["tone"] = "down"
+            calendar.append(item)
+
+        month_groups: list[dict] = []
+        month_map: dict[str, dict] = {}
+        for item in calendar:
+            month_key = str(item["trade_date"])[:7]
+            month_group = month_map.get(month_key)
+            if not month_group:
+                month_group = {
+                    "month": month_key,
+                    "days": [],
+                    "realized_pnl": 0.0,
+                    "realized_pnl_text": "0.00",
+                    "month_end_unrealized_pnl": 0.0,
+                    "month_end_unrealized_pnl_text": "0.00",
+                    "net_change_pnl": 0.0,
+                    "net_change_pnl_text": "0.00",
+                    "tone": "flat",
+                }
+                month_map[month_key] = month_group
+                month_groups.append(month_group)
+            month_group["days"].append(item)
+
+        realized_by_month: dict[str, float] = {}
+        for trade in detail.get("trades") or []:
+            if str(trade.get("side") or "") != "sell":
+                continue
+            pnl_amount = trade.get("pnl_amount")
+            if pnl_amount is None:
+                continue
+            month_key = str(trade.get("execution_date") or "")[:7]
+            realized_by_month[month_key] = round(realized_by_month.get(month_key, 0.0) + float(pnl_amount), 4)
+
+        month_end_nav: dict[str, float] = {}
+        for nav_row in detail.get("nav") or []:
+            month_end_nav[str(nav_row.get("trade_date") or "")[:7]] = float(nav_row.get("nav") or 0.0)
+
+        previous_month_end_nav = float(detail.get("summary", {}).get("initial_capital") or 0.0)
+        for month_group in month_groups:
+            last_day = month_group["days"][-1] if month_group["days"] else None
+            last_day_positions = position_grouped.get(str(last_day["trade_date"]) if last_day else "", [])
+            month_end_unrealized = round(
+                sum(float(row.get("unrealized_pnl") or 0.0) for row in last_day_positions),
+                4,
+            )
+            realized = float(realized_by_month.get(month_group["month"], 0.0))
+            current_month_end_nav = float(month_end_nav.get(month_group["month"], previous_month_end_nav))
+            net_change_pnl = round(current_month_end_nav - previous_month_end_nav, 4)
+            month_group["realized_pnl"] = realized
+            month_group["realized_pnl_text"] = f"{realized:.2f}"
+            month_group["month_end_unrealized_pnl"] = month_end_unrealized
+            month_group["month_end_unrealized_pnl_text"] = f"{month_end_unrealized:.2f}"
+            month_group["net_change_pnl"] = net_change_pnl
+            month_group["net_change_pnl_text"] = f"{net_change_pnl:.2f}"
+            if net_change_pnl > 0:
+                month_group["tone"] = "up"
+            elif net_change_pnl < 0:
+                month_group["tone"] = "down"
+            for day in month_group["days"]:
+                day["month_key"] = month_group["month"]
+                day["month_realized_pnl"] = realized
+                day["month_realized_pnl_text"] = month_group["realized_pnl_text"]
+                day["month_end_unrealized_pnl"] = month_end_unrealized
+                day["month_end_unrealized_pnl_text"] = month_group["month_end_unrealized_pnl_text"]
+                day["month_net_change_pnl"] = net_change_pnl
+                day["month_net_change_pnl_text"] = month_group["net_change_pnl_text"]
+            previous_month_end_nav = current_month_end_nav
+
+        detail["position_calendar"] = calendar
+        detail["position_calendar_months"] = month_groups
+        detail["positions_by_date"] = position_grouped
+        detail["position_active_date"] = calendar[-1]["trade_date"] if calendar else ""
+
+    @staticmethod
+    def _group_backtest_trades(detail: dict) -> None:
+        grouped: dict[str, list[dict]] = {}
+        for row in detail.get("trades") or []:
+            grouped.setdefault(str(row.get("execution_date") or ""), []).append(row)
+        detail["trades_by_date"] = grouped
+
+    @staticmethod
+    def _format_backtest_task_error(exc: Exception) -> dict[str, str]:
+        raw = " ".join(str(exc).split()) or exc.__class__.__name__
+        lower = raw.lower()
+
+        if "应用重启前中断" in raw:
+            return {
+                "summary": "回测失败：任务在应用重启前中断",
+                "detail": raw,
+                "hint": "这类失败通常不是策略逻辑错误，重新发起任务即可。",
+            }
+        if "daily_score" in lower and ("不足" in raw or "not enough" in lower):
+            return {
+                "summary": "回测失败：可用评分数据不足",
+                "detail": raw,
+                "hint": "先检查所选区间内是否已经完成 daily_score 和 daily_factor 回填。",
+            }
+        if "start_date" in lower or "end_date" in lower or "日期" in raw:
+            return {
+                "summary": "回测失败：日期区间配置无效",
+                "detail": raw,
+                "hint": "请检查开始日期、结束日期和最近交易日数的配置是否合理。",
+            }
+        if "sqlite" in lower or "database" in lower or "locked" in lower or "busy" in lower:
+            return {
+                "summary": "回测失败：数据库读写异常",
+                "detail": raw,
+                "hint": "数据库可能正被其他任务占用，稍后重试会更稳妥。",
+            }
+        if "json" in lower or "config" in lower or "float" in lower or "int" in lower:
+            return {
+                "summary": "回测失败：回测参数解析异常",
+                "detail": raw,
+                "hint": "请检查回测表单中的参数格式，尤其是日期、资金、费率和阈值。",
+            }
+        return {
+            "summary": "回测失败：执行过程中出现异常",
+            "detail": raw,
+            "hint": "可以根据详细原因继续定位，必要时缩小区间先做小样本验证。",
+        }
+
+    def _run_backtest_task(self, task_id: int, config: dict) -> None:
+        def progress_callback(payload: dict) -> None:
+            self._update_backtest_task(
+                task_id,
+                phase=str(payload.get("phase") or "executing"),
+                message=str(payload.get("message") or "正在执行回测"),
+                progress_current=int(payload.get("progress_current") or 0),
+                progress_total=int(payload.get("progress_total") or 0),
+                last_trade_date=payload.get("last_trade_date"),
+            )
+
+        try:
+            result = self.backtest_runner.run(config, progress_callback=progress_callback)
+            self._update_backtest_task(
+                task_id,
+                status="completed",
+                phase="completed",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                message="回测完成",
+                run_id=result["run_id"],
+                progress_current=result.get("available_signal_days", 0),
+                progress_total=result.get("available_signal_days", 0),
+                last_trade_date=result.get("end_date"),
+            )
+        except Exception as exc:
+            error_info = self._format_backtest_task_error(exc)
+            self._update_backtest_task(
+                task_id,
+                status="failed",
+                phase="failed",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                message=error_info["detail"],
+            )
+
+    def _update_backtest_task(self, task_id: int, **fields) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in fields.keys())
+        values = list(fields.values()) + [task_id]
+        with self.db.connect() as conn:
+            conn.execute(f"UPDATE backtest_task SET {assignments} WHERE id = ?", values)
+
+    def _build_backtest_task_payload(self, task: dict) -> dict:
+        payload = dict(task)
+        payload["config"] = json.loads(payload["config_json"]) if payload.get("config_json") else {}
+        payload["phase_label"] = self._phase_label(
+            phase=str(payload.get("phase") or ""),
+            finished=bool(payload.get("finished_at")),
+            status=str(payload.get("status") or ""),
+        )
+        payload["phase_hint"] = self._phase_hint(
+            phase=str(payload.get("phase") or ""),
+            status=str(payload.get("status") or ""),
+        )
+        payload["error_summary"] = ""
+        payload["error_detail"] = ""
+        payload["error_hint"] = ""
+        if str(payload.get("status") or "") == "failed":
+            error_info = self._format_backtest_task_error(Exception(str(payload.get("message") or "")))
+            payload["error_summary"] = error_info["summary"]
+            payload["error_detail"] = error_info["detail"]
+            payload["error_hint"] = error_info["hint"]
+        return self._enrich_task_timing(payload)
+
     def _build_progress_message(self, current: int, total: int, symbol: str, cache_stats: CacheStats) -> str:
         base = f"正在扫描 {symbol}，已完成 {current}/{total}"
         if cache_stats.stock_failures <= 0:
@@ -956,6 +1469,10 @@ class StockAnalysisService:
         task["phase_label"] = StockAnalysisService._phase_label(
             phase=phase,
             finished=bool(task.get("finished_at")),
+            status=str(task.get("status") or ""),
+        )
+        task["phase_hint"] = StockAnalysisService._phase_hint(
+            phase=phase,
             status=str(task.get("status") or ""),
         )
         started_at = task.get("started_at")
@@ -980,7 +1497,7 @@ class StockAnalysisService:
                 eta_at = None
 
         task["avg_item_seconds"] = round(avg_seconds, 2) if avg_seconds is not None else None
-        task["avg_item_text"] = f"{avg_seconds:.2f} 秒/项" if avg_seconds is not None else "-"
+        task["avg_item_text"] = f"{avg_seconds:.2f} 秒/日" if avg_seconds is not None else "-"
         task["eta_at"] = eta_at
         task["eta_text"] = eta_at or ("已完成" if finished_at else "-")
         if not eta_at and finished_at:
@@ -996,12 +1513,31 @@ class StockAnalysisService:
         labels = {
             "pending": "等待中",
             "scanning": "扫描中",
-            "loading": "加载中",
+            "loading": "加载数据中",
+            "preparing": "准备信号中",
             "calculating": "计算中",
-            "summarizing": "汇总中",
+            "executing": "执行交易中",
+            "summarizing": "汇总结果中",
             "writing": "写库中",
         }
-        return labels.get(phase, "扫描中")
+        return labels.get(phase, "处理中")
+
+    @staticmethod
+    def _phase_hint(phase: str, status: str) -> str:
+        if status == "failed" or phase == "failed":
+            return "任务已停止，请查看失败原因。"
+        if status == "completed" or phase == "completed":
+            return "回测结果已经落库，可以查看详情。"
+        hints = {
+            "pending": "任务已经创建，正在等待后台线程开始执行。",
+            "loading": "正在读取交易日、评分数据、行情数据和基准数据。",
+            "preparing": "正在整理每日候选股票和市场过滤条件。",
+            "calculating": "正在评估买卖规则并生成候选信号。",
+            "executing": "正在按交易日推进持仓、成交和净值。",
+            "summarizing": "正在汇总收益、回撤、胜率和执行约束统计。",
+            "writing": "正在把信号、成交、持仓和净值写入数据库。",
+        }
+        return hints.get(phase, "任务正在后台处理中。")
 
     def _update_task(self, task_id: int, **fields) -> None:
         if not fields:
