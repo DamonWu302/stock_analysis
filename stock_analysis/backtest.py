@@ -9,10 +9,10 @@ from .analyzer import SCORE_VERSION
 BUY_RULE_STRICT = "buy_strict"
 BUY_RULE_MOMENTUM = "buy_momentum"
 
-SELL_RULE_STOP = "sell_stop"
-SELL_RULE_TREND = "sell_trend"
-SELL_RULE_CAPITAL = "sell_capital"
-SELL_RULE_STALE = "sell_stale"
+SELL_RULE_TRIM = "sell_trim"
+SELL_RULE_BREAK_MA5 = "sell_break_ma5"
+SELL_RULE_DRAWDOWN = "sell_drawdown"
+SELL_RULE_TIME_STOP = "sell_time_stop"
 
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 
@@ -26,10 +26,41 @@ class BacktestDefaults:
     end_date: str | None = None
     market_score_filter_min_avg: float = 41.0
     market_score_filter_min_ma5: float = 41.0
+    market_require_benchmark_ma20_up: bool = False
+    market_require_benchmark_above_ma20: bool = True
     max_positions: int = 4
     initial_capital: float = DEFAULT_INITIAL_CAPITAL
     fee_rate: float = 0.001
     slippage_rate: float = 0.001
+    buy_strict_score_total: float = 74.0
+    buy_strict_score_ma_trend: float = 14.0
+    buy_strict_score_breakout: float = 12.0
+    buy_strict_score_capital_sector: float = 10.0
+    buy_strict_score_volume_pattern: float = 14.0
+    buy_momentum_score_total: float = 68.0
+    buy_momentum_score_volume_pattern: float = 14.0
+    buy_min_core_hits: int = 4
+    buy_low_position_high_ratio_max: float = 0.95
+    buy_20d_gain_max: float = 15.0
+    buy_recent_stall_lookback: int = 3
+    buy_recent_stall_pct_max: float = 1.0
+    buy_recent_stall_volume_multiple: float = 1.2
+    buy_risk_amplitude_max: float = 0.20
+    buy_risk_max_drop_max: float = 0.12
+    buy_sector_rank_top_pct: float = 0.50
+    sell_trim_profit_threshold: float = 0.08
+    sell_trim_fraction: float = 0.5
+    sell_trim_upper_shadow_ratio: float = 0.03
+    sell_trim_volume_multiple: float = 1.2
+    sell_break_ma5_volume_multiple: float = 1.0
+    sell_drawdown_profit_threshold: float = 0.10
+    sell_drawdown_threshold: float = 0.05
+    sell_drawdown_profit_threshold_mid: float = 0.18
+    sell_drawdown_threshold_mid: float = 0.06
+    sell_drawdown_profit_threshold_high: float = 0.30
+    sell_drawdown_threshold_high: float = 0.08
+    sell_time_stop_days: int = 10
+    sell_time_stop_return_threshold: float = 0.02
     buy_timing: str = "next_open"
     sell_timing: str = "next_open"
     allow_pyramiding: bool = False
@@ -38,7 +69,12 @@ class BacktestDefaults:
     score_version: str = SCORE_VERSION
     enabled_buy_rules: list[str] = field(default_factory=lambda: [BUY_RULE_STRICT, BUY_RULE_MOMENTUM])
     enabled_sell_rules: list[str] = field(
-        default_factory=lambda: [SELL_RULE_STOP, SELL_RULE_TREND, SELL_RULE_CAPITAL, SELL_RULE_STALE]
+        default_factory=lambda: [
+            SELL_RULE_TRIM,
+            SELL_RULE_BREAK_MA5,
+            SELL_RULE_DRAWDOWN,
+            SELL_RULE_TIME_STOP,
+        ]
     )
 
 
@@ -46,75 +82,153 @@ def build_backtest_config_schema() -> dict[str, Any]:
     defaults = BacktestDefaults()
     return {
         "defaults": asdict(defaults),
+        "compare_fields": [
+            {"id": "buy_strict_score_total", "label": "严格买入总分阈值", "type": "float"},
+            {"id": "buy_momentum_score_total", "label": "增强买入总分阈值", "type": "float"},
+            {"id": "buy_min_core_hits", "label": "买入最少核心命中数", "type": "int"},
+            {"id": "buy_20d_gain_max", "label": "买入20日涨幅上限", "type": "float"},
+            {"id": "market_score_filter_min_avg", "label": "市场平均分过滤阈值", "type": "float"},
+            {"id": "market_score_filter_min_ma5", "label": "市场5日均值过滤阈值", "type": "float"},
+            {"id": "max_positions", "label": "最大持仓数", "type": "int"},
+            {"id": "fee_rate", "label": "手续费", "type": "float"},
+            {"id": "slippage_rate", "label": "滑点", "type": "float"},
+        ],
         "buy_rules": [
             {
                 "id": BUY_RULE_STRICT,
-                "label": "严格买入",
+                "label": "提前型严格买入",
                 "enabled": True,
-                "description": "总分、趋势、突破、资金三项同时达标时触发主买点。",
+                "description": "总分达到 74 分以上，且均线多头/低位突破满足其一，同时量价与资金板块共振达标，再叠加低位和近3日量能过滤。",
                 "conditions": [
-                    {"field": "score_total", "operator": ">=", "value": 80.0},
-                    {"field": "score_ma_trend", "operator": ">=", "value": 18.0},
-                    {"field": "score_breakout", "operator": ">=", "value": 12.8},
-                    {"field": "score_capital_sector", "operator": ">=", "value": 14.4},
+                    {"field": "score_total", "operator": ">=", "value": defaults.buy_strict_score_total},
+                    {
+                        "field": "score_ma_trend_or_breakout",
+                        "operator": "either",
+                        "value": f"均线多头 >= {defaults.buy_strict_score_ma_trend} 或 低位启动突破 >= {defaults.buy_strict_score_breakout}",
+                    },
+                    {"field": "score_volume_pattern", "operator": ">=", "value": defaults.buy_strict_score_volume_pattern},
+                    {"field": "score_capital_sector", "operator": ">=", "value": defaults.buy_strict_score_capital_sector},
+                    {"field": "core_hits", "operator": ">=", "value": defaults.buy_min_core_hits},
+                    {
+                        "field": "low_position_gate",
+                        "operator": "=",
+                        "value": 1.0,
+                        "formula": f"close <= prior_20_high * {defaults.buy_low_position_high_ratio_max} or 20日涨幅 <= {defaults.buy_20d_gain_max}%",
+                    },
+                    {
+                        "field": "recent_volume_stall",
+                        "operator": "=",
+                        "value": 0.0,
+                        "formula": f"近{defaults.buy_recent_stall_lookback}日内不存在 涨幅 < {defaults.buy_recent_stall_pct_max}% 且 成交量 > 5日均量 {defaults.buy_recent_stall_volume_multiple} 倍",
+                    },
+                    {
+                        "field": "buy_risk_limit",
+                        "operator": "=",
+                        "value": 1.0,
+                        "formula": f"买入前5日振幅 <= {defaults.buy_risk_amplitude_max:.0%} 且 最大跌幅 <= {defaults.buy_risk_max_drop_max:.0%}",
+                    },
+                    {
+                        "field": "sector_rank_gate",
+                        "operator": "<=",
+                        "value": defaults.buy_sector_rank_top_pct,
+                        "formula": f"所属板块5日涨幅排名需位于前 {defaults.buy_sector_rank_top_pct:.0%}",
+                    },
                 ],
                 "logic": "all",
             },
             {
                 "id": BUY_RULE_MOMENTUM,
-                "label": "增强买入",
+                "label": "提前型增强买入",
                 "enabled": True,
-                "description": "总分略低但量价形态非常强时，触发右侧动量买点。",
+                "description": "保留动量买点，但同样要求核心指标、低位约束和近3日量能环境不过热。",
                 "conditions": [
-                    {"field": "score_total", "operator": ">=", "value": 75.0},
-                    {"field": "score_volume_pattern", "operator": ">=", "value": 20.0},
+                    {"field": "score_total", "operator": ">=", "value": defaults.buy_momentum_score_total},
+                    {"field": "score_volume_pattern", "operator": ">=", "value": defaults.buy_momentum_score_volume_pattern},
+                    {"field": "core_hits", "operator": ">=", "value": defaults.buy_min_core_hits},
+                    {
+                        "field": "low_position_gate",
+                        "operator": "=",
+                        "value": 1.0,
+                        "formula": f"close <= prior_20_high * {defaults.buy_low_position_high_ratio_max} or 20日涨幅 <= {defaults.buy_20d_gain_max}%",
+                    },
+                    {
+                        "field": "recent_volume_stall",
+                        "operator": "=",
+                        "value": 0.0,
+                        "formula": f"近{defaults.buy_recent_stall_lookback}日内不存在 涨幅 < {defaults.buy_recent_stall_pct_max}% 且 成交量 > 5日均量 {defaults.buy_recent_stall_volume_multiple} 倍",
+                    },
+                    {
+                        "field": "buy_risk_limit",
+                        "operator": "=",
+                        "value": 1.0,
+                        "formula": f"买入前5日振幅 <= {defaults.buy_risk_amplitude_max:.0%} 且 最大跌幅 <= {defaults.buy_risk_max_drop_max:.0%}",
+                    },
+                    {
+                        "field": "sector_rank_gate",
+                        "operator": "<=",
+                        "value": defaults.buy_sector_rank_top_pct,
+                        "formula": f"所属板块5日涨幅排名需位于前 {defaults.buy_sector_rank_top_pct:.0%}",
+                    },
                 ],
                 "logic": "all",
             },
         ],
         "sell_rules": [
             {
-                "id": SELL_RULE_STOP,
-                "label": "硬止损",
+                "id": SELL_RULE_TRIM,
+                "label": "分级止盈减仓",
                 "enabled": True,
-                "description": "跌破突破防守位时，视为突破失效。",
+                "description": "持仓盈利达到阈值后，如出现放量长上影，先减仓 50% 锁定利润，作为辅助止盈。",
                 "conditions": [
                     {
-                        "field": "close_vs_breakout_floor",
-                        "operator": "<",
+                        "field": "position_return",
+                        "operator": ">=",
+                        "value": defaults.sell_trim_profit_threshold,
+                    },
+                    {
+                        "field": "long_upper_shadow_signal",
+                        "operator": "=",
                         "value": 1.0,
-                        "formula": "close < max(prior_20_high - 1.2*ATR14, prior_20_high*0.96)",
+                        "formula": "放量长上影",
                     }
                 ],
                 "logic": "all",
             },
             {
-                "id": SELL_RULE_TREND,
-                "label": "趋势转弱",
+                "id": SELL_RULE_BREAK_MA5,
+                "label": "跌破 MA5 放量清仓",
                 "enabled": True,
-                "description": "短趋势走平或跌破关键均线时离场。",
+                "description": "收盘跌破 MA5 且成交量高于 MA5 量能时，直接清仓。",
                 "conditions": [
-                    {"field": "ma5_vs_ma10", "operator": "<=", "value": 1.0},
-                    {"field": "close_vs_ma10", "operator": "<", "value": 1.0},
+                    {"field": "close_vs_ma5", "operator": "<", "value": 1.0},
+                    {"field": "volume_vs_vol_ma5", "operator": ">", "value": defaults.sell_break_ma5_volume_multiple},
                 ],
-                "logic": "any",
-            },
-            {
-                "id": SELL_RULE_CAPITAL,
-                "label": "资金撤退",
-                "enabled": True,
-                "description": "CMF 转负时，视为资金开始撤退。",
-                "conditions": [{"field": "cmf21", "operator": "<", "value": 0.0}],
                 "logic": "all",
             },
             {
-                "id": SELL_RULE_STALE,
-                "label": "新鲜度失效",
+                "id": SELL_RULE_DRAWDOWN,
+                "label": "高点回撤止损",
                 "enabled": True,
-                "description": "突破后迟迟不走强时，切换到更有活力的标的。",
+                "description": "盈利达到 10% 后启用移动止盈；若阶段利润达到 20%，则放宽回撤容忍度。",
                 "conditions": [
-                    {"field": "score_hold_ratio", "operator": "<", "value": 0.5},
-                    {"field": "position_return", "operator": "<", "value": 0.05},
+                    {
+                        "field": "dynamic_trailing_stop",
+                        "operator": "=",
+                        "value": 1.0,
+                        "formula": f"峰值盈利 >= {defaults.sell_drawdown_profit_threshold:.0%} 时回撤>{defaults.sell_drawdown_threshold:.0%}；峰值盈利 >= {defaults.sell_drawdown_profit_threshold_mid:.0%} 时回撤>{defaults.sell_drawdown_threshold_mid:.0%}；峰值盈利 >= {defaults.sell_drawdown_profit_threshold_high:.0%} 时回撤>{defaults.sell_drawdown_threshold_high:.0%}",
+                    },
+                ],
+                "logic": "all",
+            },
+            {
+                "id": SELL_RULE_TIME_STOP,
+                "label": "时间止损",
+                "enabled": True,
+                "description": "持仓 10 天后若收益仍弱，且跌到 MA20 下方，直接清仓提升资金周转。",
+                "conditions": [
+                    {"field": "hold_days", "operator": ">=", "value": defaults.sell_time_stop_days},
+                    {"field": "position_return", "operator": "<", "value": defaults.sell_time_stop_return_threshold},
+                    {"field": "close_vs_ma20", "operator": "<=", "value": 1.0},
                 ],
                 "logic": "all",
             },
@@ -153,7 +267,7 @@ def build_backtest_templates() -> list[dict[str, Any]]:
         {
             "template_key": "balanced_default",
             "name": "均衡默认",
-            "description": "双买点、四卖点都开启，适合先跑全量评估。",
+            "description": "提前买点 + 五档卖出，适合先跑全量评估。",
             "sort_order": 10,
             "config": {
                 "name": "均衡默认模板",
@@ -162,13 +276,18 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "market_score_filter_min_avg": 41.0,
                 "market_score_filter_min_ma5": 41.0,
                 "enabled_buy_rules": [BUY_RULE_STRICT, BUY_RULE_MOMENTUM],
-                "enabled_sell_rules": [SELL_RULE_STOP, SELL_RULE_TREND, SELL_RULE_CAPITAL, SELL_RULE_STALE],
+                "enabled_sell_rules": [
+                    SELL_RULE_TRIM,
+                    SELL_RULE_BREAK_MA5,
+                    SELL_RULE_DRAWDOWN,
+                    SELL_RULE_TIME_STOP,
+                ],
             },
         },
         {
             "template_key": "strict_trend",
             "name": "严格趋势",
-            "description": "只做严格买点，市场过滤更高，适合偏保守环境。",
+            "description": "只做提前型严格买点，止盈和风控更完整。",
             "sort_order": 20,
             "config": {
                 "name": "严格趋势模板",
@@ -177,13 +296,18 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "market_score_filter_min_avg": 45.0,
                 "market_score_filter_min_ma5": 45.0,
                 "enabled_buy_rules": [BUY_RULE_STRICT],
-                "enabled_sell_rules": [SELL_RULE_STOP, SELL_RULE_TREND, SELL_RULE_CAPITAL],
+                "enabled_sell_rules": [
+                    SELL_RULE_TRIM,
+                    SELL_RULE_BREAK_MA5,
+                    SELL_RULE_DRAWDOWN,
+                    SELL_RULE_TIME_STOP,
+                ],
             },
         },
         {
             "template_key": "momentum_attack",
             "name": "动量进攻",
-            "description": "偏向增强买点，持仓更满，适合想验证高弹性票的时期。",
+            "description": "偏向提前型增强买点，更强调快速止盈和放量撤退。",
             "sort_order": 30,
             "config": {
                 "name": "动量进攻模板",
@@ -192,13 +316,18 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "market_score_filter_min_avg": 43.0,
                 "market_score_filter_min_ma5": 43.0,
                 "enabled_buy_rules": [BUY_RULE_MOMENTUM],
-                "enabled_sell_rules": [SELL_RULE_TREND, SELL_RULE_CAPITAL, SELL_RULE_STALE],
+                "enabled_sell_rules": [
+                    SELL_RULE_TRIM,
+                    SELL_RULE_BREAK_MA5,
+                    SELL_RULE_DRAWDOWN,
+                    SELL_RULE_TIME_STOP,
+                ],
             },
         },
         {
             "template_key": "defensive_low_exposure",
             "name": "防守低仓",
-            "description": "更少持仓、更高过滤，只保留强信号，适合弱势环境。",
+            "description": "更少持仓、更高过滤，适合弱势环境。",
             "sort_order": 40,
             "config": {
                 "name": "防守低仓模板",
@@ -207,7 +336,12 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "market_score_filter_min_avg": 46.0,
                 "market_score_filter_min_ma5": 46.0,
                 "enabled_buy_rules": [BUY_RULE_STRICT],
-                "enabled_sell_rules": [SELL_RULE_STOP, SELL_RULE_TREND, SELL_RULE_CAPITAL, SELL_RULE_STALE],
+                "enabled_sell_rules": [
+                    SELL_RULE_TRIM,
+                    SELL_RULE_BREAK_MA5,
+                    SELL_RULE_DRAWDOWN,
+                    SELL_RULE_TIME_STOP,
+                ],
             },
         },
     ]

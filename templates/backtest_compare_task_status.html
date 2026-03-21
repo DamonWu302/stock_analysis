@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>参数对比任务</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        {% if success %}
+        <div class="alert success">{{ success }}</div>
+        {% endif %}
+
+        <section class="hero detail-hero">
+            <div>
+                <p class="eyebrow">COMPARE TASK</p>
+                <h1>{{ task.name }}</h1>
+                <p class="subtitle">对比参数：{{ task.parameter_label }}</p>
+            </div>
+            <div class="detail-stats">
+                <div class="mini-card"><span>状态</span><strong id="status-text">{{ task.status }}</strong></div>
+                <div class="mini-card"><span>阶段</span><strong id="phase-text">{{ task.phase_label }}</strong></div>
+                <div class="mini-card"><span>进度</span><strong id="progress-text">{{ task.progress_current }}/{{ task.progress_total }}</strong></div>
+                <div class="mini-card"><span>预计完成</span><strong id="eta-text">{{ task.eta_text }}</strong></div>
+            </div>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>任务说明</h2>
+            </div>
+            <p class="summary-block" id="message-text">{{ task.message or '-' }}</p>
+            <p class="summary-block">参数维度：{% for item in task['values'] %}{{ item['label'] }} = {{ item['values']|join(', ') }}{% if not loop.last %}；{% endif %}{% endfor %}</p>
+            <p class="summary-block">阶段说明：<span id="phase-hint">{{ task.phase_hint }}</span></p>
+        </section>
+
+        {% if compare_charts %}
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>对比结果曲线</h2>
+            </div>
+            <div class="compare-highlight-row">
+                <span class="badge compare-best-total">总收益最优：#{{ task['summary'].get('best_total_return_run_id') or '-' }}</span>
+                <span class="badge compare-best-excess">超额最优：#{{ task['summary'].get('best_excess_return_run_id') or '-' }}</span>
+            </div>
+            <div class="compare-chart-grid">
+                {% for item in compare_charts %}
+                <article class="compare-chart-card{% if item.run_id == task['summary'].get('best_total_return_run_id') %} is-best-total{% endif %}{% if item.run_id == task['summary'].get('best_excess_return_run_id') %} is-best-excess{% endif %}">
+                    <div class="compare-chart-head">
+                        <div>
+                            <strong>{{ item.parameter_value }}</strong>
+                            <div class="compare-card-badges">
+                                {% if item.run_id == task['summary'].get('best_total_return_run_id') %}
+                                <span class="badge compare-best-total">总收益最优</span>
+                                {% endif %}
+                                {% if item.run_id == task['summary'].get('best_excess_return_run_id') %}
+                                <span class="badge compare-best-excess">超额最优</span>
+                                {% endif %}
+                            </div>
+                        </div>
+                        <a class="detail-link" href="{{ url_for('backtest_detail_page', run_id=item.run_id) }}">查看详情</a>
+                    </div>
+                    <p class="summary-block">总收益 {{ '%.2f'|format((item.total_return or 0) * 100) }}%，超额 {{ '%.2f'|format((item.excess_return or 0) * 100) }}%</p>
+                    <div class="chart-box compare-chart-box">{{ item.nav_svg|safe }}</div>
+                </article>
+                {% endfor %}
+            </div>
+        </section>
+        {% endif %}
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>对比结果</h2>
+                <label class="compare-sort-inline">
+                    <span>排序方式</span>
+                    <select id="compare-sort-select">
+                        <option value="total_return_desc">总收益 从高到低</option>
+                        <option value="excess_return_desc">超额收益 从高到低</option>
+                        <option value="max_drawdown_asc">最大回撤 从低到高</option>
+                        <option value="win_rate_desc">胜率 从高到低</option>
+                        <option value="trade_count_desc">交易次数 从高到低</option>
+                    </select>
+                </label>
+            </div>
+            {% set rows = task['summary'].get('rows', []) if task['summary'] else [] %}
+            {% if rows %}
+            <div class="data-table-wrap">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>参数值</th>
+                            <th>回测</th>
+                            <th>总收益</th>
+                            <th>超额收益</th>
+                            <th>最大回撤</th>
+                            <th>交易次数</th>
+                            <th>胜率</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="compare-rows">
+                        {% for row in rows %}
+                        <tr class="compare-row{% if row.run_id == task['summary'].get('best_total_return_run_id') %} is-best-total{% endif %}{% if row.run_id == task['summary'].get('best_excess_return_run_id') %} is-best-excess{% endif %}"
+                            data-run-id="{{ row.run_id }}"
+                            data-parameter-value="{{ row.parameter_value }}"
+                            data-name="{{ row.name }}"
+                            data-total-return="{{ row.total_return or 0 }}"
+                            data-excess-return="{{ row.excess_return or 0 }}"
+                            data-max-drawdown="{{ row.max_drawdown or 0 }}"
+                            data-trade-count="{{ row.trade_count or 0 }}"
+                            data-win-rate="{{ row.win_rate or 0 }}">
+                            <td>{{ row.parameter_value }}</td>
+                            <td>
+                                {{ row.name }}
+                                {% if row.run_id == task['summary'].get('best_total_return_run_id') %}
+                                <span class="badge compare-best-total">总收益最优</span>
+                                {% endif %}
+                                {% if row.run_id == task['summary'].get('best_excess_return_run_id') %}
+                                <span class="badge compare-best-excess">超额最优</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ '%.2f'|format((row.total_return or 0) * 100) }}%</td>
+                            <td>{{ '%.2f'|format((row.excess_return or 0) * 100) }}%</td>
+                            <td>{{ '%.2f'|format((row.max_drawdown or 0) * 100) }}%</td>
+                            <td>{{ row.trade_count or 0 }}</td>
+                            <td>{{ '%.2f'|format((row.win_rate or 0) * 100) }}%</td>
+                            <td><a class="detail-link" href="{{ url_for('backtest_detail_page', run_id=row.run_id) }}">查看回测</a></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p class="summary-block" id="compare-empty">任务执行完成后，这里会展示多组参数结果对比。</p>
+            {% endif %}
+        </section>
+    </main>
+
+    <script>
+    (() => {
+        const taskId = {{ task.id }};
+        const statusNode = document.getElementById('status-text');
+        const phaseNode = document.getElementById('phase-text');
+        const progressNode = document.getElementById('progress-text');
+        const etaNode = document.getElementById('eta-text');
+        const messageNode = document.getElementById('message-text');
+        const hintNode = document.getElementById('phase-hint');
+        const rowsNode = document.getElementById('compare-rows');
+        const emptyNode = document.getElementById('compare-empty');
+        const sortSelect = document.getElementById('compare-sort-select');
+
+        const sortRows = (rows) => {
+            const mode = sortSelect ? sortSelect.value : 'total_return_desc';
+            const sorted = [...rows];
+            const sorters = {
+                total_return_desc: (a, b) => (b.total_return || 0) - (a.total_return || 0),
+                excess_return_desc: (a, b) => (b.excess_return || 0) - (a.excess_return || 0),
+                max_drawdown_asc: (a, b) => (a.max_drawdown || 0) - (b.max_drawdown || 0),
+                win_rate_desc: (a, b) => (b.win_rate || 0) - (a.win_rate || 0),
+                trade_count_desc: (a, b) => (b.trade_count || 0) - (a.trade_count || 0),
+            };
+            sorted.sort(sorters[mode] || sorters.total_return_desc);
+            return sorted;
+        };
+
+        const renderRows = (rows, summary = {}) => {
+            if (!rowsNode && !emptyNode) return;
+            if (!rows || !rows.length) return;
+            const bestTotal = summary.best_total_return_run_id;
+            const bestExcess = summary.best_excess_return_run_id;
+            const html = sortRows(rows).map((row) => `
+                <tr class="compare-row ${row.run_id === bestTotal ? 'is-best-total' : ''} ${row.run_id === bestExcess ? 'is-best-excess' : ''}">
+                    <td>${row.parameter_value}</td>
+                    <td>
+                        ${row.name}
+                        ${row.run_id === bestTotal ? '<span class="badge compare-best-total">总收益最优</span>' : ''}
+                        ${row.run_id === bestExcess ? '<span class="badge compare-best-excess">超额最优</span>' : ''}
+                    </td>
+                    <td>${((row.total_return || 0) * 100).toFixed(2)}%</td>
+                    <td>${((row.excess_return || 0) * 100).toFixed(2)}%</td>
+                    <td>${((row.max_drawdown || 0) * 100).toFixed(2)}%</td>
+                    <td>${row.trade_count || 0}</td>
+                    <td>${((row.win_rate || 0) * 100).toFixed(2)}%</td>
+                    <td><a class="detail-link" href="/backtests/${row.run_id}">查看回测</a></td>
+                </tr>
+            `).join('');
+            if (rowsNode) {
+                rowsNode.innerHTML = html;
+            }
+            if (emptyNode) {
+                emptyNode.remove();
+            }
+        };
+
+        const poll = async () => {
+            const response = await fetch(`/api/backtests/compare/tasks/${taskId}`);
+            if (!response.ok) return;
+            const task = await response.json();
+            statusNode.textContent = task.status;
+            phaseNode.textContent = task.phase_label;
+            progressNode.textContent = `${task.progress_current}/${task.progress_total}`;
+            etaNode.textContent = task.eta_text;
+            messageNode.textContent = task.message || '-';
+            hintNode.textContent = task.phase_hint || '-';
+            renderRows((task.summary && task.summary.rows) || [], task.summary || {});
+            if (task.status === 'completed' || task.status === 'failed') {
+                clearInterval(timer);
+                if (task.status === 'completed') {
+                    window.location.reload();
+                }
+            }
+        };
+
+        if (sortSelect) {
+            sortSelect.addEventListener('change', () => {
+                const currentRows = Array.from(rowsNode?.querySelectorAll('tr') || []);
+                if (currentRows.length) {
+                    poll();
+                }
+            });
+        }
+
+        const timer = setInterval(poll, 2000);
+    })();
+    </script>
+</body>
+</html>

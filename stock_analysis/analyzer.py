@@ -5,7 +5,14 @@ from typing import Any
 
 import pandas as pd
 
-SCORE_VERSION = "2026-03-cmf-mfi-v1"
+SCORE_VERSION = "2026-03-cmf-mfi-v2"
+
+MA_TREND_WEIGHT = 18.0
+VOLUME_PATTERN_WEIGHT = 15.0
+CAPITAL_SECTOR_WEIGHT = 18.0
+BREAKOUT_WEIGHT = 22.0
+HOLD_WEIGHT = 18.0
+BENCHMARK_WEIGHT = 10.0
 
 
 @dataclass(slots=True)
@@ -95,7 +102,7 @@ def _compute_ma_trend_score(df: pd.DataFrame, window: int = 5) -> tuple[float, s
         return 0.0, "均线数据不足"
 
     compare_pairs = [("ma5", "ma10"), ("ma10", "ma20"), ("ma20", "ma30"), ("ma30", "ma60")]
-    pair_weight = 6.0
+    pair_weight = MA_TREND_WEIGHT / 4.0
     recent = valid.tail(window).copy()
     scores: list[float] = []
     weights = list(range(1, len(recent) + 1))
@@ -117,7 +124,7 @@ def _compute_ma_trend_score(df: pd.DataFrame, window: int = 5) -> tuple[float, s
     for short_col, long_col in compare_pairs:
         diff_ratio = (float(latest[short_col]) - float(latest[long_col])) / max(float(latest["close"]), 0.01)
         latest_parts.append(f"{short_col.upper()}/{long_col.upper()} {diff_ratio:.2%}")
-    comment = f"最近{len(recent)}日加权均分 {weighted_score:.2f}/24；最新相邻均线差值: {'，'.join(latest_parts)}"
+    comment = f"最近{len(recent)}日加权均分 {weighted_score:.2f}/{MA_TREND_WEIGHT:.0f}；最新相邻均线差值: {'，'.join(latest_parts)}"
     return weighted_score, comment
 
 
@@ -182,7 +189,7 @@ def _build_score_breakdown_from_prepared(
     benchmark_prev = benchmark.iloc[-2]
 
     ma_score, ma_comment = _compute_ma_trend_score(df, window=5)
-    ma_progress = _clip_ratio(ma_score / 24.0)
+    ma_progress = _clip_ratio(ma_score / MA_TREND_WEIGHT)
 
     recent = df.tail(10).copy()
     recent["up_gain_score"] = (recent["pct_change"] / 0.02).clip(lower=0, upper=1)
@@ -264,12 +271,12 @@ def _build_score_breakdown_from_prepared(
     )
 
     return [
-        _score_item("均线多头", 24, ma_progress, 0.75, ma_comment),
-        _score_item("放量上涨+缩量回调", 20, volume_progress, 0.8, volume_comment),
-        _score_item("资金流入+板块强势", 18, capital_progress, 0.8, capital_comment),
-        _score_item("低位启动突破", 16, breakout_progress, 0.8, breakout_comment),
-        _score_item("突破后未破位", 12, hold_progress, 0.85, hold_comment),
-        _score_item("大盘共振", 10, benchmark_progress, 0.8, benchmark_comment),
+        _score_item("均线多头", MA_TREND_WEIGHT, ma_progress, 0.75, ma_comment),
+        _score_item("放量上涨+缩量回调", VOLUME_PATTERN_WEIGHT, volume_progress, 0.8, volume_comment),
+        _score_item("资金流入+板块强势", CAPITAL_SECTOR_WEIGHT, capital_progress, 0.8, capital_comment),
+        _score_item("低位启动突破", BREAKOUT_WEIGHT, breakout_progress, 0.8, breakout_comment),
+        _score_item("突破后未破位", HOLD_WEIGHT, hold_progress, 0.85, hold_comment),
+        _score_item("大盘共振", BENCHMARK_WEIGHT, benchmark_progress, 0.8, benchmark_comment),
     ]
 
 
@@ -285,7 +292,7 @@ def build_score_breakdown(snapshot: pd.Series, history: pd.DataFrame, benchmark_
     benchmark_prev = benchmark.iloc[-2]
 
     ma_score, ma_comment = _compute_ma_trend_score(df, window=5)
-    ma_progress = _clip_ratio(ma_score / 24.0)
+    ma_progress = _clip_ratio(ma_score / MA_TREND_WEIGHT)
 
     recent = df.tail(10).copy()
     recent["up_gain_score"] = (recent["pct_change"] / 0.02).clip(lower=0, upper=1)
@@ -369,12 +376,12 @@ def build_score_breakdown(snapshot: pd.Series, history: pd.DataFrame, benchmark_
     )
 
     return [
-        _score_item("均线多头", 24, ma_progress, 0.75, ma_comment),
-        _score_item("放量上涨+缩量回调", 20, volume_progress, 0.8, volume_comment),
-        _score_item("资金流入+板块强势", 18, capital_progress, 0.8, capital_comment),
-        _score_item("低位启动突破", 16, breakout_progress, 0.8, breakout_comment),
-        _score_item("突破后未破位", 12, hold_progress, 0.85, hold_comment),
-        _score_item("大盘共振", 10, benchmark_progress, 0.8, benchmark_comment),
+        _score_item("均线多头", MA_TREND_WEIGHT, ma_progress, 0.75, ma_comment),
+        _score_item("放量上涨+缩量回调", VOLUME_PATTERN_WEIGHT, volume_progress, 0.8, volume_comment),
+        _score_item("资金流入+板块强势", CAPITAL_SECTOR_WEIGHT, capital_progress, 0.8, capital_comment),
+        _score_item("低位启动突破", BREAKOUT_WEIGHT, breakout_progress, 0.8, breakout_comment),
+        _score_item("突破后未破位", HOLD_WEIGHT, hold_progress, 0.85, hold_comment),
+        _score_item("大盘共振", BENCHMARK_WEIGHT, benchmark_progress, 0.8, benchmark_comment),
     ]
 
 

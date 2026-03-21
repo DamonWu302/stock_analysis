@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 import json
+from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -45,6 +47,7 @@ class StockAnalysisService:
         self._last_cache_mode = "unknown"
         self._recover_stale_tasks()
         self._recover_stale_backtest_tasks()
+        self._recover_stale_backtest_compare_tasks()
         self._recover_stale_backfill_tasks()
 
     def start_background_run(self, provider_name: str | None = None, limit: int | None = None) -> int:
@@ -300,6 +303,83 @@ class StockAnalysisService:
             payload.append(item)
         return payload
 
+    def create_backtest_template(self, name: str, description: str | None, config: dict | None = None) -> int:
+        normalized = self.backtest_runner._normalize_config(dict(config or {}))
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("模板名称不能为空")
+        clean_description = str(description or "").strip() or None
+        template_key = self._make_backtest_template_key(clean_name)
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO backtest_template
+                (template_key, name, description, config_json, sort_order, is_builtin, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                """,
+                (
+                    template_key,
+                    clean_name,
+                    clean_description,
+                    json.dumps(normalized, ensure_ascii=False),
+                    self._next_backtest_template_sort_order(conn),
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def update_backtest_template(self, template_id: int, name: str, description: str | None, config: dict | None = None) -> None:
+        normalized = self.backtest_runner._normalize_config(dict(config or {}))
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("模板名称不能为空")
+        clean_description = str(description or "").strip() or None
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, is_builtin
+                FROM backtest_template
+                WHERE id = ?
+                """,
+                (template_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("未找到对应模板")
+            if int(row["is_builtin"] or 0):
+                raise ValueError("内置模板不能直接修改，请另存为自定义模板")
+            conn.execute(
+                """
+                UPDATE backtest_template
+                SET name = ?, description = ?, config_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_name,
+                    clean_description,
+                    json.dumps(normalized, ensure_ascii=False),
+                    datetime.now().isoformat(timespec="seconds"),
+                    template_id,
+                ),
+            )
+
+    def delete_backtest_template(self, template_id: int) -> None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, is_builtin
+                FROM backtest_template
+                WHERE id = ?
+                """,
+                (template_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("未找到对应模板")
+            if int(row["is_builtin"] or 0):
+                raise ValueError("内置模板不能删除")
+            conn.execute("DELETE FROM backtest_template WHERE id = ?", (template_id,))
+
     def run_backtest(self, config: dict | None = None) -> dict:
         return self.backtest_runner.run(config)
 
@@ -324,6 +404,91 @@ class StockAnalysisService:
     def recent_backtests(self, limit: int = 20) -> list[dict]:
         return self.backtest_runner.recent_runs(limit=limit)
 
+    def start_backtest_compare_task(
+        self,
+        name: str,
+        parameter_key: str,
+        parameter_label: str,
+        values: list[float | int],
+        base_config: dict | None = None,
+        secondary_parameter_key: str | None = None,
+        secondary_parameter_label: str | None = None,
+        secondary_values: list[float | int] | None = None,
+    ) -> int:
+        normalized = self.backtest_runner._normalize_config(dict(base_config or {}))
+        started_at = datetime.now().isoformat(timespec="seconds")
+        dimensions = [
+            {
+                "key": parameter_key,
+                "label": parameter_label,
+                "values": list(values),
+            }
+        ]
+        if secondary_parameter_key and secondary_values:
+            dimensions.append(
+                {
+                    "key": secondary_parameter_key,
+                    "label": secondary_parameter_label or secondary_parameter_key,
+                    "values": list(secondary_values),
+                }
+            )
+        combinations = self._build_compare_combinations(dimensions)
+        parameter_key_text = "|".join(item["key"] for item in dimensions)
+        parameter_label_text = " / ".join(item["label"] for item in dimensions)
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO backtest_compare_task
+                (name, status, phase, started_at, progress_current, progress_total, message,
+                 parameter_key, parameter_label, values_json, base_config_json)
+                VALUES ('', 'running', 'pending', ?, 0, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    started_at,
+                    len(combinations),
+                    "参数对比任务已创建，等待执行",
+                    parameter_key_text,
+                    parameter_label_text,
+                    json.dumps({"dimensions": dimensions, "combinations": combinations}, ensure_ascii=False),
+                    json.dumps(normalized, ensure_ascii=False),
+                ),
+            )
+            task_id = int(cursor.lastrowid)
+            task_name = str(name or f"{parameter_label_text} 参数对比").strip() or f"{parameter_label_text} 参数对比"
+            conn.execute("UPDATE backtest_compare_task SET name = ? WHERE id = ?", (task_name, task_id))
+        thread = threading.Thread(
+            target=self._run_backtest_compare_task,
+            args=(task_id, task_name, parameter_label_text, combinations, normalized),
+            daemon=True,
+        )
+        thread.start()
+        return task_id
+
+    def recent_backtest_compare_tasks(self, limit: int = 10) -> list[dict]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM backtest_compare_task
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._build_backtest_compare_task_payload(dict(row)) for row in rows]
+
+    def backtest_compare_task_detail(self, task_id: int) -> dict | None:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM backtest_compare_task
+                WHERE id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        return self._build_backtest_compare_task_payload(dict(row)) if row else None
+
     def backtest_detail(self, run_id: int) -> dict | None:
         detail = self.backtest_runner.run_detail(run_id)
         if not detail or not detail.get("summary"):
@@ -344,6 +509,20 @@ class StockAnalysisService:
         self._group_backtest_trades(detail)
         self._group_backtest_positions(detail)
         return detail
+
+    def export_backtest_markdown(self, run_id: int) -> Path:
+        detail = self.backtest_detail(run_id)
+        if not detail:
+            raise ValueError(f"未找到回测 {run_id}")
+
+        export_dir = Path(settings.database_path).resolve().parent / "exports" / "backtests"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", str(detail.get("name") or f"run-{run_id}")).strip("-")
+        filename = f"backtest_{run_id}_{safe_name or 'run'}_{timestamp}.md"
+        output_path = export_dir / filename
+        output_path.write_text(self._build_backtest_markdown(detail), encoding="utf-8")
+        return output_path
 
     def latest_backtest_task(self) -> dict | None:
         with self.db.connect() as conn:
@@ -1032,6 +1211,20 @@ class StockAnalysisService:
                 (datetime.now().isoformat(timespec="seconds"),),
             )
 
+    def _recover_stale_backtest_compare_tasks(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE backtest_compare_task
+                SET status = 'failed',
+                    phase = 'failed',
+                    finished_at = ?,
+                    message = '参数对比任务在应用重启前中断'
+                WHERE status = 'running'
+                """,
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+
     @staticmethod
     def _format_task_error(exc: Exception) -> str:
         message = str(exc)
@@ -1071,12 +1264,12 @@ class StockAnalysisService:
         if not reason:
             return "-"
         labels = {
-            "buy_strict": "严格买入",
-            "buy_momentum": "增强买入",
-            "sell_stop": "硬止损",
-            "sell_trend": "趋势转弱",
-            "sell_capital": "资金撤退",
-            "sell_stale": "新鲜度失效",
+            "buy_strict": "提前型严格买入",
+            "buy_momentum": "提前型增强买入",
+            "sell_trim": "分级止盈减仓",
+            "sell_break_ma5": "跌破MA5放量清仓",
+            "sell_drawdown": "高点回撤止损",
+            "sell_time_stop": "时间止损",
         }
         parts = [labels.get(item.strip(), item.strip()) for item in reason.split(",") if item.strip()]
         return "、".join(parts) if parts else reason
@@ -1431,6 +1624,91 @@ class StockAnalysisService:
         with self.db.connect() as conn:
             conn.execute(f"UPDATE backtest_task SET {assignments} WHERE id = ?", values)
 
+    def _run_backtest_compare_task(
+        self,
+        task_id: int,
+        task_name: str,
+        parameter_label: str,
+        combinations: list[dict],
+        base_config: dict,
+    ) -> None:
+        run_ids: list[int] = []
+        rows: list[dict] = []
+        total = len(combinations)
+        try:
+            for index, combo in enumerate(combinations, start=1):
+                combo_label = combo.get("label") or "-"
+                self._update_backtest_compare_task(
+                    task_id,
+                    phase="executing",
+                    progress_current=index - 1,
+                    progress_total=total,
+                    message=f"正在执行第 {index}/{total} 组：{combo_label}",
+                )
+                config = dict(base_config)
+                parameter_map = dict(combo.get("params") or {})
+                config.update(parameter_map)
+                config["name"] = f"{task_name} / {combo_label}"
+                result = self.backtest_runner.run(config)
+                run_ids.append(int(result["run_id"]))
+                rows.append(
+                    {
+                        "run_id": int(result["run_id"]),
+                        "name": config["name"],
+                        "parameter_value": combo_label,
+                        "parameter_map": parameter_map,
+                        "total_return": result.get("total_return"),
+                        "excess_return": result.get("excess_return"),
+                        "max_drawdown": result.get("max_drawdown"),
+                        "trade_count": result.get("trade_count"),
+                        "win_rate": result.get("win_rate"),
+                        "avg_holding_days": result.get("avg_holding_days"),
+                    }
+                )
+                self._update_backtest_compare_task(
+                    task_id,
+                    progress_current=index,
+                    progress_total=total,
+                    message=f"已完成第 {index}/{total} 组：{combo_label}",
+                )
+
+            best_total = max(rows, key=lambda item: float(item.get("total_return") or -999), default=None)
+            best_excess = max(rows, key=lambda item: float(item.get("excess_return") or -999), default=None)
+            summary = {
+                "rows": rows,
+                "best_total_return_run_id": best_total.get("run_id") if best_total else None,
+                "best_excess_return_run_id": best_excess.get("run_id") if best_excess else None,
+            }
+            self._update_backtest_compare_task(
+                task_id,
+                status="completed",
+                phase="completed",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                progress_current=total,
+                progress_total=total,
+                message="参数对比完成",
+                run_ids_json=json.dumps(run_ids, ensure_ascii=False),
+                summary_json=json.dumps(summary, ensure_ascii=False),
+            )
+        except Exception as exc:
+            self._update_backtest_compare_task(
+                task_id,
+                status="failed",
+                phase="failed",
+                finished_at=datetime.now().isoformat(timespec="seconds"),
+                message=str(exc),
+                run_ids_json=json.dumps(run_ids, ensure_ascii=False),
+                summary_json=json.dumps({"rows": rows, "error": str(exc)}, ensure_ascii=False),
+            )
+
+    def _update_backtest_compare_task(self, task_id: int, **fields) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{key} = ?" for key in fields.keys())
+        values = list(fields.values()) + [task_id]
+        with self.db.connect() as conn:
+            conn.execute(f"UPDATE backtest_compare_task SET {assignments} WHERE id = ?", values)
+
     def _build_backtest_task_payload(self, task: dict) -> dict:
         payload = dict(task)
         payload["config"] = json.loads(payload["config_json"]) if payload.get("config_json") else {}
@@ -1451,6 +1729,54 @@ class StockAnalysisService:
             payload["error_summary"] = error_info["summary"]
             payload["error_detail"] = error_info["detail"]
             payload["error_hint"] = error_info["hint"]
+        return self._enrich_task_timing(payload)
+
+    @staticmethod
+    def _build_compare_combinations(dimensions: list[dict]) -> list[dict]:
+        combinations: list[dict] = []
+        if not dimensions:
+            return combinations
+        if len(dimensions) == 1:
+            dimension = dimensions[0]
+            for value in dimension.get("values") or []:
+                combinations.append({
+                    "label": f"{dimension['label']}={value}",
+                    "params": {dimension['key']: value},
+                })
+            return combinations
+
+        first = dimensions[0]
+        second = dimensions[1]
+        for first_value in first.get("values") or []:
+            for second_value in second.get("values") or []:
+                combinations.append(
+                    {
+                        "label": f"{first['label']}={first_value} / {second['label']}={second_value}",
+                        "params": {
+                            first['key']: first_value,
+                            second['key']: second_value,
+                        },
+                    }
+                )
+        return combinations
+
+    def _build_backtest_compare_task_payload(self, task: dict) -> dict:
+        payload = dict(task)
+        value_payload = json.loads(payload["values_json"]) if payload.get("values_json") else []
+        payload["values"] = value_payload.get("dimensions", value_payload) if isinstance(value_payload, dict) else value_payload
+        payload["combinations"] = value_payload.get("combinations", []) if isinstance(value_payload, dict) else []
+        payload["base_config"] = json.loads(payload["base_config_json"]) if payload.get("base_config_json") else {}
+        payload["run_ids"] = json.loads(payload["run_ids_json"]) if payload.get("run_ids_json") else []
+        payload["summary"] = json.loads(payload["summary_json"]) if payload.get("summary_json") else {}
+        payload["phase_label"] = self._phase_label(
+            phase=str(payload.get("phase") or ""),
+            finished=bool(payload.get("finished_at")),
+            status=str(payload.get("status") or ""),
+        )
+        payload["phase_hint"] = self._phase_hint(
+            phase=str(payload.get("phase") or ""),
+            status=str(payload.get("status") or ""),
+        )
         return self._enrich_task_timing(payload)
 
     def _build_progress_message(self, current: int, total: int, symbol: str, cache_stats: CacheStats) -> str:
@@ -2309,6 +2635,243 @@ class StockAnalysisService:
         if not prev_close:
             return 0.0
         return round(((latest_close - prev_close) / prev_close) * 100, 2)
+
+    @staticmethod
+    def _make_backtest_template_key(name: str) -> str:
+        stem = re.sub(r"[^a-z0-9]+", "-", str(name or "").strip().lower()).strip("-")
+        if not stem:
+            stem = "custom"
+        return f"custom-{stem}-{int(time.time() * 1000)}"
+
+    @staticmethod
+    def _next_backtest_template_sort_order(conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) AS max_sort_order FROM backtest_template").fetchone()
+        return int(row["max_sort_order"] or 0) + 10
+
+    def _build_backtest_markdown(self, detail: dict) -> str:
+        summary = detail.get("summary") or {}
+        config = (build_backtest_config_schema().get("defaults") or {}) | (detail.get("config") or {})
+        signal_stats = detail.get("signal_stats") or {}
+        nav_rows = detail.get("nav") or []
+        calendar_rows = detail.get("position_calendar") or []
+        trades_by_date = detail.get("trades_by_date") or {}
+        positions_by_date = detail.get("positions_by_date") or {}
+
+        def fmt_num(value, digits: int = 2) -> str:
+            if value is None:
+                return "-"
+            return f"{float(value):.{digits}f}"
+
+        def fmt_pct(value, digits: int = 2) -> str:
+            if value is None:
+                return "-"
+            return f"{float(value) * 100:.{digits}f}%"
+
+        buy_rule_desc = {
+            "buy_strict": "提前型严格买入：总分>=74，且（均线多头>=14 或 低位启动突破>=12），并满足放量上涨+缩量回调>=14、资金流入+板块强势>=10；同时仍需通过低位限制、近3日量能约束、单笔风险限制、板块5日强度排名和大盘过滤。",
+            "buy_momentum": "提前型增强买入：总分>=68，且放量上涨+缩量回调>=14；同时仍需通过核心命中数、低位限制、近3日量能约束、单笔风险限制、板块5日强度排名和大盘过滤。",
+        }
+        sell_rule_desc = {
+            "sell_trim": "分级止盈减仓：持仓盈利 `>= 8%` 且出现放量长上影时，减仓 `50%`。",
+            "sell_break_ma5": "跌破MA5放量清仓：`close < MA5` 且 `volume > vol_ma5` 时清仓。",
+            "sell_drawdown": "动态移动止盈：峰值盈利 `>= 10%` 时，回撤 `> 5%` 清仓；峰值盈利 `>= 18%` 时，回撤 `> 6%` 清仓；峰值盈利 `>= 30%` 时，回撤容忍度放宽到 `8%`。",
+            "sell_time_stop": "时间止损：持仓 `>= 10` 天、累计收益 `< 2%`，且收盘价 `<= MA20` 时清仓。",
+        }
+
+        lines: list[str] = [
+            f"# 回测报告：{detail.get('name') or f'回测 {detail.get('id') or detail.get('run_id') or ''}'}",
+            "",
+            f"- 回测编号：`{detail.get('id') or detail.get('run_id')}`",
+            f"- 区间：`{detail.get('start_date')}` ~ `{detail.get('end_date')}`",
+            f"- 状态：`{detail.get('status')}`",
+            f"- 生成时间：`{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
+            "",
+            "## 算法说明",
+            "",
+            "- 信号生成时点：`T日收盘后`。",
+            "- 买入执行时点：`T+1日开盘`。",
+            "- 卖出执行时点：触发条件后的 `T+1日开盘`。",
+            f"- 基准指数：`{config.get('benchmark_symbol') or '000001'}`，图表中按首日净值归一化展示。",
+            f"- 最大持仓：`{config.get('max_positions', '-')}` 只。",
+            "- 仓位规则：按“剩余现金 / 新开仓数量”等权分配；已持仓不因新信号调仓；不加仓。",
+            "- 交易限制：不允许同一天重复买卖同一只；不考虑融资融券。",
+            f"- 手续费：`{fmt_num(config.get('fee_rate'), 4)}`；滑点：`{fmt_num(config.get('slippage_rate'), 4)}`。",
+            f"- 市场过滤：当全市场平均分低于 `{fmt_num(config.get('market_score_filter_min_avg'))}`、5日均值低于 `{fmt_num(config.get('market_score_filter_min_ma5'))}`，或大盘收盘价未站上 `MA20` 时，不生成新的买入信号。",
+            "",
+            "### 算法因子说明",
+            "",
+            "1. 均线多头，权重18分：",
+            "   使用 5 条均线 MA5 / MA10 / MA20 / MA30 / MA60，比较 4 组相邻关系：",
+            "   MA5>MA10、MA10>MA20、MA20>MA30、MA30>MA60。",
+            "   系统不是简单二值判断，而是用 (短期均线-长期均线)/价格 的比例做平滑评分。",
+            "   当该比例达到约 0.5% 时，该组接近满分；低于阈值按比例给分，低于 0 则记 0 分。",
+            "   最终再对最近 5 个交易日做加权滑动平均，得到 0-18 的浮点分。",
+            "2. 放量上涨 + 缩量回调，权重15分：",
+            "   最近10个交易日里，系统会同时衡量：",
+            "   - 放量上涨强度：涨幅相对 2% 的强弱，以及成交量相对 5 日均量 1.5 倍的强弱；",
+            "   - 缩量整理强度：波动越小越好，且成交量越低于 5 日均量越好。",
+            "   这一项同样采用平滑评分，不是“必须完美形态才给分”。",
+            "3. 资金流入 + 板块强势，权重18分：",
+            "   使用资金流向指标替代主力净流入占比：",
+            "   - CMF(21) > 0.05 可视为资金净流入较强；",
+            "   - MFI(14) > 60 代表资金买盘压力偏强，> 70 可视为更强确认；",
+            "   同时结合板块涨幅是否强于大盘，以及板块内上涨家数占比是否高于 60%。",
+            "4. 低位启动突破，权重22分：",
+            "   当前收盘价距离近120日最低收盘价不宜过远，同时也会结合 ATR 评估是否仍处于相对低位。",
+            "   在此基础上，再判断收盘价是否对前20日高点形成有效突破。",
+            "   这一项现在是更高权重项，判断时要更重视“是否仍有低位安全边际”，而不是只看是否接近新高。",
+            "5. 突破后未破位，权重18分：",
+            "   这一项必须建立在“已经形成有效突破”的前提上；如果突破本身不成立，这一项应接近 0 分。",
+            "   防守位不是固定百分比，而是结合 ATR 动态设定，以适应不同波动率股票。",
+            "   同时还会考虑“突破新鲜度”：突破越新，守位信号越有效；突破时间过久，这一项权重会自然衰减。",
+            "6. 大盘共振，权重10分：",
+            "   大盘收盘站上 MA20，且 MA20 相比前一日继续上行。",
+            "",
+            "### 买入规则",
+            "",
+            f"- 辅助过滤：买入前 5 日振幅需 `<= {fmt_pct(config.get('buy_risk_amplitude_max'))}`，且买入前 5 日最大跌幅需 `<= {fmt_pct(config.get('buy_risk_max_drop_max'))}`。",
+            f"- 板块过滤：所属板块 5 日涨幅排名需位于前 `{fmt_pct(config.get('buy_sector_rank_top_pct'))}`。",
+            f"- 大盘过滤：`market_require_benchmark_above_ma20 = {bool(config.get('market_require_benchmark_above_ma20', True))}`，开启时要求大盘收盘价站上 `MA20` 才开仓。",
+        ]
+
+        enabled_buy_rules = config.get("enabled_buy_rules") or []
+        for rule in enabled_buy_rules:
+            lines.append(f"- `{rule}`：{buy_rule_desc.get(rule, '未定义说明')}")
+        if not enabled_buy_rules:
+            lines.append("- 当前未启用买入规则。")
+
+        lines.extend(["", "### 卖出规则", ""])
+        enabled_sell_rules = config.get("enabled_sell_rules") or []
+        for rule in enabled_sell_rules:
+            lines.append(f"- `{rule}`：{sell_rule_desc.get(rule, '未定义说明')}")
+        if not enabled_sell_rules:
+            lines.append("- 当前未启用卖出规则。")
+
+        lines.extend(
+            [
+                "",
+                "## 回测摘要",
+                "",
+                f"- 初始资金：`{fmt_num(summary.get('initial_capital'))}`",
+                f"- 期末净值：`{fmt_num(summary.get('final_nav'))}`",
+                f"- 总收益：`{fmt_pct(summary.get('total_return'))}`",
+                f"- 基准收益：`{fmt_pct(summary.get('benchmark_return'))}`",
+                f"- 超额收益：`{fmt_pct(summary.get('excess_return'))}`",
+                f"- 最大回撤：`{fmt_pct(summary.get('max_drawdown'))}`",
+                f"- 交易次数：`{summary.get('trade_count', 0)}`",
+                f"- 买入次数：`{summary.get('buy_count', 0)}`",
+                f"- 卖出次数：`{summary.get('sell_count', 0)}`",
+                f"- 胜率：`{fmt_pct(summary.get('win_rate'))}`",
+                f"- 平均持仓天数：`{fmt_num(summary.get('avg_holding_days'))}`",
+                "",
+                "## 配置参数",
+                "",
+                f"- 模板ID：`{config.get('template_id') or '-'}`",
+                f"- 回看交易日：`{config.get('lookback_days', '-')}`",
+                f"- 最大持仓：`{config.get('max_positions', '-')}`",
+                f"- 手续费：`{fmt_num(config.get('fee_rate'), 4)}`",
+                f"- 滑点：`{fmt_num(config.get('slippage_rate'), 4)}`",
+                f"- 平均分过滤阈值：`{fmt_num(config.get('market_score_filter_min_avg'))}`",
+                f"- 5日均值过滤阈值：`{fmt_num(config.get('market_score_filter_min_ma5'))}`",
+                f"- 大盘收盘站上MA20过滤：`{bool(config.get('market_require_benchmark_above_ma20', True))}`",
+                f"- 大盘MA20向上过滤：`{bool(config.get('market_require_benchmark_ma20_up', False))}`",
+                f"- 买入前5日振幅上限：`{fmt_pct(config.get('buy_risk_amplitude_max'))}`",
+                f"- 买入前5日最大跌幅上限：`{fmt_pct(config.get('buy_risk_max_drop_max'))}`",
+                f"- 板块5日强度排名上限：`前 {fmt_pct(config.get('buy_sector_rank_top_pct'))}`",
+                f"- 买入规则：`{', '.join(enabled_buy_rules) or '-'}`",
+                f"- 卖出规则：`{', '.join(enabled_sell_rules) or '-'}`",
+                "",
+                "## 信号统计",
+                "",
+                f"- 总信号数：`{signal_stats.get('signal_count', 0)}`",
+                f"- 买入信号数：`{signal_stats.get('selected_buy_count', 0)}`",
+                f"- 买入规则命中：`{signal_stats.get('buy_rule_counts', {})}`",
+                f"- 卖出规则命中：`{signal_stats.get('sell_rule_counts', {})}`",
+                "",
+                "## 执行约束统计",
+                "",
+                f"- 市场过滤拦截天数：`{summary.get('market_filter_blocked_days', 0)}`",
+                f"- 市场过滤拦截信号：`{summary.get('market_filter_blocked_buy_signals', 0)}`",
+                f"- 买入成交受阻：`{summary.get('buy_execution_blocked', 0)}`",
+                f"- 卖出顺延次数：`{summary.get('sell_execution_deferred', 0)}`",
+                f"- 买入受阻明细：`{summary.get('buy_execution_blocked_breakdown_label') or '-'}`",
+                f"- 卖出顺延明细：`{summary.get('sell_execution_deferred_breakdown_label') or '-'}`",
+                "",
+                "## 月度净值变化",
+                "",
+                "| 月份 | 月度净值变化 | 月内已实现 | 月末浮盈 |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+        )
+
+        for month in detail.get("position_calendar_months") or []:
+            lines.append(
+                f"| {month.get('month')} | {month.get('net_change_pnl_text')} | {month.get('realized_pnl_text')} | {month.get('month_end_unrealized_pnl_text')} |"
+            )
+
+        lines.extend(
+            [
+                "",
+                "## 每日净值",
+                "",
+                "| 日期 | 策略净值 | 基准净值 | 当日收益 | 回撤 | 持仓数 |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in nav_rows:
+            lines.append(
+                f"| {row.get('trade_date')} | {fmt_num(row.get('nav'))} | {fmt_num(row.get('benchmark_nav'))} | {fmt_pct(row.get('daily_return'))} | {fmt_pct(row.get('drawdown'))} | {row.get('position_count', 0)} |"
+            )
+
+        lines.extend(["", "## 每日持仓与交易明细", ""])
+        for day in calendar_rows:
+            trade_date = str(day.get("trade_date") or "")
+            lines.extend(
+                [
+                    f"### {trade_date}",
+                    "",
+                    f"- 当日持仓数：`{day.get('position_count', 0)}`",
+                    f"- 组合当日盈亏：`{day.get('daily_pnl_text')}`",
+                    f"- 当日持仓市值：`{day.get('market_value_text')}`",
+                    "",
+                    "#### 持仓表",
+                    "",
+                    "| 股票 | 数量 | 成本价 | 收盘价 | 持仓市值 | 权重 | 当日盈亏 | 浮盈亏 | 持仓天数 | 标签 |",
+                    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+                ]
+            )
+            positions = positions_by_date.get(trade_date, [])
+            if positions:
+                for row in positions:
+                    labels = " / ".join(
+                        [item for item in [row.get("position_event_label"), row.get("position_exit_label")] if item]
+                    ) or "-"
+                    lines.append(
+                        f"| {row.get('symbol')} | {row.get('shares')} | {row.get('cost_price_text')} | {row.get('close_price_text')} | {row.get('market_value_text')} | {row.get('weight_text')} | {row.get('daily_pnl_text')} | {row.get('unrealized_pnl_text')} | {row.get('hold_days')} | {labels} |"
+                    )
+            else:
+                lines.append("| - | - | - | - | - | - | - | - | - | 当日无持仓 |")
+
+            lines.extend(
+                [
+                    "",
+                    "#### 当日交易记录",
+                    "",
+                    "| 股票 | 方向 | 价格 | 数量 | 原因 | 成交对当日净值影响 |",
+                    "| --- | --- | ---: | ---: | --- | ---: |",
+                ]
+            )
+            trades = trades_by_date.get(trade_date, [])
+            if trades:
+                for row in trades:
+                    lines.append(
+                        f"| {row.get('symbol')} | {row.get('side_label') or row.get('side')} | {fmt_num(row.get('price'), 4)} | {row.get('shares')} | {row.get('reason_label') or row.get('reason')} | {row.get('daily_impact_text') or '-'} |"
+                    )
+            else:
+                lines.append("| - | - | - | - | - | 当日无成交 |")
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
     def _build_detail_from_daily_tables(

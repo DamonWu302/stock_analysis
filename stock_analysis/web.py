@@ -23,6 +23,23 @@ def create_app() -> Flask:
     service = StockAnalysisService()
     chat_service = StockChatService()
 
+    def build_backtest_payload(form) -> dict:
+        return {
+            "template_id": int(form.get("template_id", "0") or 0) or None,
+            "name": (form.get("name") or "").strip() or None,
+            "start_date": (form.get("start_date") or "").strip() or None,
+            "end_date": (form.get("end_date") or "").strip() or None,
+            "lookback_days": int(form.get("lookback_days", "120") or 120),
+            "max_positions": int(form.get("max_positions", "4") or 4),
+            "initial_capital": float(form.get("initial_capital", "1000000") or 1000000),
+            "fee_rate": float(form.get("fee_rate", "0.001") or 0.001),
+            "slippage_rate": float(form.get("slippage_rate", "0.001") or 0.001),
+            "market_score_filter_min_avg": float(form.get("market_score_filter_min_avg", "41") or 41),
+            "market_score_filter_min_ma5": float(form.get("market_score_filter_min_ma5", "41") or 41),
+            "enabled_buy_rules": form.getlist("enabled_buy_rules"),
+            "enabled_sell_rules": form.getlist("enabled_sell_rules"),
+        }
+
     @app.template_filter("fmt_dt")
     def format_datetime(value):
         if value in (None, "", "-"):
@@ -124,6 +141,7 @@ def create_app() -> Flask:
     def backtests():
         runs = service.recent_backtests(limit=20)
         tasks = service.recent_backtest_tasks(limit=10)
+        compare_tasks = service.recent_backtest_compare_tasks(limit=10)
         score_trend = service.score_trend(20)
         schema = service.backtest_config_schema()
         templates = service.backtest_templates()
@@ -146,6 +164,8 @@ def create_app() -> Flask:
             schema=schema,
             defaults=defaults,
             templates=templates,
+            compare_tasks=compare_tasks,
+            selected_template=selected_template,
             selected_template_id=selected_template_id,
             error=request.args.get("error"),
             success=request.args.get("success"),
@@ -163,6 +183,24 @@ def create_app() -> Flask:
             score_trend=score_trend,
             score_trend_svg=build_score_trend_svg(score_trend),
             nav_svg=build_nav_svg(detail.get("nav") or [], detail.get("trades") or []),
+            success=request.args.get("success"),
+            error=request.args.get("error"),
+            export_path=request.args.get("export_path"),
+        )
+
+    @app.post("/backtests/<int:run_id>/export-md")
+    def export_backtest_markdown(run_id: int):
+        try:
+            output_path = service.export_backtest_markdown(run_id)
+        except Exception as exc:
+            return redirect(url_for("backtest_detail_page", run_id=run_id, error=str(exc)))
+        return redirect(
+            url_for(
+                "backtest_detail_page",
+                run_id=run_id,
+                success="回测明细已导出为 Markdown 文档",
+                export_path=str(output_path),
+            )
         )
 
     @app.get("/api/backtest/runs/<int:run_id>")
@@ -202,29 +240,129 @@ def create_app() -> Flask:
             return redirect(url_for("backtests", error=f"未找到回测任务 {task_id}"))
         return render_template("backtest_task_status.html", task=detail, success=request.args.get("success"))
 
+    @app.post("/backtests/compare")
+    def create_backtest_compare_task_form():
+        form = request.form
+        payload = build_backtest_payload(form)
+        parameter_key = (form.get("compare_parameter_key") or "").strip()
+        raw_values = (form.get("compare_values") or "").strip()
+        secondary_parameter_key = (form.get("compare_parameter_key_secondary") or "").strip()
+        raw_secondary_values = (form.get("compare_values_secondary") or "").strip()
+        compare_name = (form.get("compare_name") or "").strip()
+        compare_fields = {item["id"]: item for item in service.backtest_config_schema().get("compare_fields", [])}
+        if parameter_key not in compare_fields:
+            return redirect(url_for("backtests", error="未选择有效的主对比参数"))
+
+        def parse_values(field_key: str, raw_text: str):
+            values = []
+            for chunk in [item.strip() for item in raw_text.split(",") if item.strip()]:
+                if compare_fields[field_key]["type"] == "int":
+                    values.append(int(float(chunk)))
+                else:
+                    values.append(float(chunk))
+            return values
+
+        try:
+            values = parse_values(parameter_key, raw_values)
+            secondary_values = parse_values(secondary_parameter_key, raw_secondary_values) if secondary_parameter_key and raw_secondary_values else []
+        except ValueError:
+            return redirect(url_for("backtests", error="对比参数值格式不正确，请使用英文逗号分隔数字"))
+        if len(values) < 2:
+            return redirect(url_for("backtests", error="主参数至少提供两组值用于对比"))
+        if secondary_parameter_key and secondary_parameter_key == parameter_key:
+            return redirect(url_for("backtests", error="第二参数不能与主参数重复"))
+        if secondary_parameter_key and len(secondary_values) < 2:
+            return redirect(url_for("backtests", error="第二参数至少提供两组值用于网格对比"))
+        try:
+            task_id = service.start_backtest_compare_task(
+                name=compare_name,
+                parameter_key=parameter_key,
+                parameter_label=str(compare_fields[parameter_key]["label"]),
+                values=values,
+                base_config=payload,
+                secondary_parameter_key=secondary_parameter_key or None,
+                secondary_parameter_label=str(compare_fields[secondary_parameter_key]["label"]) if secondary_parameter_key else None,
+                secondary_values=secondary_values or None,
+            )
+        except Exception as exc:
+            return redirect(url_for("backtests", error=str(exc)))
+        return redirect(url_for("backtest_compare_task_page", task_id=task_id))
+
+    @app.get("/backtests/compare/tasks/<int:task_id>")
+    def backtest_compare_task_page(task_id: int):
+        detail = service.backtest_compare_task_detail(task_id)
+        if not detail:
+            return redirect(url_for("backtests", error=f"未找到参数对比任务 {task_id}"))
+        compare_charts = []
+        for row in (detail.get("summary") or {}).get("rows", [])[:12]:
+            run_detail = service.backtest_detail(int(row.get("run_id")))
+            if not run_detail:
+                continue
+            compare_charts.append(
+                {
+                    "run_id": int(row.get("run_id")),
+                    "name": row.get("name"),
+                    "parameter_value": row.get("parameter_value"),
+                    "total_return": row.get("total_return"),
+                    "excess_return": row.get("excess_return"),
+                    "nav_svg": build_nav_svg(run_detail.get("nav") or [], run_detail.get("trades") or []),
+                }
+            )
+        return render_template(
+            "backtest_compare_task_status.html",
+            task=detail,
+            compare_charts=compare_charts,
+            success=request.args.get("success"),
+        )
+
+    @app.get("/api/backtests/compare/tasks/<int:task_id>")
+    def backtest_compare_task_detail_api(task_id: int):
+        detail = service.backtest_compare_task_detail(task_id)
+        if not detail:
+            return jsonify({"error": f"未找到参数对比任务 {task_id}"}), 404
+        return jsonify(detail)
+
     @app.post("/backtests")
     def create_backtest_run_form():
         form = request.form
-        payload = {
-            "template_id": int(form.get("template_id", "0") or 0) or None,
-            "name": (form.get("name") or "").strip() or None,
-            "start_date": (form.get("start_date") or "").strip() or None,
-            "end_date": (form.get("end_date") or "").strip() or None,
-            "lookback_days": int(form.get("lookback_days", "120") or 120),
-            "max_positions": int(form.get("max_positions", "4") or 4),
-            "initial_capital": float(form.get("initial_capital", "1000000") or 1000000),
-            "fee_rate": float(form.get("fee_rate", "0.001") or 0.001),
-            "slippage_rate": float(form.get("slippage_rate", "0.001") or 0.001),
-            "market_score_filter_min_avg": float(form.get("market_score_filter_min_avg", "41") or 41),
-            "market_score_filter_min_ma5": float(form.get("market_score_filter_min_ma5", "41") or 41),
-            "enabled_buy_rules": form.getlist("enabled_buy_rules"),
-            "enabled_sell_rules": form.getlist("enabled_sell_rules"),
-        }
+        payload = build_backtest_payload(form)
         try:
             task_id = service.start_backtest_task(payload)
         except Exception as exc:
             return redirect(url_for("backtests", error=str(exc)))
         return redirect(url_for("backtest_task_page", task_id=task_id, success="回测任务已创建"))
+
+    @app.post("/backtests/templates")
+    def create_backtest_template_form():
+        form = request.form
+        payload = build_backtest_payload(form)
+        name = (form.get("template_name") or "").strip()
+        description = (form.get("template_description") or "").strip() or None
+        try:
+            template_id = service.create_backtest_template(name=name, description=description, config=payload)
+        except Exception as exc:
+            return redirect(url_for("backtests", error=str(exc)))
+        return redirect(url_for("backtests", template_id=template_id, success="已保存自定义模板"))
+
+    @app.post("/backtests/templates/<int:template_id>/update")
+    def update_backtest_template_form(template_id: int):
+        form = request.form
+        payload = build_backtest_payload(form)
+        name = (form.get("template_name") or "").strip()
+        description = (form.get("template_description") or "").strip() or None
+        try:
+            service.update_backtest_template(template_id=template_id, name=name, description=description, config=payload)
+        except Exception as exc:
+            return redirect(url_for("backtests", template_id=template_id, error=str(exc)))
+        return redirect(url_for("backtests", template_id=template_id, success="模板已更新"))
+
+    @app.post("/backtests/templates/<int:template_id>/delete")
+    def delete_backtest_template_form(template_id: int):
+        try:
+            service.delete_backtest_template(template_id)
+        except Exception as exc:
+            return redirect(url_for("backtests", template_id=template_id, error=str(exc)))
+        return redirect(url_for("backtests", success="模板已删除"))
 
     @app.post("/api/daily/backfill")
     def backfill_daily_tables():

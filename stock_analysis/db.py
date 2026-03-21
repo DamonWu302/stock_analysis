@@ -235,6 +235,24 @@ CREATE TABLE IF NOT EXISTS backtest_task (
     FOREIGN KEY (run_id) REFERENCES backtest_run(id)
 );
 
+CREATE TABLE IF NOT EXISTS backtest_compare_task (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'pending',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    progress_current INTEGER NOT NULL DEFAULT 0,
+    progress_total INTEGER NOT NULL DEFAULT 0,
+    message TEXT,
+    parameter_key TEXT NOT NULL,
+    parameter_label TEXT NOT NULL,
+    values_json TEXT NOT NULL,
+    base_config_json TEXT NOT NULL,
+    run_ids_json TEXT,
+    summary_json TEXT
+);
+
 CREATE TABLE IF NOT EXISTS backtest_template (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     template_key TEXT NOT NULL UNIQUE,

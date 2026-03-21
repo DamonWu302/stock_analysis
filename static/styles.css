@@ -107,6 +107,46 @@ h1 {
     gap: 12px;
 }
 
+.template-manager {
+    display: grid;
+    gap: 14px;
+    padding: 18px;
+    border-radius: 22px;
+    border: 1px solid rgba(31, 41, 51, 0.08);
+    background: rgba(255, 255, 255, 0.72);
+    box-shadow: 0 10px 30px rgba(31, 41, 51, 0.06);
+}
+
+.template-manager-head,
+.template-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.template-manager-note {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.6;
+    font-size: 14px;
+}
+
+.template-manager-form,
+.template-inline-form {
+    display: grid;
+    gap: 12px;
+}
+
+.template-inline-form {
+    grid-template-columns: 1fr;
+}
+
+.template-custom-badge {
+    background: rgba(226, 250, 246, 0.95);
+    color: var(--green);
+}
+
 .template-card {
     display: grid;
     gap: 8px;
@@ -168,6 +208,22 @@ button {
     cursor: pointer;
 }
 
+button[disabled] {
+    opacity: 0.48;
+    cursor: not-allowed;
+}
+
+.button-secondary {
+    background: rgba(255, 255, 255, 0.9);
+    color: var(--ink);
+    border: 1px solid rgba(31, 41, 51, 0.12);
+}
+
+.button-danger {
+    color: var(--red);
+    border-color: rgba(185, 28, 28, 0.18);
+}
+
 .stats {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -185,6 +241,12 @@ button {
 .alert.success {
     border-color: rgba(15, 118, 110, 0.16);
     color: var(--green);
+}
+
+.export-path {
+    margin-top: 6px;
+    font-size: 13px;
+    word-break: break-all;
 }
 
 .option-group {
@@ -210,6 +272,89 @@ button {
 
 .card {
     padding: 20px 22px;
+}
+
+.detail-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 12px;
+    margin: 18px 0 24px;
+}
+
+.compare-form {
+    display: grid;
+    gap: 14px;
+}
+
+.compare-builder-wrap {
+    margin-top: 24px;
+}
+
+.compare-chart-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 18px;
+}
+
+.compare-chart-card {
+    padding: 18px;
+    border-radius: 22px;
+    border: 1px solid rgba(31, 41, 51, 0.08);
+    background: rgba(255, 255, 255, 0.76);
+}
+
+.compare-chart-card.is-best-total,
+.compare-row.is-best-total {
+    box-shadow: inset 0 0 0 1px rgba(185, 28, 28, 0.24);
+    background: rgba(255, 245, 245, 0.9);
+}
+
+.compare-chart-card.is-best-excess,
+.compare-row.is-best-excess {
+    box-shadow: inset 0 0 0 1px rgba(15, 118, 110, 0.22);
+}
+
+.compare-chart-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.compare-chart-box {
+    padding: 12px;
+}
+
+.compare-card-badges,
+.compare-highlight-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.compare-best-total {
+    background: rgba(254, 226, 226, 0.92);
+    color: var(--red);
+}
+
+.compare-best-excess {
+    background: rgba(226, 250, 246, 0.95);
+    color: var(--green);
+}
+
+.compare-sort-inline {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 220px;
+}
+
+.compare-sort-inline span {
+    color: var(--muted);
+    font-size: 13px;
 }
 
 .card span {

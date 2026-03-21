@@ -9,6 +9,18 @@
 </head>
 <body>
     <main class="page">
+        {% if error %}
+        <div class="alert">{{ error }}</div>
+        {% endif %}
+        {% if success %}
+        <div class="alert success">
+            <div>{{ success }}</div>
+            {% if export_path %}
+            <div class="export-path">保存路径：{{ export_path }}</div>
+            {% endif %}
+        </div>
+        {% endif %}
+
         <section class="hero detail-hero">
             <div>
                 <p class="eyebrow">BACKTEST DETAIL</p>
@@ -24,13 +36,19 @@
             </div>
         </section>
 
+        <section class="detail-actions">
+            <a class="detail-link" href="{{ url_for('backtests') }}">返回回测中心</a>
+            <form method="post" action="{{ url_for('export_backtest_markdown', run_id=detail.id) }}">
+                <button type="submit" class="button-secondary">保存为 Markdown 文档</button>
+            </form>
+        </section>
+
         <section class="chart-wrap">
             <div class="section-title">
                 <div>
                     <h2>每日平均分走势</h2>
                     <p>用于观察回测区间附近的市场评分温度。</p>
                 </div>
-                <a class="detail-link" href="{{ url_for('backtests') }}">返回回测中心</a>
             </div>
             <div class="chart-box">{{ score_trend_svg|safe }}</div>
         </section>
@@ -104,7 +122,7 @@
             <div class="section-title">
                 <div>
                     <h2>每日持仓表</h2>
-                    <p class="summary-block">点击下方交易日日历卡片，切换查看当日持仓明细。</p>
+                    <p class="summary-block">点击下方交易日日历卡片，切换查看当日持仓明细和当日交易记录。</p>
                 </div>
             </div>
             {% if detail.position_calendar %}
@@ -152,7 +170,8 @@
                 <div class="position-panel-head">
                     <div>
                         <h3>{{ item.trade_date }}</h3>
-                        <p>当日持仓 {{ item.position_count }} 只，组合当日盈亏
+                        <p>
+                            当日持仓 {{ item.position_count }} 只，组合当日盈亏
                             <span class="{% if item.daily_pnl > 0 %}profit{% elif item.daily_pnl < 0 %}loss{% endif %}">{{ item.daily_pnl_text }}</span>
                         </p>
                     </div>
@@ -227,7 +246,7 @@
                                     <th>价格</th>
                                     <th>数量</th>
                                     <th>原因</th>
-                                    <th>当日净值影响</th>
+                                    <th>成交对当日净值影响</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -276,22 +295,20 @@
                 if (!hasActive) return;
                 group.classList.add('is-expanded');
                 const toggle = group.querySelector('[data-month-toggle]');
-                const content = group.querySelector('.position-calendar');
                 if (toggle) toggle.setAttribute('aria-expanded', 'true');
-                if (content) content.hidden = false;
             });
         };
 
-            monthGroups.forEach((group) => {
-                const toggle = group.querySelector('[data-month-toggle]');
-                if (!toggle) return;
-                toggle.addEventListener('click', () => {
-                    const expanded = toggle.getAttribute('aria-expanded') === 'true';
-                    const next = !expanded;
-                    toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
-                    group.classList.toggle('is-expanded', next);
-                });
+        monthGroups.forEach((group) => {
+            const toggle = group.querySelector('[data-month-toggle]');
+            if (!toggle) return;
+            toggle.addEventListener('click', () => {
+                const expanded = toggle.getAttribute('aria-expanded') === 'true';
+                const next = !expanded;
+                toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
+                group.classList.toggle('is-expanded', next);
             });
+        });
 
         buttons.forEach((button) => {
             button.addEventListener('click', () => activate(button.dataset.tradeDate));

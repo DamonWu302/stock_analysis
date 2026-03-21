@@ -13,7 +13,7 @@
             <div>
                 <p class="eyebrow">BACKTEST HUB</p>
                 <h1>回测中心</h1>
-                <p class="subtitle">左侧选择回测模板，右侧直接发起任务。模板会自动填充时间窗口、买卖规则、仓位和市场过滤参数。</p>
+                <p class="subtitle">左侧选择模板并管理配置，右侧直接发起回测。模板会自动填充时间窗口、买卖规则、仓位和市场过滤参数。</p>
             </div>
             <div class="control-panel">
                 <div class="hint">
@@ -36,21 +36,99 @@
                 <div>
                     <p class="eyebrow">TEMPLATES</p>
                     <h2>回测配置模板</h2>
-                    <p class="subtitle">点击模板后会立即覆盖右侧表单。应用模板后仍可以继续微调参数。</p>
+                    <p class="subtitle">点击模板会立即覆盖右侧表单。内置模板适合快速开跑，自定义模板适合保存你常用的参数组合。</p>
                 </div>
+
                 <div class="template-list">
                     {% for template in templates %}
                     <button
                         type="button"
                         class="template-card{% if template.id == selected_template_id %} is-active{% endif %}"
                         data-template-id="{{ template.id }}"
+                        data-template-name="{{ template.name }}"
+                        data-template-description="{{ template.description or '' }}"
+                        data-template-builtin="{{ 1 if template.is_builtin else 0 }}"
                         data-template-config='{{ template.config|tojson }}'
                     >
-                        <strong>{{ template.name }}</strong>
+                        <div class="template-card-head">
+                            <strong>{{ template.name }}</strong>
+                            {% if template.is_builtin %}
+                            <span class="badge">内置</span>
+                            {% else %}
+                            <span class="badge template-custom-badge">自定义</span>
+                            {% endif %}
+                        </div>
                         <span>{{ template.description or '未填写模板说明' }}</span>
                     </button>
                     {% endfor %}
                 </div>
+
+                <section class="template-manager">
+                    <div class="template-manager-head">
+                        <strong>模板管理</strong>
+                        <span id="template-mode-badge" class="badge">
+                            {% if selected_template and selected_template.is_builtin %}内置模板{% elif selected_template %}自定义模板{% else %}未选择{% endif %}
+                        </span>
+                    </div>
+                    <p class="template-manager-note" id="template-manager-note">
+                        {% if selected_template and selected_template.is_builtin %}
+                        当前是内置模板，支持按当前配置另存为新的自定义模板。
+                        {% elif selected_template %}
+                        当前是自定义模板，可以直接覆盖更新或删除。
+                        {% else %}
+                        先选择一个模板，再按右侧当前配置保存。
+                        {% endif %}
+                    </p>
+
+                    <form id="template-save-form" class="template-manager-form" method="post" action="{{ url_for('create_backtest_template_form') }}">
+                        <input type="hidden" name="template_id" value="{{ selected_template_id or '' }}">
+                        <input type="hidden" name="name">
+                        <input type="hidden" name="start_date">
+                        <input type="hidden" name="end_date">
+                        <input type="hidden" name="lookback_days">
+                        <input type="hidden" name="max_positions">
+                        <input type="hidden" name="initial_capital">
+                        <input type="hidden" name="fee_rate">
+                        <input type="hidden" name="slippage_rate">
+                        <input type="hidden" name="market_score_filter_min_avg">
+                        <input type="hidden" name="market_score_filter_min_ma5">
+                        <div id="template-save-buy-rules"></div>
+                        <div id="template-save-sell-rules"></div>
+
+                        <label>
+                            模板名称
+                            <input id="template-name" type="text" name="template_name" value="{{ selected_template.name if selected_template else '' }}" placeholder="例如：强趋势低仓">
+                        </label>
+                        <label>
+                            模板说明
+                            <input id="template-description" type="text" name="template_description" value="{{ selected_template.description if selected_template else '' }}" placeholder="描述适用市场环境和风格">
+                        </label>
+                        <button type="submit">另存为新模板</button>
+                    </form>
+
+                    <form id="template-update-form" class="template-inline-form" method="post" action="{% if selected_template %}{{ url_for('update_backtest_template_form', template_id=selected_template.id) }}{% else %}#{% endif %}">
+                        <input type="hidden" name="template_id" value="{{ selected_template_id or '' }}">
+                        <input type="hidden" name="name">
+                        <input type="hidden" name="start_date">
+                        <input type="hidden" name="end_date">
+                        <input type="hidden" name="lookback_days">
+                        <input type="hidden" name="max_positions">
+                        <input type="hidden" name="initial_capital">
+                        <input type="hidden" name="fee_rate">
+                        <input type="hidden" name="slippage_rate">
+                        <input type="hidden" name="market_score_filter_min_avg">
+                        <input type="hidden" name="market_score_filter_min_ma5">
+                        <input type="hidden" name="template_name" value="{{ selected_template.name if selected_template else '' }}">
+                        <input type="hidden" name="template_description" value="{{ selected_template.description if selected_template else '' }}">
+                        <div id="template-update-buy-rules"></div>
+                        <div id="template-update-sell-rules"></div>
+                        <button id="template-update-button" type="submit" {% if not selected_template or selected_template.is_builtin %}disabled{% endif %}>覆盖当前模板</button>
+                    </form>
+
+                    <form id="template-delete-form" class="template-inline-form" method="post" action="{% if selected_template %}{{ url_for('delete_backtest_template_form', template_id=selected_template.id) }}{% else %}#{% endif %}">
+                        <button id="template-delete-button" type="submit" class="button-secondary button-danger" {% if not selected_template or selected_template.is_builtin %}disabled{% endif %}>删除当前模板</button>
+                    </form>
+                </section>
             </aside>
 
             <form class="control-panel" id="backtest-form" method="post" action="{{ url_for('create_backtest_run_form') }}">
@@ -131,6 +209,93 @@
 
                 <button type="submit">开始回测</button>
             </form>
+        </section>
+
+        <section class="table-wrap compare-builder-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>批量参数对比</h2>
+                    <p>基于当前右侧回测配置，只替换一个参数字段，批量跑出多组结果做横向比较。</p>
+                </div>
+            </div>
+            <form id="compare-form" class="compare-form" method="post" action="{{ url_for('create_backtest_compare_task_form') }}">
+                <input type="hidden" name="template_id">
+                <input type="hidden" name="name">
+                <input type="hidden" name="start_date">
+                <input type="hidden" name="end_date">
+                <input type="hidden" name="lookback_days">
+                <input type="hidden" name="max_positions">
+                <input type="hidden" name="initial_capital">
+                <input type="hidden" name="fee_rate">
+                <input type="hidden" name="slippage_rate">
+                <input type="hidden" name="market_score_filter_min_avg">
+                <input type="hidden" name="market_score_filter_min_ma5">
+                <div id="compare-buy-rules"></div>
+                <div id="compare-sell-rules"></div>
+
+                <label>
+                    对比任务名称
+                    <input type="text" name="compare_name" placeholder="例如：严格买入总分阈值对比">
+                </label>
+                <label>
+                    对比参数
+                    <select name="compare_parameter_key" id="compare-parameter-key">
+                        {% for field in schema.compare_fields %}
+                        <option value="{{ field.id }}">{{ field.label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    主参数值
+                    <input type="text" name="compare_values" placeholder="例如：68,72,74,76">
+                </label>
+                <label>
+                    第二参数（可选）
+                    <select name="compare_parameter_key_secondary">
+                        <option value="">不启用第二参数</option>
+                        {% for field in schema.compare_fields %}
+                        <option value="{{ field.id }}">{{ field.label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    第二参数值（可选）
+                    <input type="text" name="compare_values_secondary" placeholder="例如：39,41,43">
+                </label>
+                <button type="submit">开始批量对比</button>
+            </form>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <h2>最近参数对比任务</h2>
+            </div>
+            {% if compare_tasks %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务</th>
+                        <th>参数</th>
+                        <th>状态</th>
+                        <th>进度</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for task in compare_tasks %}
+                    <tr>
+                        <td>#{{ task.id }} {{ task.name }}</td>
+                        <td>{{ task.parameter_label }}</td>
+                        <td>{{ task.phase_label }}</td>
+                        <td>{{ task.progress_current }}/{{ task.progress_total }}</td>
+                        <td><a class="detail-link" href="{{ url_for('backtest_compare_task_page', task_id=task.id) }}">查看对比</a></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="summary-block">当前还没有参数对比任务。</p>
+            {% endif %}
         </section>
 
         <section class="chart-wrap">
@@ -230,6 +395,16 @@
         const endDate = document.getElementById('end-date');
         const lookbackDays = document.getElementById('lookback-days');
         const hint = document.getElementById('time-mode-hint');
+        const templateName = document.getElementById('template-name');
+        const templateDescription = document.getElementById('template-description');
+        const templateModeBadge = document.getElementById('template-mode-badge');
+        const templateNote = document.getElementById('template-manager-note');
+        const updateForm = document.getElementById('template-update-form');
+        const deleteForm = document.getElementById('template-delete-form');
+        const updateButton = document.getElementById('template-update-button');
+        const deleteButton = document.getElementById('template-delete-button');
+        const saveForm = document.getElementById('template-save-form');
+        const compareForm = document.getElementById('compare-form');
 
         if (!form || !startDate || !endDate || !lookbackDays || !hint) return;
 
@@ -238,32 +413,6 @@
             form.querySelectorAll(`input[name="${name}"]`).forEach((node) => {
                 node.checked = values.has(node.value);
             });
-        };
-
-        const applyTemplate = (templateId, config) => {
-            if (templateInput) templateInput.value = templateId || '';
-            templateCards.forEach((card) => {
-                card.classList.toggle('is-active', String(card.dataset.templateId) === String(templateId));
-            });
-            if (!config) return;
-            const setValue = (id, value) => {
-                const node = document.getElementById(id);
-                if (!node) return;
-                node.value = value ?? '';
-            };
-            setValue('name', config.name);
-            setValue('start-date', config.start_date);
-            setValue('end-date', config.end_date);
-            setValue('lookback-days', config.lookback_days);
-            setValue('max-positions', config.max_positions);
-            setValue('initial-capital', config.initial_capital);
-            setValue('fee-rate', config.fee_rate);
-            setValue('slippage-rate', config.slippage_rate);
-            setValue('market-score-filter-min-avg', config.market_score_filter_min_avg);
-            setValue('market-score-filter-min-ma5', config.market_score_filter_min_ma5);
-            setCheckboxGroup('enabled_buy_rules', config.enabled_buy_rules);
-            setCheckboxGroup('enabled_sell_rules', config.enabled_sell_rules);
-            syncTimeMode();
         };
 
         const syncTimeMode = () => {
@@ -284,21 +433,161 @@
             syncTimeMode();
         };
 
-        templateCards.forEach((card) => {
-            card.addEventListener('click', () => {
-                let config = {};
-                try {
-                    config = JSON.parse(card.dataset.templateConfig || '{}');
-                } catch (error) {
-                    config = {};
-                }
-                applyTemplate(card.dataset.templateId, config);
+        const getCurrentFormPayload = () => {
+            const checkedValues = (name) => Array.from(form.querySelectorAll(`input[name="${name}"]:checked`)).map((node) => node.value);
+            return {
+                template_id: templateInput ? templateInput.value : '',
+                name: document.getElementById('name')?.value || '',
+                start_date: startDate.value || '',
+                end_date: endDate.value || '',
+                lookback_days: document.getElementById('lookback-days')?.value || '',
+                max_positions: document.getElementById('max-positions')?.value || '',
+                initial_capital: document.getElementById('initial-capital')?.value || '',
+                fee_rate: document.getElementById('fee-rate')?.value || '',
+                slippage_rate: document.getElementById('slippage-rate')?.value || '',
+                market_score_filter_min_avg: document.getElementById('market-score-filter-min-avg')?.value || '',
+                market_score_filter_min_ma5: document.getElementById('market-score-filter-min-ma5')?.value || '',
+                enabled_buy_rules: checkedValues('enabled_buy_rules'),
+                enabled_sell_rules: checkedValues('enabled_sell_rules'),
+            };
+        };
+
+        const fillHiddenFields = (targetForm) => {
+            if (!targetForm) return;
+            const payload = getCurrentFormPayload();
+            const setHidden = (name, value) => {
+                const node = targetForm.querySelector(`input[name="${name}"]`);
+                if (node) node.value = value ?? '';
+            };
+            setHidden('template_id', payload.template_id);
+            setHidden('name', payload.name);
+            setHidden('start_date', payload.start_date);
+            setHidden('end_date', payload.end_date);
+            setHidden('lookback_days', payload.lookback_days);
+            setHidden('max_positions', payload.max_positions);
+            setHidden('initial_capital', payload.initial_capital);
+            setHidden('fee_rate', payload.fee_rate);
+            setHidden('slippage_rate', payload.slippage_rate);
+            setHidden('market_score_filter_min_avg', payload.market_score_filter_min_avg);
+            setHidden('market_score_filter_min_ma5', payload.market_score_filter_min_ma5);
+
+            ['enabled_buy_rules', 'enabled_sell_rules'].forEach((fieldName) => {
+                const prefix = targetForm.id === 'template-save-form'
+                    ? 'template-save'
+                    : targetForm.id === 'template-update-form'
+                        ? 'template-update'
+                        : 'compare';
+                const container = targetForm.querySelector(`#${prefix}-${fieldName === 'enabled_buy_rules' ? 'buy' : 'sell'}-rules`);
+                if (!container) return;
+                container.innerHTML = '';
+                payload[fieldName].forEach((value) => {
+                    const hidden = document.createElement('input');
+                    hidden.type = 'hidden';
+                    hidden.name = fieldName;
+                    hidden.value = value;
+                    container.appendChild(hidden);
+                });
             });
+
+            if (targetForm.querySelector('input[name="template_name"]') && templateName) {
+                targetForm.querySelector('input[name="template_name"]').value = templateName.value;
+            }
+            if (targetForm.querySelector('input[name="template_description"]') && templateDescription) {
+                targetForm.querySelector('input[name="template_description"]').value = templateDescription.value;
+            }
+        };
+
+        const setTemplateManagerState = (card) => {
+            if (!card) return;
+            const isBuiltin = String(card.dataset.templateBuiltin) === '1';
+            const templateId = card.dataset.templateId || '';
+            const name = card.dataset.templateName || '';
+            const description = card.dataset.templateDescription || '';
+
+            if (templateName) templateName.value = name;
+            if (templateDescription) templateDescription.value = description;
+
+            if (templateModeBadge) {
+                templateModeBadge.textContent = isBuiltin ? '内置模板' : '自定义模板';
+            }
+            if (templateNote) {
+                templateNote.textContent = isBuiltin
+                    ? '当前是内置模板，支持按当前配置另存为新的自定义模板。'
+                    : '当前是自定义模板，可以直接覆盖更新或删除。';
+            }
+            if (updateForm) {
+                updateForm.action = `/backtests/templates/${templateId}/update`;
+            }
+            if (deleteForm) {
+                deleteForm.action = `/backtests/templates/${templateId}/delete`;
+            }
+            if (updateButton) {
+                updateButton.disabled = isBuiltin;
+            }
+            if (deleteButton) {
+                deleteButton.disabled = isBuiltin;
+            }
+        };
+
+        const applyTemplate = (card) => {
+            if (!card) return;
+            const templateId = card.dataset.templateId;
+            let config = {};
+            try {
+                config = JSON.parse(card.dataset.templateConfig || '{}');
+            } catch (error) {
+                config = {};
+            }
+            if (templateInput) templateInput.value = templateId || '';
+            templateCards.forEach((item) => {
+                item.classList.toggle('is-active', item === card);
+            });
+            const setValue = (id, value) => {
+                const node = document.getElementById(id);
+                if (!node) return;
+                node.value = value ?? '';
+            };
+            setValue('name', config.name);
+            setValue('start-date', config.start_date);
+            setValue('end-date', config.end_date);
+            setValue('lookback-days', config.lookback_days);
+            setValue('max-positions', config.max_positions);
+            setValue('initial-capital', config.initial_capital);
+            setValue('fee-rate', config.fee_rate);
+            setValue('slippage-rate', config.slippage_rate);
+            setValue('market-score-filter-min-avg', config.market_score_filter_min_avg);
+            setValue('market-score-filter-min-ma5', config.market_score_filter_min_ma5);
+            setCheckboxGroup('enabled_buy_rules', config.enabled_buy_rules);
+            setCheckboxGroup('enabled_sell_rules', config.enabled_sell_rules);
+            setTemplateManagerState(card);
+            syncTimeMode();
+        };
+
+        templateCards.forEach((card) => {
+            card.addEventListener('click', () => applyTemplate(card));
         });
+
+        [saveForm, updateForm, compareForm].forEach((targetForm) => {
+            if (!targetForm) return;
+            targetForm.addEventListener('submit', () => fillHiddenFields(targetForm));
+        });
+
+        if (deleteForm) {
+            deleteForm.addEventListener('submit', (event) => {
+                if (!window.confirm('确认删除当前自定义模板吗？')) {
+                    event.preventDefault();
+                }
+            });
+        }
 
         startDate.addEventListener('change', syncTimeMode);
         endDate.addEventListener('change', syncTimeMode);
         lookbackDays.addEventListener('input', clearDateRangeIfLookbackChanged);
+
+        const activeCard = document.querySelector('.template-card.is-active') || templateCards[0];
+        if (activeCard) {
+            setTemplateManagerState(activeCard);
+        }
         syncTimeMode();
     })();
     </script>

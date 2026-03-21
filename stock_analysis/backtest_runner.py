@@ -9,10 +9,10 @@ from .backtest import (
     BUY_RULE_MOMENTUM,
     BUY_RULE_STRICT,
     DEFAULT_INITIAL_CAPITAL,
-    SELL_RULE_CAPITAL,
-    SELL_RULE_STALE,
-    SELL_RULE_STOP,
-    SELL_RULE_TREND,
+    SELL_RULE_BREAK_MA5,
+    SELL_RULE_DRAWDOWN,
+    SELL_RULE_TIME_STOP,
+    SELL_RULE_TRIM,
     build_backtest_config_schema,
 )
 from .db import Database
@@ -26,6 +26,8 @@ class Position:
     entry_signal_date: str
     entry_execution_date: str
     entry_cost_total: float
+    peak_close: float
+    trimmed: bool = False
 
 
 class BacktestRunner:
@@ -293,14 +295,22 @@ class BacktestRunner:
                     if next_trade_date:
                         pending_sells.setdefault(next_trade_date, []).append(order)
                     continue
+                sell_fraction = min(max(float(order.get("fraction") or 1.0), 0.0), 1.0)
+                if sell_fraction <= 0:
+                    continue
+                original_shares = position.shares
+                shares_to_sell = round(original_shares * sell_fraction, 4)
+                if shares_to_sell <= 0:
+                    shares_to_sell = original_shares
+                cost_portion = round(position.entry_cost_total * (shares_to_sell / max(original_shares, 0.0001)), 4)
                 execution_price = round(float(price_row["open"]) * (1 - config["slippage_rate"]), 4)
-                gross_amount = round(position.shares * execution_price, 4)
+                gross_amount = round(shares_to_sell * execution_price, 4)
                 fee = round(gross_amount * config["fee_rate"], 4)
                 net_amount = round(gross_amount - fee, 4)
                 cash += net_amount
                 daily_turnover += gross_amount
                 holding_days = max(self._trade_date_distance(trade_dates, position.entry_execution_date, trade_date), 1)
-                realized_return = (net_amount - position.entry_cost_total) / max(position.entry_cost_total, 0.01)
+                realized_return = (net_amount - cost_portion) / max(cost_portion, 0.01)
                 closed_returns.append(realized_return)
                 closed_holding_days.append(holding_days)
                 trade_rows.append(
@@ -311,16 +321,21 @@ class BacktestRunner:
                         order["signal_trade_date"],
                         trade_date,
                         execution_price,
-                        position.shares,
+                        shares_to_sell,
                         gross_amount,
                         fee,
-                        round(position.shares * float(price_row["open"]) * config["slippage_rate"], 4),
+                        round(shares_to_sell * float(price_row["open"]) * config["slippage_rate"], 4),
                         net_amount,
                         ",".join(order["rule_hits"]),
                     )
                 )
                 traded_today.add(symbol)
-                del positions[symbol]
+                if shares_to_sell >= original_shares - 0.0001:
+                    del positions[symbol]
+                else:
+                    position.shares = round(original_shares - shares_to_sell, 4)
+                    position.entry_cost_total = round(max(position.entry_cost_total - cost_portion, 0.0), 4)
+                    position.trimmed = True
 
             buy_orders = [
                 order
@@ -361,6 +376,7 @@ class BacktestRunner:
                         entry_signal_date=order["signal_trade_date"],
                         entry_execution_date=trade_date,
                         entry_cost_total=net_amount,
+                        peak_close=execution_price,
                     )
                     trade_rows.append(
                         (
@@ -385,6 +401,7 @@ class BacktestRunner:
             for symbol, position in positions.items():
                 price_row = price_map.get((trade_date, symbol), {})
                 close_price = float(price_row.get("close") or position.cost_price)
+                position.peak_close = max(float(position.peak_close), close_price)
                 value = round(position.shares * close_price, 4)
                 market_value += value
                 daily_positions.append(
@@ -439,15 +456,22 @@ class BacktestRunner:
                 symbol = str(row["symbol"])
                 breakout_floor = self._breakout_floor(row)
                 if symbol in positions:
-                    sell_hits = self._evaluate_sell_rules(
+                    sell_decision = self._evaluate_sell_rules(
                         row,
                         position=positions[symbol],
                         current_close=float(row["close"]),
+                        hold_days=self._trade_date_distance(trade_dates, positions[symbol].entry_execution_date, trade_date),
                         enabled_sell_rules=enabled_sell_rules,
+                        config=config,
                     )
-                    if sell_hits:
+                    if sell_decision:
                         pending_sells.setdefault(next_trade_date, []).append(
-                            {"symbol": symbol, "signal_trade_date": trade_date, "rule_hits": sell_hits}
+                            {
+                                "symbol": symbol,
+                                "signal_trade_date": trade_date,
+                                "rule_hits": sell_decision["rule_hits"],
+                                "fraction": sell_decision["fraction"],
+                            }
                         )
                         signal_rows.append(
                             (
@@ -459,15 +483,15 @@ class BacktestRunner:
                                 "sell",
                                 1,
                                 None,
-                                json.dumps(sell_hits, ensure_ascii=False),
+                                json.dumps(sell_decision["rule_hits"], ensure_ascii=False),
                                 breakout_floor,
-                                0.0,
+                                round(1.0 - float(sell_decision["fraction"]), 6),
                                 "",
                             )
                         )
                     continue
 
-                buy_hits = self._evaluate_buy_rules(row, enabled_buy_rules=enabled_buy_rules)
+                buy_hits = self._evaluate_buy_rules(row, enabled_buy_rules=enabled_buy_rules, config=config)
                 if not buy_hits:
                     continue
                 if not market_filter_passed:
@@ -609,16 +633,73 @@ class BacktestRunner:
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
+                WITH latest_sector AS (
+                    SELECT ms.symbol, ms.sector
+                    FROM market_snapshot ms
+                    JOIN (
+                        SELECT symbol, MAX(trade_date) AS latest_trade_date
+                        FROM market_snapshot
+                        GROUP BY symbol
+                    ) latest
+                      ON latest.symbol = ms.symbol AND latest.latest_trade_date = ms.trade_date
+                ),
+                sector_base AS (
+                    SELECT ph.trade_date,
+                           ph.symbol,
+                           ls.sector,
+                           ph.close,
+                           LAG(ph.close, 5) OVER (PARTITION BY ph.symbol ORDER BY ph.trade_date) AS close_5d_ago
+                    FROM price_history ph
+                    LEFT JOIN latest_sector ls ON ls.symbol = ph.symbol
+                    WHERE ph.trade_date BETWEEN ? AND ?
+                ),
+                sector_return AS (
+                    SELECT trade_date,
+                           COALESCE(sector, '未分类') AS sector,
+                           AVG((close / NULLIF(close_5d_ago, 0)) - 1.0) AS sector_return_5d
+                    FROM sector_base
+                    WHERE close_5d_ago IS NOT NULL
+                    GROUP BY trade_date, COALESCE(sector, '未分类')
+                ),
+                sector_rank AS (
+                    SELECT trade_date,
+                           sector,
+                           sector_return_5d,
+                           PERCENT_RANK() OVER (PARTITION BY trade_date ORDER BY sector_return_5d DESC) AS sector_rank_pct
+                    FROM sector_return
+                )
                 SELECT ds.trade_date, ds.symbol, ds.score_total, ds.score_ma_trend, ds.score_volume_pattern,
                        ds.score_capital_sector, ds.score_breakout, ds.score_hold, ds.score_benchmark,
-                       df.close, df.ma5, df.ma10, df.atr14, df.prior_20_high, df.cmf21
+                       df.close, df.ma5, df.ma10, df.ma20, df.atr14, df.prior_20_high, df.cmf21,
+                       df.mfi14, df.vol_ma5, df.pct_change, ph.open, ph.high, ph.low, ph.volume,
+                       LAG(ds.score_total) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS prev_score_total,
+                       LAG(df.mfi14) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS prev_mfi14,
+                       LAG(df.close, 20) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS close_20d_ago,
+                       LAG(df.pct_change, 1) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS pct_change_lag1,
+                       LAG(df.pct_change, 2) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS pct_change_lag2,
+                       LAG(ph.volume, 1) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS volume_lag1,
+                       LAG(ph.volume, 2) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS volume_lag2,
+                       LAG(df.vol_ma5, 1) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS vol_ma5_lag1,
+                       LAG(df.vol_ma5, 2) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS vol_ma5_lag2,
+                       MAX(ph.high) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS risk_high_5d,
+                       MIN(ph.low) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS risk_low_5d,
+                       MAX(ph.close) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS risk_close_high_5d,
+                       MIN(ph.close) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS risk_close_low_5d,
+                       sector_rank.sector_rank_pct,
+                       sector_rank.sector_return_5d
                 FROM daily_score ds
                 JOIN daily_factor df
                   ON df.trade_date = ds.trade_date AND df.symbol = ds.symbol
+                LEFT JOIN price_history ph
+                  ON ph.trade_date = ds.trade_date AND ph.symbol = ds.symbol
+                LEFT JOIN latest_sector ls
+                  ON ls.symbol = ds.symbol
+                LEFT JOIN sector_rank
+                  ON sector_rank.trade_date = ds.trade_date AND sector_rank.sector = COALESCE(ls.sector, '未分类')
                 WHERE ds.trade_date BETWEEN ? AND ?
                 ORDER BY ds.trade_date ASC, ds.score_total DESC, ds.symbol ASC
                 """,
-                (start_date, end_date),
+                (start_date, end_date, start_date, end_date),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -626,26 +707,53 @@ class BacktestRunner:
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
+                WITH stats AS (
+                    SELECT trade_date, AVG(score_total) AS avg_score
+                    FROM daily_score
+                    WHERE trade_date BETWEEN ? AND ?
+                    GROUP BY trade_date
+                ),
+                benchmark_base AS (
+                    SELECT trade_date, close
+                    FROM benchmark_history
+                    WHERE symbol = '000001' AND trade_date BETWEEN ? AND ?
+                ),
+                benchmark_ma AS (
+                    SELECT trade_date,
+                           close,
+                           AVG(close) OVER (
+                               ORDER BY trade_date
+                               ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                           ) AS ma20
+                    FROM benchmark_base
+                ),
+                benchmark_ratio AS (
+                    SELECT trade_date,
+                           close / NULLIF(ma20, 0) AS close_ma20_ratio,
+                           ma20 / NULLIF(LAG(ma20) OVER (ORDER BY trade_date), 0) AS ma20_ratio
+                    FROM benchmark_ma
+                )
                 SELECT stats.trade_date,
                        stats.avg_score,
                        AVG(stats.avg_score) OVER (
                            ORDER BY stats.trade_date
                            ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                       ) AS ma5_avg_score
-                FROM (
-                    SELECT trade_date, AVG(score_total) AS avg_score
-                    FROM daily_score
-                    WHERE trade_date BETWEEN ? AND ?
-                    GROUP BY trade_date
-                ) stats
+                       ) AS ma5_avg_score,
+                       benchmark_ratio.ma20_ratio,
+                       benchmark_ratio.close_ma20_ratio
+                FROM stats
+                LEFT JOIN benchmark_ratio
+                  ON benchmark_ratio.trade_date = stats.trade_date
                 ORDER BY stats.trade_date ASC
                 """,
-                (start_date, end_date),
+                (start_date, end_date, start_date, end_date),
             ).fetchall()
         return {
             str(row["trade_date"]): {
                 "avg_score": round(float(row["avg_score"]), 4) if row["avg_score"] is not None else 0.0,
                 "ma5_avg_score": round(float(row["ma5_avg_score"]), 4) if row["ma5_avg_score"] is not None else 0.0,
+                "benchmark_ma20_ratio": round(float(row["ma20_ratio"]), 6) if row["ma20_ratio"] is not None else 0.0,
+                "benchmark_close_ma20_ratio": round(float(row["close_ma20_ratio"]), 6) if row["close_ma20_ratio"] is not None else 0.0,
             }
             for row in rows
         }
@@ -793,18 +901,101 @@ class BacktestRunner:
             return None
         return round(max(float(prior_20_high) - 1.2 * float(atr14), float(prior_20_high) * 0.96), 4)
 
-    def _evaluate_buy_rules(self, row: dict[str, Any], enabled_buy_rules: set[str]) -> list[str]:
+    def _evaluate_buy_rules(self, row: dict[str, Any], enabled_buy_rules: set[str], config: dict[str, Any]) -> list[str]:
         hits: list[str] = []
+        core_scores = {
+            "score_ma_trend": float(row.get("score_ma_trend") or 0.0),
+            "score_volume_pattern": float(row.get("score_volume_pattern") or 0.0),
+            "score_capital_sector": float(row.get("score_capital_sector") or 0.0),
+            "score_breakout": float(row.get("score_breakout") or 0.0),
+            "score_hold": float(row.get("score_hold") or 0.0),
+            "score_benchmark": float(row.get("score_benchmark") or 0.0),
+        }
+        core_hits = sum(
+            [
+                core_scores["score_ma_trend"] >= 18.0,
+                core_scores["score_volume_pattern"] >= 12.0,
+                core_scores["score_capital_sector"] >= 10.0,
+                core_scores["score_breakout"] >= 10.0,
+                core_scores["score_hold"] >= 8.0,
+                core_scores["score_benchmark"] >= 6.0,
+            ]
+        )
+        if core_hits < int(config["buy_min_core_hits"]):
+            return hits
+
+        current_close = float(row.get("close") or 0.0)
+        prior_20_high = row.get("prior_20_high")
+        close_20d_ago = row.get("close_20d_ago")
+        is_low_position = False
+        if prior_20_high is not None and float(prior_20_high) > 0:
+            is_low_position = current_close <= float(prior_20_high) * float(config["buy_low_position_high_ratio_max"])
+        gain_20d_ok = False
+        if close_20d_ago is not None and float(close_20d_ago) > 0:
+            gain_20d = (current_close / float(close_20d_ago) - 1.0) * 100.0
+            gain_20d_ok = gain_20d <= float(config["buy_20d_gain_max"])
+        if not (is_low_position or gain_20d_ok):
+            return hits
+
+        lookback = max(int(config["buy_recent_stall_lookback"]), 1)
+        stall_pct_max = float(config["buy_recent_stall_pct_max"])
+        stall_volume_multiple = float(config["buy_recent_stall_volume_multiple"])
+        recent_windows = [
+            (row.get("pct_change"), row.get("volume"), row.get("vol_ma5")),
+            (row.get("pct_change_lag1"), row.get("volume_lag1"), row.get("vol_ma5_lag1")),
+            (row.get("pct_change_lag2"), row.get("volume_lag2"), row.get("vol_ma5_lag2")),
+        ][:lookback]
+        has_recent_volume_stall = False
+        for pct_change, volume, vol_ma5 in recent_windows:
+            if pct_change is None or volume is None or vol_ma5 is None:
+                continue
+            if float(vol_ma5) <= 0:
+                continue
+            if float(pct_change) < stall_pct_max and float(volume) > float(vol_ma5) * stall_volume_multiple:
+                has_recent_volume_stall = True
+                break
+        if has_recent_volume_stall:
+            return hits
+
+        risk_high_5d = row.get("risk_high_5d")
+        risk_low_5d = row.get("risk_low_5d")
+        risk_close_high_5d = row.get("risk_close_high_5d")
+        risk_close_low_5d = row.get("risk_close_low_5d")
+        recent_amplitude = None
+        if risk_high_5d is not None and risk_low_5d is not None and float(risk_low_5d) > 0:
+            recent_amplitude = (float(risk_high_5d) - float(risk_low_5d)) / float(risk_low_5d)
+        recent_max_drop = None
+        if risk_close_high_5d is not None and risk_close_low_5d is not None and float(risk_close_high_5d) > 0:
+            recent_max_drop = (float(risk_close_high_5d) - float(risk_close_low_5d)) / float(risk_close_high_5d)
+        if recent_amplitude is None or recent_max_drop is None:
+            return hits
+        if (
+            recent_amplitude > float(config["buy_risk_amplitude_max"])
+            or recent_max_drop > float(config["buy_risk_max_drop_max"])
+        ):
+            return hits
+        sector_rank_pct = row.get("sector_rank_pct")
+        if sector_rank_pct is None:
+            return hits
+        if float(sector_rank_pct) > float(config["buy_sector_rank_top_pct"]):
+            return hits
+
         if BUY_RULE_STRICT in enabled_buy_rules:
             if (
-                float(row["score_total"]) >= 80.0
-                and float(row["score_ma_trend"]) >= 18.0
-                and float(row["score_breakout"]) >= 12.8
-                and float(row["score_capital_sector"]) >= 14.4
+                float(row["score_total"]) >= float(config["buy_strict_score_total"])
+                and (
+                    float(row["score_ma_trend"]) >= float(config["buy_strict_score_ma_trend"])
+                    or float(row["score_breakout"]) >= float(config["buy_strict_score_breakout"])
+                )
+                and float(row["score_volume_pattern"]) >= float(config["buy_strict_score_volume_pattern"])
+                and float(row["score_capital_sector"]) >= float(config["buy_strict_score_capital_sector"])
             ):
                 hits.append(BUY_RULE_STRICT)
         if BUY_RULE_MOMENTUM in enabled_buy_rules:
-            if float(row["score_total"]) >= 75.0 and float(row["score_volume_pattern"]) >= 20.0:
+            if (
+                float(row["score_total"]) >= float(config["buy_momentum_score_total"])
+                and float(row["score_volume_pattern"]) >= float(config["buy_momentum_score_volume_pattern"])
+            ):
                 hits.append(BUY_RULE_MOMENTUM)
         return hits
 
@@ -833,6 +1024,14 @@ class BacktestRunner:
         return (
             float(market_filter.get("avg_score") or 0.0) >= float(config["market_score_filter_min_avg"])
             and float(market_filter.get("ma5_avg_score") or 0.0) >= float(config["market_score_filter_min_ma5"])
+            and (
+                not bool(config.get("market_require_benchmark_ma20_up", True))
+                or float(market_filter.get("benchmark_ma20_ratio") or 0.0) > 1.0
+            )
+            and (
+                not bool(config.get("market_require_benchmark_above_ma20", True))
+                or float(market_filter.get("benchmark_close_ma20_ratio") or 0.0) > 1.0
+            )
         )
 
     def _evaluate_sell_rules(
@@ -840,29 +1039,76 @@ class BacktestRunner:
         row: dict[str, Any],
         position: Position,
         current_close: float,
+        hold_days: int,
         enabled_sell_rules: set[str],
-    ) -> list[str]:
-        hits: list[str] = []
-        breakout_floor = self._breakout_floor(row)
-        if SELL_RULE_STOP in enabled_sell_rules and breakout_floor is not None and current_close < breakout_floor:
-            hits.append(SELL_RULE_STOP)
-        ma5 = row.get("ma5")
-        ma10 = row.get("ma10")
-        if (
-            SELL_RULE_TREND in enabled_sell_rules
-            and ma5 is not None
-            and ma10 is not None
-            and (float(ma5) <= float(ma10) or current_close < float(ma10))
-        ):
-            hits.append(SELL_RULE_TREND)
-        cmf21 = row.get("cmf21")
-        if SELL_RULE_CAPITAL in enabled_sell_rules and cmf21 is not None and float(cmf21) < 0:
-            hits.append(SELL_RULE_CAPITAL)
-        score_hold_ratio = float(row["score_hold"]) / 12.0 if row.get("score_hold") is not None else 0.0
+        config: dict[str, Any],
+    ) -> dict[str, Any] | None:
         position_return = (current_close - position.cost_price) / max(position.cost_price, 0.01)
-        if SELL_RULE_STALE in enabled_sell_rules and score_hold_ratio < 0.5 and position_return < 0.05:
-            hits.append(SELL_RULE_STALE)
-        return hits
+        ma5 = row.get("ma5")
+        volume = float(row.get("volume") or 0.0)
+        vol_ma5 = float(row.get("vol_ma5") or 0.0)
+        current_hold_days = max(int(hold_days), 0)
+        ma10 = row.get("ma10")
+        ma20 = row.get("ma20")
+
+        drawdown_from_peak = 0.0
+        if position.peak_close > 0:
+            drawdown_from_peak = (float(position.peak_close) - current_close) / float(position.peak_close)
+        peak_return = (float(position.peak_close) - position.cost_price) / max(position.cost_price, 0.01)
+
+        is_break_ma5 = (
+            SELL_RULE_BREAK_MA5 in enabled_sell_rules
+            and ma5 is not None
+            and current_close < float(ma5)
+            and vol_ma5 > 0
+            and volume > vol_ma5 * float(config["sell_break_ma5_volume_multiple"])
+        )
+        drawdown_limit = None
+        if peak_return >= float(config["sell_drawdown_profit_threshold_high"]):
+            drawdown_limit = float(config["sell_drawdown_threshold_high"])
+        elif peak_return >= float(config["sell_drawdown_profit_threshold_mid"]):
+            drawdown_limit = float(config["sell_drawdown_threshold_mid"])
+        elif peak_return >= float(config["sell_drawdown_profit_threshold"]):
+            drawdown_limit = float(config["sell_drawdown_threshold"])
+        is_drawdown_stop = SELL_RULE_DRAWDOWN in enabled_sell_rules and drawdown_limit is not None and drawdown_from_peak > drawdown_limit
+        is_time_stop = (
+            SELL_RULE_TIME_STOP in enabled_sell_rules
+            and current_hold_days >= int(config["sell_time_stop_days"])
+            and position_return < float(config["sell_time_stop_return_threshold"])
+            and ma20 is not None
+            and current_close <= float(ma20)
+        )
+        if is_drawdown_stop or is_break_ma5 or is_time_stop:
+            rule_hits: list[str] = []
+            if is_drawdown_stop:
+                rule_hits.append(SELL_RULE_DRAWDOWN)
+            if is_break_ma5:
+                rule_hits.append(SELL_RULE_BREAK_MA5)
+            if is_time_stop:
+                rule_hits.append(SELL_RULE_TIME_STOP)
+            return {"fraction": 1.0, "rule_hits": rule_hits}
+
+        if SELL_RULE_TRIM not in enabled_sell_rules or position.trimmed:
+            return None
+        if position_return < float(config["sell_trim_profit_threshold"]):
+            return None
+
+        open_price = float(row.get("open") or current_close)
+        high_price = float(row.get("high") or current_close)
+        low_price = float(row.get("low") or current_close)
+        upper_shadow = high_price - max(open_price, current_close)
+        full_range = max(high_price - low_price, 0.01)
+        is_long_upper_shadow = (
+            upper_shadow > 0
+            and upper_shadow / max(current_close, 0.01) >= float(config["sell_trim_upper_shadow_ratio"])
+            and upper_shadow / full_range >= 0.35
+            and vol_ma5 > 0
+            and volume > vol_ma5 * float(config["sell_trim_volume_multiple"])
+        )
+        if is_long_upper_shadow:
+            trim_hits: list[str] = [SELL_RULE_TRIM]
+            return {"fraction": float(config["sell_trim_fraction"]), "rule_hits": trim_hits}
+        return None
 
     @staticmethod
     def _deserialize_signal_row(row: dict[str, Any]) -> dict[str, Any]:
