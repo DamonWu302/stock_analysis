@@ -1,0 +1,3 @@
+cfg_buy_amount_min,cfg_buy_min_core_hits,cfg_buy_momentum_score_total,cfg_buy_strict_score_total,cfg_market_score_filter_min_avg,cfg_market_score_filter_min_ma5,cfg_max_single_position,cfg_sell_market_drop_threshold,cfg_sell_market_score_threshold,error,passed_constraints,run_id,status,trial_id
+250000000.0,3,70,72,38,33,0.25,-4.0,38,could not convert string to float: '',0,,failed,1
+200000000.0,3,72,72,38,38,0.2,-3.5,34,could not convert string to float: '',0,,failed,2

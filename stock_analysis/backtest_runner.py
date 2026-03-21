@@ -996,12 +996,12 @@ class BacktestRunner:
             return hits
         if float(sector_rank_pct) > float(config["buy_sector_rank_top_pct"]):
             return hits
-        trade_amount = row.get("amount")
-        amount_lag1 = row.get("amount_lag1")
-        amount_lag2 = row.get("amount_lag2")
+        trade_amount = self._safe_float(row.get("amount"))
+        amount_lag1 = self._safe_float(row.get("amount_lag1"))
+        amount_lag2 = self._safe_float(row.get("amount_lag2"))
         if trade_amount is None or amount_lag1 is None or amount_lag2 is None:
             return hits
-        amount_3d_avg = (float(trade_amount) + float(amount_lag1) + float(amount_lag2)) / 3.0
+        amount_3d_avg = (trade_amount + amount_lag1 + amount_lag2) / 3.0
         if amount_3d_avg < float(config["buy_amount_min"]):
             return hits
 
@@ -1041,6 +1041,15 @@ class BacktestRunner:
         if side == "sell" and float(open_price) <= lower_limit:
             return "limit_down"
         return "tradable"
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _passes_market_filter(market_filter: dict[str, float], config: dict[str, Any]) -> bool:

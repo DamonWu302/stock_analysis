@@ -99,6 +99,8 @@ def build_backtest_config_schema() -> dict[str, Any]:
             {"id": "market_score_filter_min_ma5", "label": "市场5日均值过滤阈值", "type": "float"},
             {"id": "max_positions", "label": "最大持仓数", "type": "int"},
             {"id": "max_single_position", "label": "单票仓位上限", "type": "float"},
+            {"id": "sell_market_score_threshold", "label": "弱市清仓平均分阈值", "type": "float"},
+            {"id": "sell_market_drop_threshold", "label": "弱市清仓跌幅阈值", "type": "float"},
             {"id": "fee_rate", "label": "手续费", "type": "float"},
             {"id": "slippage_rate", "label": "滑点", "type": "float"},
         ],
