@@ -13,6 +13,8 @@ SELL_RULE_TRIM = "sell_trim"
 SELL_RULE_BREAK_MA5 = "sell_break_ma5"
 SELL_RULE_DRAWDOWN = "sell_drawdown"
 SELL_RULE_TIME_STOP = "sell_time_stop"
+SELL_RULE_FLIP_LOSS = "sell_flip_loss"
+SELL_RULE_MARKET_WEAK_DROP = "sell_market_weak_drop"
 
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 
@@ -29,6 +31,7 @@ class BacktestDefaults:
     market_require_benchmark_ma20_up: bool = False
     market_require_benchmark_above_ma20: bool = True
     max_positions: int = 4
+    max_single_position: float = 0.30
     initial_capital: float = DEFAULT_INITIAL_CAPITAL
     fee_rate: float = 0.001
     slippage_rate: float = 0.001
@@ -48,6 +51,7 @@ class BacktestDefaults:
     buy_risk_amplitude_max: float = 0.20
     buy_risk_max_drop_max: float = 0.12
     buy_sector_rank_top_pct: float = 0.50
+    buy_amount_min: float = 250_000_000.0
     sell_trim_profit_threshold: float = 0.08
     sell_trim_fraction: float = 0.5
     sell_trim_upper_shadow_ratio: float = 0.03
@@ -61,6 +65,8 @@ class BacktestDefaults:
     sell_drawdown_threshold_high: float = 0.08
     sell_time_stop_days: int = 10
     sell_time_stop_return_threshold: float = 0.02
+    sell_market_score_threshold: float = 35.0
+    sell_market_drop_threshold: float = -3.0
     buy_timing: str = "next_open"
     sell_timing: str = "next_open"
     allow_pyramiding: bool = False
@@ -74,6 +80,8 @@ class BacktestDefaults:
             SELL_RULE_BREAK_MA5,
             SELL_RULE_DRAWDOWN,
             SELL_RULE_TIME_STOP,
+            SELL_RULE_FLIP_LOSS,
+            SELL_RULE_MARKET_WEAK_DROP,
         ]
     )
 
@@ -90,6 +98,7 @@ def build_backtest_config_schema() -> dict[str, Any]:
             {"id": "market_score_filter_min_avg", "label": "市场平均分过滤阈值", "type": "float"},
             {"id": "market_score_filter_min_ma5", "label": "市场5日均值过滤阈值", "type": "float"},
             {"id": "max_positions", "label": "最大持仓数", "type": "int"},
+            {"id": "max_single_position", "label": "单票仓位上限", "type": "float"},
             {"id": "fee_rate", "label": "手续费", "type": "float"},
             {"id": "slippage_rate", "label": "滑点", "type": "float"},
         ],
@@ -133,6 +142,12 @@ def build_backtest_config_schema() -> dict[str, Any]:
                         "value": defaults.buy_sector_rank_top_pct,
                         "formula": f"所属板块5日涨幅排名需位于前 {defaults.buy_sector_rank_top_pct:.0%}",
                     },
+                    {
+                    "field": "amount_gate",
+                    "operator": ">=",
+                    "value": defaults.buy_amount_min,
+                    "formula": f"近3日平均成交额 >= {defaults.buy_amount_min / 100000000:.1f} 亿元",
+                },
                 ],
                 "logic": "all",
             },
@@ -169,6 +184,12 @@ def build_backtest_config_schema() -> dict[str, Any]:
                         "value": defaults.buy_sector_rank_top_pct,
                         "formula": f"所属板块5日涨幅排名需位于前 {defaults.buy_sector_rank_top_pct:.0%}",
                     },
+                    {
+                    "field": "amount_gate",
+                    "operator": ">=",
+                    "value": defaults.buy_amount_min,
+                    "formula": f"近3日平均成交额 >= {defaults.buy_amount_min / 100000000:.1f} 亿元",
+                },
                 ],
                 "logic": "all",
             },
@@ -232,11 +253,34 @@ def build_backtest_config_schema() -> dict[str, Any]:
                 ],
                 "logic": "all",
             },
+            {
+                "id": SELL_RULE_FLIP_LOSS,
+                "label": "盈转亏卖出",
+                "enabled": True,
+                "description": "持仓曾经处于盈利状态，但当前收盘已跌回成本线下方时，直接清仓。",
+                "conditions": [
+                    {"field": "peak_return", "operator": ">", "value": 0.0},
+                    {"field": "position_return", "operator": "<", "value": 0.0},
+                ],
+                "logic": "all",
+            },
+            {
+                "id": SELL_RULE_MARKET_WEAK_DROP,
+                "label": "弱市大跌清仓",
+                "enabled": True,
+                "description": "当市场平均分低于阈值，且个股当日跌幅达到设定值时，直接清仓。",
+                "conditions": [
+                    {"field": "market_avg_score", "operator": "<", "value": defaults.sell_market_score_threshold},
+                    {"field": "pct_change", "operator": "<=", "value": defaults.sell_market_drop_threshold},
+                ],
+                "logic": "all",
+            },
         ],
         "portfolio_rules": {
             "max_positions": defaults.max_positions,
+            "max_single_position": defaults.max_single_position,
             "allocation": "equal_cash_on_new_entries",
-            "description": "按剩余现金 / 新开仓数量等权分配；已持仓不因新信号调仓，只在卖出后补新票。",
+            "description": "按剩余现金 / 新开仓数量等权分配，并受单票仓位上限约束；已持仓不因新信号调仓，只在卖出后补新票。",
             "restrictions": [
                 "不加仓",
                 "不允许同一天重复买卖同一只",
@@ -273,6 +317,7 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "name": "均衡默认模板",
                 "lookback_days": 120,
                 "max_positions": 4,
+                "max_single_position": 0.30,
                 "market_score_filter_min_avg": 41.0,
                 "market_score_filter_min_ma5": 41.0,
                 "enabled_buy_rules": [BUY_RULE_STRICT, BUY_RULE_MOMENTUM],
@@ -281,6 +326,8 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                     SELL_RULE_BREAK_MA5,
                     SELL_RULE_DRAWDOWN,
                     SELL_RULE_TIME_STOP,
+                    SELL_RULE_FLIP_LOSS,
+                    SELL_RULE_MARKET_WEAK_DROP,
                 ],
             },
         },
@@ -293,6 +340,7 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "name": "严格趋势模板",
                 "lookback_days": 120,
                 "max_positions": 3,
+                "max_single_position": 0.30,
                 "market_score_filter_min_avg": 45.0,
                 "market_score_filter_min_ma5": 45.0,
                 "enabled_buy_rules": [BUY_RULE_STRICT],
@@ -301,6 +349,8 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                     SELL_RULE_BREAK_MA5,
                     SELL_RULE_DRAWDOWN,
                     SELL_RULE_TIME_STOP,
+                    SELL_RULE_FLIP_LOSS,
+                    SELL_RULE_MARKET_WEAK_DROP,
                 ],
             },
         },
@@ -313,6 +363,7 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "name": "动量进攻模板",
                 "lookback_days": 120,
                 "max_positions": 4,
+                "max_single_position": 0.30,
                 "market_score_filter_min_avg": 43.0,
                 "market_score_filter_min_ma5": 43.0,
                 "enabled_buy_rules": [BUY_RULE_MOMENTUM],
@@ -321,6 +372,8 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                     SELL_RULE_BREAK_MA5,
                     SELL_RULE_DRAWDOWN,
                     SELL_RULE_TIME_STOP,
+                    SELL_RULE_FLIP_LOSS,
+                    SELL_RULE_MARKET_WEAK_DROP,
                 ],
             },
         },
@@ -333,6 +386,7 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                 "name": "防守低仓模板",
                 "lookback_days": 120,
                 "max_positions": 2,
+                "max_single_position": 0.30,
                 "market_score_filter_min_avg": 46.0,
                 "market_score_filter_min_ma5": 46.0,
                 "enabled_buy_rules": [BUY_RULE_STRICT],
@@ -341,6 +395,8 @@ def build_backtest_templates() -> list[dict[str, Any]]:
                     SELL_RULE_BREAK_MA5,
                     SELL_RULE_DRAWDOWN,
                     SELL_RULE_TIME_STOP,
+                    SELL_RULE_FLIP_LOSS,
+                    SELL_RULE_MARKET_WEAK_DROP,
                 ],
             },
         },

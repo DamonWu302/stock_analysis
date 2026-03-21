@@ -280,6 +280,157 @@ button[disabled] {
     justify-content: flex-end;
     gap: 12px;
     margin: 18px 0 24px;
+    flex-wrap: wrap;
+}
+
+.detail-config-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-bottom: 18px;
+}
+
+.detail-config-panel {
+    overflow: hidden;
+}
+
+.detail-config-summary .card {
+    padding: 18px;
+}
+
+.config-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    width: 100%;
+    padding: 0;
+    background: transparent;
+    color: var(--ink);
+    box-shadow: none;
+    border: 0;
+    text-align: left;
+    margin-bottom: 18px;
+}
+
+.config-toggle span {
+    display: grid;
+    gap: 6px;
+}
+
+.config-toggle strong {
+    font-size: 22px;
+}
+
+.config-toggle small {
+    color: var(--muted);
+    line-height: 1.6;
+}
+
+.config-toggle-arrow {
+    width: 12px;
+    height: 12px;
+    border-right: 2px solid var(--accent);
+    border-bottom: 2px solid var(--accent);
+    transform: rotate(45deg);
+    transition: transform 0.2s ease;
+    flex: 0 0 auto;
+}
+
+.config-toggle.is-expanded .config-toggle-arrow {
+    transform: rotate(225deg);
+}
+
+.detail-config-body {
+    display: grid;
+    gap: 6px;
+    max-height: 0;
+    opacity: 0;
+    overflow: hidden;
+    transition: max-height 0.25s ease, opacity 0.2s ease;
+}
+
+.detail-config-body.is-expanded {
+    max-height: 6000px;
+    opacity: 1;
+}
+
+.rerun-form {
+    display: grid;
+    gap: 6px;
+}
+
+.metric-note {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+}
+
+.metric-cell {
+    min-width: 320px;
+    color: var(--muted);
+    line-height: 1.6;
+    white-space: normal;
+    word-break: break-word;
+}
+
+.compact-table-wrap .data-table {
+    min-width: 980px;
+}
+
+.hover-metric {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    margin-top: 6px;
+}
+
+.hover-metric-trigger {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--accent);
+    background: rgba(180, 83, 9, 0.1);
+    border: 1px solid rgba(180, 83, 9, 0.16);
+    cursor: default;
+    white-space: nowrap;
+}
+
+.hover-metric-card {
+    position: absolute;
+    left: 0;
+    top: calc(100% + 10px);
+    z-index: 20;
+    width: min(360px, 60vw);
+    padding: 12px 14px;
+    border-radius: 16px;
+    background: rgba(31, 41, 51, 0.96);
+    color: #fff7ed;
+    box-shadow: 0 18px 42px rgba(15, 23, 42, 0.28);
+    line-height: 1.7;
+    font-size: 13px;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(6px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    white-space: normal;
+    word-break: break-word;
+}
+
+.hover-metric:hover .hover-metric-card,
+.hover-metric:focus-within .hover-metric-card {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.risk-exit-badge {
+    margin-left: 8px;
+    background: rgba(185, 28, 28, 0.12);
+    color: var(--red);
+    border: 1px solid rgba(185, 28, 28, 0.2);
 }
 
 .compare-form {
@@ -385,8 +536,9 @@ button[disabled] {
 
 .data-table {
     width: 100%;
-    min-width: 820px;
+    min-width: 1040px;
     border-collapse: collapse;
+    table-layout: auto;
 }
 
 .data-table thead th {
@@ -403,6 +555,7 @@ button[disabled] {
     padding: 14px 16px;
     border-bottom: 1px solid rgba(31, 41, 51, 0.06);
     vertical-align: middle;
+    white-space: normal;
 }
 
 .data-table tbody tr:nth-child(even) {

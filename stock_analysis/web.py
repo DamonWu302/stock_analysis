@@ -24,18 +24,72 @@ def create_app() -> Flask:
     chat_service = StockChatService()
 
     def build_backtest_payload(form) -> dict:
+        def parse_int(name: str, default: int) -> int:
+            value = (form.get(name) or "").strip()
+            if value == "":
+                return int(default)
+            return int(value)
+
+        def parse_float(name: str, default: float) -> float:
+            value = (form.get(name) or "").strip()
+            if value == "":
+                return float(default)
+            return float(value)
+
+        def parse_bool(name: str, default: bool = False) -> bool:
+            values = form.getlist(name)
+            if not values:
+                return default
+            value = values[-1]
+            return str(value).strip().lower() in {"1", "true", "on", "yes"}
+
         return {
-            "template_id": int(form.get("template_id", "0") or 0) or None,
+            "template_id": parse_int("template_id", 0) or None,
             "name": (form.get("name") or "").strip() or None,
             "start_date": (form.get("start_date") or "").strip() or None,
             "end_date": (form.get("end_date") or "").strip() or None,
-            "lookback_days": int(form.get("lookback_days", "120") or 120),
-            "max_positions": int(form.get("max_positions", "4") or 4),
-            "initial_capital": float(form.get("initial_capital", "1000000") or 1000000),
-            "fee_rate": float(form.get("fee_rate", "0.001") or 0.001),
-            "slippage_rate": float(form.get("slippage_rate", "0.001") or 0.001),
-            "market_score_filter_min_avg": float(form.get("market_score_filter_min_avg", "41") or 41),
-            "market_score_filter_min_ma5": float(form.get("market_score_filter_min_ma5", "41") or 41),
+            "lookback_days": parse_int("lookback_days", 120),
+            "max_positions": parse_int("max_positions", 4),
+            "max_single_position": parse_float("max_single_position", 0.30),
+            "initial_capital": parse_float("initial_capital", 1000000.0),
+            "fee_rate": parse_float("fee_rate", 0.001),
+            "slippage_rate": parse_float("slippage_rate", 0.001),
+            "market_score_filter_min_avg": parse_float("market_score_filter_min_avg", 41.0),
+            "market_score_filter_min_ma5": parse_float("market_score_filter_min_ma5", 41.0),
+            "market_require_benchmark_above_ma20": parse_bool("market_require_benchmark_above_ma20", True),
+            "market_require_benchmark_ma20_up": parse_bool("market_require_benchmark_ma20_up", False),
+            "buy_strict_score_total": parse_float("buy_strict_score_total", 74.0),
+            "buy_strict_score_ma_trend": parse_float("buy_strict_score_ma_trend", 14.0),
+            "buy_strict_score_breakout": parse_float("buy_strict_score_breakout", 12.0),
+            "buy_strict_score_capital_sector": parse_float("buy_strict_score_capital_sector", 10.0),
+            "buy_strict_score_volume_pattern": parse_float("buy_strict_score_volume_pattern", 14.0),
+            "buy_momentum_score_total": parse_float("buy_momentum_score_total", 68.0),
+            "buy_momentum_score_volume_pattern": parse_float("buy_momentum_score_volume_pattern", 14.0),
+            "buy_min_core_hits": parse_int("buy_min_core_hits", 4),
+            "buy_low_position_high_ratio_max": parse_float("buy_low_position_high_ratio_max", 0.95),
+            "buy_20d_gain_max": parse_float("buy_20d_gain_max", 15.0),
+            "buy_recent_stall_lookback": parse_int("buy_recent_stall_lookback", 3),
+            "buy_recent_stall_pct_max": parse_float("buy_recent_stall_pct_max", 1.0),
+            "buy_recent_stall_volume_multiple": parse_float("buy_recent_stall_volume_multiple", 1.2),
+            "buy_risk_amplitude_max": parse_float("buy_risk_amplitude_max", 0.20),
+            "buy_risk_max_drop_max": parse_float("buy_risk_max_drop_max", 0.12),
+            "buy_sector_rank_top_pct": parse_float("buy_sector_rank_top_pct", 0.50),
+            "buy_amount_min": parse_float("buy_amount_min", 250000000.0),
+            "sell_trim_profit_threshold": parse_float("sell_trim_profit_threshold", 0.08),
+            "sell_trim_fraction": parse_float("sell_trim_fraction", 0.5),
+            "sell_trim_upper_shadow_ratio": parse_float("sell_trim_upper_shadow_ratio", 0.03),
+            "sell_trim_volume_multiple": parse_float("sell_trim_volume_multiple", 1.2),
+            "sell_break_ma5_volume_multiple": parse_float("sell_break_ma5_volume_multiple", 1.0),
+            "sell_drawdown_profit_threshold": parse_float("sell_drawdown_profit_threshold", 0.10),
+            "sell_drawdown_threshold": parse_float("sell_drawdown_threshold", 0.05),
+            "sell_drawdown_profit_threshold_mid": parse_float("sell_drawdown_profit_threshold_mid", 0.18),
+            "sell_drawdown_threshold_mid": parse_float("sell_drawdown_threshold_mid", 0.06),
+            "sell_drawdown_profit_threshold_high": parse_float("sell_drawdown_profit_threshold_high", 0.30),
+            "sell_drawdown_threshold_high": parse_float("sell_drawdown_threshold_high", 0.08),
+            "sell_time_stop_days": parse_int("sell_time_stop_days", 10),
+            "sell_time_stop_return_threshold": parse_float("sell_time_stop_return_threshold", 0.02),
+            "sell_market_score_threshold": parse_float("sell_market_score_threshold", 35.0),
+            "sell_market_drop_threshold": parse_float("sell_market_drop_threshold", -3.0),
             "enabled_buy_rules": form.getlist("enabled_buy_rules"),
             "enabled_sell_rules": form.getlist("enabled_sell_rules"),
         }
@@ -187,6 +241,15 @@ def create_app() -> Flask:
             error=request.args.get("error"),
             export_path=request.args.get("export_path"),
         )
+
+    @app.post("/backtests/<int:run_id>/rerun")
+    def rerun_backtest_form(run_id: int):
+        payload = build_backtest_payload(request.form)
+        try:
+            task_id = service.start_backtest_task(payload)
+        except Exception as exc:
+            return redirect(url_for("backtest_detail_page", run_id=run_id, error=str(exc)))
+        return redirect(url_for("backtest_task_page", task_id=task_id, success="已按当前参数创建重算任务"))
 
     @app.post("/backtests/<int:run_id>/export-md")
     def export_backtest_markdown(run_id: int):

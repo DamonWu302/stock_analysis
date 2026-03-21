@@ -36,7 +36,7 @@
                 <div>
                     <p class="eyebrow">TEMPLATES</p>
                     <h2>回测配置模板</h2>
-                    <p class="subtitle">点击模板会立即覆盖右侧表单。内置模板适合快速开跑，自定义模板适合保存你常用的参数组合。</p>
+                    <p class="subtitle">点击模板会立刻覆盖右侧表单。内置模板适合快速开跑，自定义模板适合保存你常用的参数组合。</p>
                 </div>
 
                 <div class="template-list">
@@ -87,11 +87,13 @@
                         <input type="hidden" name="end_date">
                         <input type="hidden" name="lookback_days">
                         <input type="hidden" name="max_positions">
+                        <input type="hidden" name="max_single_position">
                         <input type="hidden" name="initial_capital">
                         <input type="hidden" name="fee_rate">
                         <input type="hidden" name="slippage_rate">
                         <input type="hidden" name="market_score_filter_min_avg">
                         <input type="hidden" name="market_score_filter_min_ma5">
+                        <input type="hidden" name="buy_amount_min">
                         <div id="template-save-buy-rules"></div>
                         <div id="template-save-sell-rules"></div>
 
@@ -113,11 +115,13 @@
                         <input type="hidden" name="end_date">
                         <input type="hidden" name="lookback_days">
                         <input type="hidden" name="max_positions">
+                        <input type="hidden" name="max_single_position">
                         <input type="hidden" name="initial_capital">
                         <input type="hidden" name="fee_rate">
                         <input type="hidden" name="slippage_rate">
                         <input type="hidden" name="market_score_filter_min_avg">
                         <input type="hidden" name="market_score_filter_min_ma5">
+                        <input type="hidden" name="buy_amount_min">
                         <input type="hidden" name="template_name" value="{{ selected_template.name if selected_template else '' }}">
                         <input type="hidden" name="template_description" value="{{ selected_template.description if selected_template else '' }}">
                         <div id="template-update-buy-rules"></div>
@@ -137,7 +141,7 @@
                 <div>
                     <p class="eyebrow">NEW RUN</p>
                     <h2>发起回测</h2>
-                    <p class="subtitle">“开始日期/结束日期”和“最近交易日数”二选一。填写日期区间时，后端会优先按日期区间执行。</p>
+                    <p class="subtitle">“开始日期 + 结束日期”和“最近交易日数”二选一。填写日期区间时，后端会优先按日期区间执行。</p>
                 </div>
 
                 <label>
@@ -167,6 +171,10 @@
                     <input type="number" id="max-positions" name="max_positions" min="1" max="8" value="{{ defaults.max_positions }}">
                 </label>
                 <label>
+                    单票仓位上限
+                    <input type="number" id="max-single-position" name="max_single_position" min="0.05" max="1" step="0.01" value="{{ defaults.max_single_position or 0.30 }}">
+                </label>
+                <label>
                     初始资金
                     <input type="number" id="initial-capital" name="initial_capital" min="10000" step="10000" value="{{ defaults.initial_capital }}">
                 </label>
@@ -179,12 +187,16 @@
                     <input type="number" id="slippage-rate" name="slippage_rate" min="0" step="0.0001" value="{{ defaults.slippage_rate }}">
                 </label>
                 <label>
-                    平均分过滤阈值
+                    市场平均分过滤阈值
                     <input type="number" id="market-score-filter-min-avg" name="market_score_filter_min_avg" min="0" step="0.1" value="{{ defaults.market_score_filter_min_avg }}">
                 </label>
                 <label>
-                    5日均值过滤阈值
+                    市场 5 日均值过滤阈值
                     <input type="number" id="market-score-filter-min-ma5" name="market_score_filter_min_ma5" min="0" step="0.1" value="{{ defaults.market_score_filter_min_ma5 }}">
+                </label>
+                <label>
+                    买入近3日平均成交额下限
+                    <input type="number" id="buy-amount-min" name="buy_amount_min" min="0" step="10000000" value="{{ defaults.buy_amount_min or 250000000 }}">
                 </label>
 
                 <div class="option-group">
@@ -207,6 +219,15 @@
                     {% endfor %}
                 </div>
 
+                <label>
+                    弱市清仓平均分阈值
+                    <input type="number" id="sell-market-score-threshold" name="sell_market_score_threshold" step="0.1" value="{{ defaults.sell_market_score_threshold or 35 }}">
+                </label>
+                <label>
+                    弱市清仓跌幅阈值（%）
+                    <input type="number" id="sell-market-drop-threshold" name="sell_market_drop_threshold" step="0.1" value="{{ defaults.sell_market_drop_threshold or -3 }}">
+                </label>
+
                 <button type="submit">开始回测</button>
             </form>
         </section>
@@ -215,7 +236,7 @@
             <div class="section-title">
                 <div>
                     <h2>批量参数对比</h2>
-                    <p>基于当前右侧回测配置，只替换一个参数字段，批量跑出多组结果做横向比较。</p>
+                    <p>基于当前右侧回测配置，只替换一个或两个参数字段，批量跑出多组结果做横向比较。</p>
                 </div>
             </div>
             <form id="compare-form" class="compare-form" method="post" action="{{ url_for('create_backtest_compare_task_form') }}">
@@ -225,11 +246,15 @@
                 <input type="hidden" name="end_date">
                 <input type="hidden" name="lookback_days">
                 <input type="hidden" name="max_positions">
+                <input type="hidden" name="max_single_position">
                 <input type="hidden" name="initial_capital">
                 <input type="hidden" name="fee_rate">
                 <input type="hidden" name="slippage_rate">
                 <input type="hidden" name="market_score_filter_min_avg">
                 <input type="hidden" name="market_score_filter_min_ma5">
+                <input type="hidden" name="buy_amount_min">
+                <input type="hidden" name="sell_market_score_threshold">
+                <input type="hidden" name="sell_market_drop_threshold">
                 <div id="compare-buy-rules"></div>
                 <div id="compare-sell-rules"></div>
 
@@ -250,7 +275,7 @@
                     <input type="text" name="compare_values" placeholder="例如：68,72,74,76">
                 </label>
                 <label>
-                    第二参数（可选）
+                    第二参数，可选
                     <select name="compare_parameter_key_secondary">
                         <option value="">不启用第二参数</option>
                         {% for field in schema.compare_fields %}
@@ -259,7 +284,7 @@
                     </select>
                 </label>
                 <label>
-                    第二参数值（可选）
+                    第二参数值，可选
                     <input type="text" name="compare_values_secondary" placeholder="例如：39,41,43">
                 </label>
                 <button type="submit">开始批量对比</button>
@@ -371,10 +396,10 @@
                         <td>#{{ run.id }} {{ run.name }}</td>
                         <td>{{ run.start_date }} ~ {{ run.end_date }}</td>
                         <td>{{ run.status }}</td>
-                        <td>{{ '%.2f'|format((run.summary.total_return if run.summary else 0) * 100) }}%</td>
-                        <td>{{ '%.2f'|format((run.summary.max_drawdown if run.summary else 0) * 100) }}%</td>
-                        <td>{{ run.summary.trade_count if run.summary else 0 }}</td>
-                        <td>{{ run.summary.market_filter_blocked_days if run.summary else 0 }} 天 / {{ run.summary.market_filter_blocked_buy_signals if run.summary else 0 }} 信号</td>
+                        <td>{{ '%.2f'|format(((run.summary or {}).get('total_return', 0)) * 100) }}%</td>
+                        <td>{{ '%.2f'|format(((run.summary or {}).get('max_drawdown', 0)) * 100) }}%</td>
+                        <td>{{ (run.summary or {}).get('trade_count', 0) }}</td>
+                        <td>{{ (run.summary or {}).get('market_filter_blocked_days', 0) }} 天 / {{ (run.summary or {}).get('market_filter_blocked_buy_signals', 0) }} 信号</td>
                         <td><a class="detail-link" href="{{ url_for('backtest_detail_page', run_id=run.id) }}">查看详情</a></td>
                     </tr>
                     {% endfor %}
@@ -419,7 +444,7 @@
             const hasRange = Boolean(startDate.value || endDate.value);
             if (hasRange) {
                 lookbackDays.disabled = true;
-                hint.textContent = '当前模式：按开始/结束日期回测';
+                hint.textContent = '当前模式：按开始日期和结束日期回测';
             } else {
                 lookbackDays.disabled = false;
                 hint.textContent = '当前模式：最近交易日数';
@@ -442,11 +467,15 @@
                 end_date: endDate.value || '',
                 lookback_days: document.getElementById('lookback-days')?.value || '',
                 max_positions: document.getElementById('max-positions')?.value || '',
+                max_single_position: document.getElementById('max-single-position')?.value || '',
                 initial_capital: document.getElementById('initial-capital')?.value || '',
                 fee_rate: document.getElementById('fee-rate')?.value || '',
                 slippage_rate: document.getElementById('slippage-rate')?.value || '',
                 market_score_filter_min_avg: document.getElementById('market-score-filter-min-avg')?.value || '',
                 market_score_filter_min_ma5: document.getElementById('market-score-filter-min-ma5')?.value || '',
+                buy_amount_min: document.getElementById('buy-amount-min')?.value || '',
+                sell_market_score_threshold: document.getElementById('sell-market-score-threshold')?.value || '',
+                sell_market_drop_threshold: document.getElementById('sell-market-drop-threshold')?.value || '',
                 enabled_buy_rules: checkedValues('enabled_buy_rules'),
                 enabled_sell_rules: checkedValues('enabled_sell_rules'),
             };
@@ -459,17 +488,22 @@
                 const node = targetForm.querySelector(`input[name="${name}"]`);
                 if (node) node.value = value ?? '';
             };
+
             setHidden('template_id', payload.template_id);
             setHidden('name', payload.name);
             setHidden('start_date', payload.start_date);
             setHidden('end_date', payload.end_date);
             setHidden('lookback_days', payload.lookback_days);
             setHidden('max_positions', payload.max_positions);
+            setHidden('max_single_position', payload.max_single_position);
             setHidden('initial_capital', payload.initial_capital);
             setHidden('fee_rate', payload.fee_rate);
             setHidden('slippage_rate', payload.slippage_rate);
             setHidden('market_score_filter_min_avg', payload.market_score_filter_min_avg);
             setHidden('market_score_filter_min_ma5', payload.market_score_filter_min_ma5);
+            setHidden('buy_amount_min', payload.buy_amount_min);
+            setHidden('sell_market_score_threshold', payload.sell_market_score_threshold);
+            setHidden('sell_market_drop_threshold', payload.sell_market_drop_threshold);
 
             ['enabled_buy_rules', 'enabled_sell_rules'].forEach((fieldName) => {
                 const prefix = targetForm.id === 'template-save-form'
@@ -506,27 +540,16 @@
 
             if (templateName) templateName.value = name;
             if (templateDescription) templateDescription.value = description;
-
-            if (templateModeBadge) {
-                templateModeBadge.textContent = isBuiltin ? '内置模板' : '自定义模板';
-            }
+            if (templateModeBadge) templateModeBadge.textContent = isBuiltin ? '内置模板' : '自定义模板';
             if (templateNote) {
                 templateNote.textContent = isBuiltin
                     ? '当前是内置模板，支持按当前配置另存为新的自定义模板。'
                     : '当前是自定义模板，可以直接覆盖更新或删除。';
             }
-            if (updateForm) {
-                updateForm.action = `/backtests/templates/${templateId}/update`;
-            }
-            if (deleteForm) {
-                deleteForm.action = `/backtests/templates/${templateId}/delete`;
-            }
-            if (updateButton) {
-                updateButton.disabled = isBuiltin;
-            }
-            if (deleteButton) {
-                deleteButton.disabled = isBuiltin;
-            }
+            if (updateForm) updateForm.action = `/backtests/templates/${templateId}/update`;
+            if (deleteForm) deleteForm.action = `/backtests/templates/${templateId}/delete`;
+            if (updateButton) updateButton.disabled = isBuiltin;
+            if (deleteButton) deleteButton.disabled = isBuiltin;
         };
 
         const applyTemplate = (card) => {
@@ -538,25 +561,32 @@
             } catch (error) {
                 config = {};
             }
+
             if (templateInput) templateInput.value = templateId || '';
             templateCards.forEach((item) => {
                 item.classList.toggle('is-active', item === card);
             });
+
             const setValue = (id, value) => {
                 const node = document.getElementById(id);
                 if (!node) return;
                 node.value = value ?? '';
             };
+
             setValue('name', config.name);
             setValue('start-date', config.start_date);
             setValue('end-date', config.end_date);
             setValue('lookback-days', config.lookback_days);
             setValue('max-positions', config.max_positions);
+            setValue('max-single-position', config.max_single_position);
             setValue('initial-capital', config.initial_capital);
             setValue('fee-rate', config.fee_rate);
             setValue('slippage-rate', config.slippage_rate);
             setValue('market-score-filter-min-avg', config.market_score_filter_min_avg);
             setValue('market-score-filter-min-ma5', config.market_score_filter_min_ma5);
+            setValue('buy-amount-min', config.buy_amount_min);
+            setValue('sell-market-score-threshold', config.sell_market_score_threshold);
+            setValue('sell-market-drop-threshold', config.sell_market_drop_threshold);
             setCheckboxGroup('enabled_buy_rules', config.enabled_buy_rules);
             setCheckboxGroup('enabled_sell_rules', config.enabled_sell_rules);
             setTemplateManagerState(card);

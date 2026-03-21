@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS market_snapshot (
     symbol TEXT NOT NULL,
     name TEXT,
     latest_price REAL,
+    market_cap REAL,
     pct_change REAL,
     volume REAL,
     amount REAL,
@@ -337,6 +338,13 @@ class Database:
                 "incremental_updates": "INTEGER NOT NULL DEFAULT 0",
                 "full_refreshes": "INTEGER NOT NULL DEFAULT 0",
                 "benchmark_cache_mode": "TEXT",
+            },
+        )
+        Database._ensure_columns(
+            conn,
+            "market_snapshot",
+            {
+                "market_cap": "REAL",
             },
         )
         Database._ensure_columns(

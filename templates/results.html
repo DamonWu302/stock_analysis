@@ -111,6 +111,10 @@
                         <span>板块</span>
                         <strong>{{ data.searched_stock.sector }}</strong>
                     </article>
+                    <article class="card">
+                        <span>市值</span>
+                        <strong>{{ data.searched_stock.market_cap_text }}</strong>
+                    </article>
                 </div>
                 <div class="badges">
                     {% for signal in data.searched_stock.signals %}
@@ -152,6 +156,7 @@
                         <th>名称</th>
                         <th>评分</th>
                         <th>现价</th>
+                        <th>市值</th>
                         <th>涨跌幅</th>
                         <th>板块</th>
                         <th>信号</th>
@@ -165,6 +170,7 @@
                         <td>{{ row.name }}</td>
                         <td><strong>{{ row.score }}</strong></td>
                         <td>{{ row.latest_price }}</td>
+                        <td>{{ row.market_cap_text }}</td>
                         <td class="{{ 'up' if row.pct_change >= 0 else 'down' }}">{{ row.pct_change }}%</td>
                         <td>{{ row.sector }}</td>
                         <td>

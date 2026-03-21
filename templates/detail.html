@@ -20,6 +20,7 @@
                 <div class="mini-card"><span>现价</span><strong>{{ detail.latest_price }}</strong></div>
                 <div class="mini-card"><span>涨跌幅</span><strong class="{{ 'up' if detail.pct_change >= 0 else 'down' }}">{{ detail.pct_change }}%</strong></div>
                 <div class="mini-card"><span>板块</span><strong>{{ detail.sector }}</strong></div>
+                <div class="mini-card"><span>市值</span><strong>{{ detail.market_cap_text }}</strong></div>
             </div>
         </section>
 

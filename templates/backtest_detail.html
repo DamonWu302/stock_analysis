@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
+    {% set config = detail.config or {} %}
     <main class="page">
         {% if error %}
         <div class="alert">{{ error }}</div>
@@ -41,6 +42,180 @@
             <form method="post" action="{{ url_for('export_backtest_markdown', run_id=detail.id) }}">
                 <button type="submit" class="button-secondary">保存为 Markdown 文档</button>
             </form>
+        </section>
+
+        <section class="table-wrap detail-config-panel">
+            <button
+                type="button"
+                class="config-toggle"
+                data-config-toggle
+                aria-expanded="false"
+            >
+                <span>
+                    <strong>策略参数与阈值</strong>
+                    <small>查看当前买入、卖出与过滤阈值，并支持按当前参数直接重算。</small>
+                </span>
+                <span class="config-toggle-arrow" aria-hidden="true"></span>
+            </button>
+
+            <div class="detail-config-body" data-config-body>
+                <div class="detail-config-grid detail-config-summary">
+                    <article class="card">
+                        <span>启用买入规则</span>
+                        <strong>{{ (config.enabled_buy_rules or [])|join('、') or '-' }}</strong>
+                    </article>
+                    <article class="card">
+                        <span>启用卖出规则</span>
+                        <strong>{{ (config.enabled_sell_rules or [])|join('、') or '-' }}</strong>
+                    </article>
+                    <article class="card">
+                        <span>市场过滤</span>
+                        <strong>均分 {{ config.market_score_filter_min_avg or '-' }} / 5日 {{ config.market_score_filter_min_ma5 or '-' }}</strong>
+                    </article>
+                    <article class="card">
+                        <span>近3日成交额门槛</span>
+                        <strong>{{ '%.2f'|format((config.buy_amount_min or 0) / 100000000) }} 亿</strong>
+                    </article>
+                    <article class="card">
+                        <span>单票仓位上限</span>
+                        <strong>{{ '%.0f'|format((config.max_single_position or 0.30) * 100) }}%</strong>
+                    </article>
+                </div>
+
+                <form class="rerun-form" method="post" action="{{ url_for('rerun_backtest_form', run_id=detail.id) }}">
+                <input type="hidden" name="template_id" value="{{ config.template_id or '' }}">
+                <div class="detail-config-grid">
+                    <label>
+                        <span>回测名称</span>
+                        <input type="text" name="name" value="{{ config.name or detail.name }}">
+                    </label>
+                    <label>
+                        <span>开始日期</span>
+                        <input type="date" name="start_date" value="{{ config.start_date or detail.start_date }}">
+                    </label>
+                    <label>
+                        <span>结束日期</span>
+                        <input type="date" name="end_date" value="{{ config.end_date or detail.end_date }}">
+                    </label>
+                    <label>
+                        <span>最近交易日数</span>
+                        <input type="number" name="lookback_days" value="{{ config.lookback_days or 120 }}" min="2">
+                    </label>
+                    <label>
+                        <span>最大持仓数</span>
+                        <input type="number" name="max_positions" value="{{ config.max_positions or 4 }}" min="1">
+                    </label>
+                    <label>
+                        <span>单票仓位上限</span>
+                        <input type="number" name="max_single_position" value="{{ config.max_single_position or 0.30 }}" min="0.05" max="1" step="0.01">
+                    </label>
+                    <label>
+                        <span>初始资金</span>
+                        <input type="number" name="initial_capital" value="{{ config.initial_capital or 1000000 }}" min="1000" step="1000">
+                    </label>
+                    <label>
+                        <span>手续费</span>
+                        <input type="number" name="fee_rate" value="{{ config.fee_rate or 0.001 }}" min="0" step="0.0001">
+                    </label>
+                    <label>
+                        <span>滑点</span>
+                        <input type="number" name="slippage_rate" value="{{ config.slippage_rate or 0.001 }}" min="0" step="0.0001">
+                    </label>
+                </div>
+
+                <div class="detail-config-grid">
+                    <div class="option-group">
+                        <strong>市场过滤阈值</strong>
+                        <label><span>平均分过滤阈值</span><input type="number" name="market_score_filter_min_avg" value="{{ config.market_score_filter_min_avg or 35 }}" step="0.1"></label>
+                        <label><span>5日均值过滤阈值</span><input type="number" name="market_score_filter_min_ma5" value="{{ config.market_score_filter_min_ma5 or 35 }}" step="0.1"></label>
+                        <input type="hidden" name="market_require_benchmark_above_ma20" value="0">
+                        <label><span>大盘收盘价需站上 MA20</span><input type="checkbox" name="market_require_benchmark_above_ma20" value="1" {% if config.market_require_benchmark_above_ma20 %}checked{% endif %}></label>
+                        <input type="hidden" name="market_require_benchmark_ma20_up" value="0">
+                        <label><span>大盘 MA20 方向需向上</span><input type="checkbox" name="market_require_benchmark_ma20_up" value="1" {% if config.market_require_benchmark_ma20_up %}checked{% endif %}></label>
+                    </div>
+
+                    <div class="option-group">
+                        <strong>买入规则开关</strong>
+                        <label><span>严格买入</span><input type="checkbox" name="enabled_buy_rules" value="buy_strict" {% if 'buy_strict' in (config.enabled_buy_rules or []) %}checked{% endif %}></label>
+                        <label><span>增强买入</span><input type="checkbox" name="enabled_buy_rules" value="buy_momentum" {% if 'buy_momentum' in (config.enabled_buy_rules or []) %}checked{% endif %}></label>
+                    </div>
+
+                    <div class="option-group">
+                        <strong>卖出规则开关</strong>
+                        <label><span>分级止盈减仓</span><input type="checkbox" name="enabled_sell_rules" value="sell_trim" {% if 'sell_trim' in (config.enabled_sell_rules or []) %}checked{% endif %}></label>
+                        <label><span>跌破 MA5 放量清仓</span><input type="checkbox" name="enabled_sell_rules" value="sell_break_ma5" {% if 'sell_break_ma5' in (config.enabled_sell_rules or []) %}checked{% endif %}></label>
+                        <label><span>高点回撤止损</span><input type="checkbox" name="enabled_sell_rules" value="sell_drawdown" {% if 'sell_drawdown' in (config.enabled_sell_rules or []) %}checked{% endif %}></label>
+                        <label><span>时间止损</span><input type="checkbox" name="enabled_sell_rules" value="sell_time_stop" {% if 'sell_time_stop' in (config.enabled_sell_rules or []) %}checked{% endif %}></label>
+                        <label><span>盈转亏卖出</span><input type="checkbox" name="enabled_sell_rules" value="sell_flip_loss" {% if 'sell_flip_loss' in (config.enabled_sell_rules or []) %}checked{% endif %}></label>
+                        <label><span>弱市大跌清仓</span><input type="checkbox" name="enabled_sell_rules" value="sell_market_weak_drop" {% if 'sell_market_weak_drop' in (config.enabled_sell_rules or []) %}checked{% endif %}></label>
+                    </div>
+                </div>
+
+                <div class="detail-config-grid">
+                    <div class="option-group">
+                        <strong>严格买入阈值</strong>
+                        <label><span>总分阈值</span><input type="number" name="buy_strict_score_total" value="{{ config.buy_strict_score_total or 74 }}" step="0.1"></label>
+                        <label><span>均线多头阈值</span><input type="number" name="buy_strict_score_ma_trend" value="{{ config.buy_strict_score_ma_trend or 14 }}" step="0.1"></label>
+                        <label><span>低位启动突破阈值</span><input type="number" name="buy_strict_score_breakout" value="{{ config.buy_strict_score_breakout or 12 }}" step="0.1"></label>
+                        <label><span>资金流入+板块强势阈值</span><input type="number" name="buy_strict_score_capital_sector" value="{{ config.buy_strict_score_capital_sector or 10 }}" step="0.1"></label>
+                        <label><span>放量上涨+缩量回调阈值</span><input type="number" name="buy_strict_score_volume_pattern" value="{{ config.buy_strict_score_volume_pattern or 14 }}" step="0.1"></label>
+                    </div>
+
+                    <div class="option-group">
+                        <strong>增强买入阈值</strong>
+                        <label><span>总分阈值</span><input type="number" name="buy_momentum_score_total" value="{{ config.buy_momentum_score_total or 68 }}" step="0.1"></label>
+                        <label><span>放量上涨+缩量回调阈值</span><input type="number" name="buy_momentum_score_volume_pattern" value="{{ config.buy_momentum_score_volume_pattern or 14 }}" step="0.1"></label>
+                        <label><span>最少核心命中数</span><input type="number" name="buy_min_core_hits" value="{{ config.buy_min_core_hits or 4 }}" min="1" step="1"></label>
+                        <label><span>买入近3日平均成交额下限</span><input type="number" name="buy_amount_min" value="{{ config.buy_amount_min or 250000000 }}" min="0" step="10000000"></label>
+                    </div>
+
+                    <div class="option-group">
+                        <strong>买入前置过滤</strong>
+                        <label><span>低位限制：收盘 / 前20日高点上限</span><input type="number" name="buy_low_position_high_ratio_max" value="{{ config.buy_low_position_high_ratio_max or 0.95 }}" step="0.01"></label>
+                        <label><span>20日涨幅上限（%）</span><input type="number" name="buy_20d_gain_max" value="{{ config.buy_20d_gain_max or 15 }}" step="0.1"></label>
+                        <label><span>近3日滞涨回看天数</span><input type="number" name="buy_recent_stall_lookback" value="{{ config.buy_recent_stall_lookback or 3 }}" min="1"></label>
+                        <label><span>滞涨涨幅上限（%）</span><input type="number" name="buy_recent_stall_pct_max" value="{{ config.buy_recent_stall_pct_max or 1 }}" step="0.1"></label>
+                        <label><span>滞涨放量倍数</span><input type="number" name="buy_recent_stall_volume_multiple" value="{{ config.buy_recent_stall_volume_multiple or 1.2 }}" step="0.05"></label>
+                        <label><span>5日振幅上限</span><input type="number" name="buy_risk_amplitude_max" value="{{ config.buy_risk_amplitude_max or 0.20 }}" step="0.01"></label>
+                        <label><span>5日最大跌幅上限</span><input type="number" name="buy_risk_max_drop_max" value="{{ config.buy_risk_max_drop_max or 0.12 }}" step="0.01"></label>
+                        <label><span>板块5日涨幅排名前比例</span><input type="number" name="buy_sector_rank_top_pct" value="{{ config.buy_sector_rank_top_pct or 0.50 }}" step="0.01"></label>
+                    </div>
+                </div>
+
+                <div class="detail-config-grid">
+                    <div class="option-group">
+                        <strong>分级止盈减仓</strong>
+                        <label><span>盈利阈值</span><input type="number" name="sell_trim_profit_threshold" value="{{ config.sell_trim_profit_threshold or 0.08 }}" step="0.01"></label>
+                        <label><span>减仓比例</span><input type="number" name="sell_trim_fraction" value="{{ config.sell_trim_fraction or 0.5 }}" step="0.1"></label>
+                        <label><span>长上影比例阈值</span><input type="number" name="sell_trim_upper_shadow_ratio" value="{{ config.sell_trim_upper_shadow_ratio or 0.03 }}" step="0.01"></label>
+                        <label><span>放量倍数阈值</span><input type="number" name="sell_trim_volume_multiple" value="{{ config.sell_trim_volume_multiple or 1.2 }}" step="0.05"></label>
+                    </div>
+
+                    <div class="option-group">
+                        <strong>MA5 清仓与回撤止损</strong>
+                        <label><span>跌破 MA5 放量倍数</span><input type="number" name="sell_break_ma5_volume_multiple" value="{{ config.sell_break_ma5_volume_multiple or 1.0 }}" step="0.05"></label>
+                        <label><span>回撤止盈启动阈值一</span><input type="number" name="sell_drawdown_profit_threshold" value="{{ config.sell_drawdown_profit_threshold or 0.10 }}" step="0.01"></label>
+                        <label><span>回撤阈值一</span><input type="number" name="sell_drawdown_threshold" value="{{ config.sell_drawdown_threshold or 0.05 }}" step="0.01"></label>
+                        <label><span>回撤止盈启动阈值二</span><input type="number" name="sell_drawdown_profit_threshold_mid" value="{{ config.sell_drawdown_profit_threshold_mid or 0.18 }}" step="0.01"></label>
+                        <label><span>回撤阈值二</span><input type="number" name="sell_drawdown_threshold_mid" value="{{ config.sell_drawdown_threshold_mid or 0.06 }}" step="0.01"></label>
+                        <label><span>回撤止盈启动阈值三</span><input type="number" name="sell_drawdown_profit_threshold_high" value="{{ config.sell_drawdown_profit_threshold_high or 0.30 }}" step="0.01"></label>
+                        <label><span>回撤阈值三</span><input type="number" name="sell_drawdown_threshold_high" value="{{ config.sell_drawdown_threshold_high or 0.08 }}" step="0.01"></label>
+                    </div>
+
+                    <div class="option-group">
+                        <strong>时间止损</strong>
+                        <label><span>持仓天数阈值</span><input type="number" name="sell_time_stop_days" value="{{ config.sell_time_stop_days or 10 }}" min="1"></label>
+                        <label><span>累计收益阈值</span><input type="number" name="sell_time_stop_return_threshold" value="{{ config.sell_time_stop_return_threshold or 0.02 }}" step="0.01"></label>
+                        <label><span>弱市平均分阈值</span><input type="number" name="sell_market_score_threshold" value="{{ config.sell_market_score_threshold or 35 }}" step="0.1"></label>
+                        <label><span>弱市清仓跌幅阈值（%）</span><input type="number" name="sell_market_drop_threshold" value="{{ config.sell_market_drop_threshold or -3 }}" step="0.1"></label>
+                    </div>
+                </div>
+
+                <div class="detail-actions">
+                    <button type="submit">按当前参数重新回测</button>
+                </div>
+                </form>
+            </div>
         </section>
 
         <section class="chart-wrap">
@@ -118,6 +293,88 @@
             <p class="summary-block">卖出规则：{{ detail.signal_stats.sell_rule_counts if detail.signal_stats else {} }}</p>
         </section>
 
+        <section class="table-wrap trade-summary-panel">
+            <button
+                type="button"
+                class="config-toggle is-expanded"
+                data-trade-summary-toggle
+                aria-expanded="true"
+            >
+                <span>
+                    <strong>单笔交易汇总</strong>
+                    <small>按完整买入到最后卖出的交易周期汇总，便于查看累计盈亏和卖出后 3 个交易日的表现。</small>
+                </span>
+                <span class="config-toggle-arrow" aria-hidden="true"></span>
+            </button>
+            <div class="detail-config-body is-expanded" data-trade-summary-body>
+            {% if detail.trade_summary_rows %}
+            <div class="data-table-wrap compact-table-wrap">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>代码</th>
+                            <th>买入信号日</th>
+                            <th>买入成交日</th>
+                            <th>买入条件</th>
+                            <th>卖出信号日</th>
+                            <th>卖出成交日</th>
+                            <th>卖出条件</th>
+                            <th>持仓天数</th>
+                            <th>累计盈亏</th>
+                            <th>累计收益率</th>
+                            <th>卖出后3日</th>
+                            <th>卖出后3日盈亏</th>
+                            <th>卖出后3日涨跌幅</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in detail.trade_summary_rows %}
+                        <tr>
+                            <td>{{ row.symbol }}</td>
+                            <td>{{ row.buy_signal_date or '-' }}</td>
+                            <td>{{ row.buy_execution_date or '-' }}</td>
+                            <td>
+                                <div>{{ row.buy_reason_label }}</div>
+                                {% if row.buy_metrics_text and row.buy_metrics_text != '-' %}
+                                <span class="hover-metric">
+                                    <span class="hover-metric-trigger">买入指标</span>
+                                    <span class="hover-metric-card">{{ row.buy_metrics_text }}</span>
+                                </span>
+                                {% endif %}
+                            </td>
+                            <td>{{ row.sell_signal_date or '-' }}</td>
+                            <td>{{ row.sell_execution_date or '-' }}</td>
+                            <td>
+                                <div>
+                                    {{ row.sell_reason_label }}
+                                    {% if '弱市大跌清仓' in (row.sell_reason_label or '') %}
+                                    <span class="badge risk-exit-badge">弱市风控卖出</span>
+                                    {% endif %}
+                                </div>
+                                {% if row.sell_metrics_text and row.sell_metrics_text != '-' %}
+                                <span class="hover-metric">
+                                    <span class="hover-metric-trigger">卖出指标</span>
+                                    <span class="hover-metric-card">{{ row.sell_metrics_text }}</span>
+                                </span>
+                                {% endif %}
+                            </td>
+                            <td>{{ row.holding_days }}</td>
+                            <td class="{% if row.cumulative_pnl > 0 %}profit{% elif row.cumulative_pnl < 0 %}loss{% endif %}">{{ row.cumulative_pnl_text }}</td>
+                            <td class="{% if row.cumulative_return > 0 %}profit{% elif row.cumulative_return < 0 %}loss{% endif %}">{{ row.cumulative_return_text }}</td>
+                            <td>{{ row.sell_plus_3_trade_date or '-' }}</td>
+                            <td class="{% if row.sell_plus_3_pnl is not none and row.sell_plus_3_pnl > 0 %}profit{% elif row.sell_plus_3_pnl is not none and row.sell_plus_3_pnl < 0 %}loss{% endif %}">{{ row.sell_plus_3_pnl_text }}</td>
+                            <td class="{% if row.sell_plus_3_return is not none and row.sell_plus_3_return > 0 %}profit{% elif row.sell_plus_3_return is not none and row.sell_plus_3_return < 0 %}loss{% endif %}">{{ row.sell_plus_3_return_text }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p class="summary-block">当前回测暂无完整平仓的单笔交易记录。</p>
+            {% endif %}
+            </div>
+        </section>
+
         <section class="table-wrap">
             <div class="section-title">
                 <div>
@@ -125,6 +382,7 @@
                     <p class="summary-block">点击下方交易日日历卡片，切换查看当日持仓明细和当日交易记录。</p>
                 </div>
             </div>
+
             {% if detail.position_calendar %}
             <div class="position-calendar-months" data-default-date="{{ detail.position_active_date }}">
                 {% for month in detail.position_calendar_months %}
@@ -315,6 +573,32 @@
         });
 
         activate(calendar.dataset.defaultDate || buttons[0]?.dataset.tradeDate || '');
+    })();
+
+    (() => {
+        const toggle = document.querySelector('[data-config-toggle]');
+        const body = document.querySelector('[data-config-body]');
+        if (!toggle || !body) return;
+        toggle.addEventListener('click', () => {
+            const expanded = toggle.getAttribute('aria-expanded') === 'true';
+            const next = !expanded;
+            toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
+            toggle.classList.toggle('is-expanded', next);
+            body.classList.toggle('is-expanded', next);
+        });
+    })();
+
+    (() => {
+        const toggle = document.querySelector('[data-trade-summary-toggle]');
+        const body = document.querySelector('[data-trade-summary-body]');
+        if (!toggle || !body) return;
+        toggle.addEventListener('click', () => {
+            const expanded = toggle.getAttribute('aria-expanded') === 'true';
+            const next = !expanded;
+            toggle.setAttribute('aria-expanded', next ? 'true' : 'false');
+            toggle.classList.toggle('is-expanded', next);
+            body.classList.toggle('is-expanded', next);
+        });
     })();
     </script>
 </body>

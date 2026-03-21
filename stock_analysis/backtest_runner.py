@@ -11,6 +11,8 @@ from .backtest import (
     DEFAULT_INITIAL_CAPITAL,
     SELL_RULE_BREAK_MA5,
     SELL_RULE_DRAWDOWN,
+    SELL_RULE_FLIP_LOSS,
+    SELL_RULE_MARKET_WEAK_DROP,
     SELL_RULE_TIME_STOP,
     SELL_RULE_TRIM,
     build_backtest_config_schema,
@@ -159,6 +161,10 @@ class BacktestRunner:
         if merged["start_date"] and merged["end_date"] and merged["start_date"] > merged["end_date"]:
             raise ValueError("回测开始日期不能晚于结束日期")
         merged["max_positions"] = max(int(merged.get("max_positions") or defaults["max_positions"]), 1)
+        merged["max_single_position"] = min(
+            max(float(merged.get("max_single_position") or defaults["max_single_position"]), 0.01),
+            1.0,
+        )
         merged["initial_capital"] = float(merged.get("initial_capital") or DEFAULT_INITIAL_CAPITAL)
         merged["fee_rate"] = max(float(merged.get("fee_rate") or defaults["fee_rate"]), 0.0)
         merged["slippage_rate"] = max(float(merged.get("slippage_rate") or defaults["slippage_rate"]), 0.0)
@@ -168,6 +174,7 @@ class BacktestRunner:
         merged["market_score_filter_min_ma5"] = float(
             merged.get("market_score_filter_min_ma5") or defaults["market_score_filter_min_ma5"]
         )
+        merged["buy_amount_min"] = float(merged.get("buy_amount_min") or defaults["buy_amount_min"])
         merged["buy_timing"] = "next_open"
         merged["sell_timing"] = "next_open"
         merged["allow_pyramiding"] = False
@@ -345,7 +352,13 @@ class BacktestRunner:
             available_slots = max(config["max_positions"] - len(positions), 0)
             if buy_orders and available_slots > 0:
                 buy_orders = buy_orders[:available_slots]
+                total_equity = cash
+                for symbol, position in positions.items():
+                    price_row = price_map.get((trade_date, symbol), {})
+                    ref_price = float(price_row.get("open") or price_row.get("close") or position.cost_price)
+                    total_equity += position.shares * ref_price
                 allocation = cash / len(buy_orders) if buy_orders else 0.0
+                allocation_cap = total_equity * float(config["max_single_position"])
                 for order in buy_orders:
                     symbol = str(order["symbol"])
                     price_row = price_map.get((trade_date, symbol))
@@ -359,7 +372,8 @@ class BacktestRunner:
                     open_price = float(price_row["open"])
                     execution_price = round(open_price * (1 + config["slippage_rate"]), 4)
                     per_share_total = execution_price * (1 + config["fee_rate"])
-                    shares = round(allocation / max(per_share_total, 0.01), 4)
+                    order_allocation = min(allocation, allocation_cap, cash)
+                    shares = round(order_allocation / max(per_share_total, 0.01), 4)
                     if shares <= 0:
                         continue
                     gross_amount = round(shares * execution_price, 4)
@@ -461,6 +475,7 @@ class BacktestRunner:
                         position=positions[symbol],
                         current_close=float(row["close"]),
                         hold_days=self._trade_date_distance(trade_dates, positions[symbol].entry_execution_date, trade_date),
+                        market_filter=market_filter,
                         enabled_sell_rules=enabled_sell_rules,
                         config=config,
                     )
@@ -527,7 +542,7 @@ class BacktestRunner:
                             json.dumps(candidate["buy_rule_hits"], ensure_ascii=False),
                             None,
                             candidate["breakout_floor"],
-                            round(1 / config["max_positions"], 6),
+                            round(min(1 / config["max_positions"], float(config["max_single_position"])), 6),
                             "",
                         )
                     )
@@ -671,7 +686,7 @@ class BacktestRunner:
                 SELECT ds.trade_date, ds.symbol, ds.score_total, ds.score_ma_trend, ds.score_volume_pattern,
                        ds.score_capital_sector, ds.score_breakout, ds.score_hold, ds.score_benchmark,
                        df.close, df.ma5, df.ma10, df.ma20, df.atr14, df.prior_20_high, df.cmf21,
-                       df.mfi14, df.vol_ma5, df.pct_change, ph.open, ph.high, ph.low, ph.volume,
+                       df.mfi14, df.vol_ma5, df.pct_change, ph.open, ph.high, ph.low, ph.volume, ph.amount,
                        LAG(ds.score_total) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS prev_score_total,
                        LAG(df.mfi14) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS prev_mfi14,
                        LAG(df.close, 20) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS close_20d_ago,
@@ -679,6 +694,8 @@ class BacktestRunner:
                        LAG(df.pct_change, 2) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS pct_change_lag2,
                        LAG(ph.volume, 1) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS volume_lag1,
                        LAG(ph.volume, 2) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS volume_lag2,
+                       LAG(ph.amount, 1) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS amount_lag1,
+                       LAG(ph.amount, 2) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS amount_lag2,
                        LAG(df.vol_ma5, 1) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS vol_ma5_lag1,
                        LAG(df.vol_ma5, 2) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date) AS vol_ma5_lag2,
                        MAX(ph.high) OVER (PARTITION BY ds.symbol ORDER BY ds.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS risk_high_5d,
@@ -979,6 +996,14 @@ class BacktestRunner:
             return hits
         if float(sector_rank_pct) > float(config["buy_sector_rank_top_pct"]):
             return hits
+        trade_amount = row.get("amount")
+        amount_lag1 = row.get("amount_lag1")
+        amount_lag2 = row.get("amount_lag2")
+        if trade_amount is None or amount_lag1 is None or amount_lag2 is None:
+            return hits
+        amount_3d_avg = (float(trade_amount) + float(amount_lag1) + float(amount_lag2)) / 3.0
+        if amount_3d_avg < float(config["buy_amount_min"]):
+            return hits
 
         if BUY_RULE_STRICT in enabled_buy_rules:
             if (
@@ -1040,6 +1065,7 @@ class BacktestRunner:
         position: Position,
         current_close: float,
         hold_days: int,
+        market_filter: dict[str, Any],
         enabled_sell_rules: set[str],
         config: dict[str, Any],
     ) -> dict[str, Any] | None:
@@ -1050,11 +1076,18 @@ class BacktestRunner:
         current_hold_days = max(int(hold_days), 0)
         ma10 = row.get("ma10")
         ma20 = row.get("ma20")
+        pct_change = float(row.get("pct_change") or 0.0)
+        market_avg_score = float(market_filter.get("avg_score") or 0.0)
 
         drawdown_from_peak = 0.0
         if position.peak_close > 0:
             drawdown_from_peak = (float(position.peak_close) - current_close) / float(position.peak_close)
         peak_return = (float(position.peak_close) - position.cost_price) / max(position.cost_price, 0.01)
+        is_flip_loss = (
+            SELL_RULE_FLIP_LOSS in enabled_sell_rules
+            and peak_return > 0
+            and position_return < 0
+        )
 
         is_break_ma5 = (
             SELL_RULE_BREAK_MA5 in enabled_sell_rules
@@ -1078,7 +1111,12 @@ class BacktestRunner:
             and ma20 is not None
             and current_close <= float(ma20)
         )
-        if is_drawdown_stop or is_break_ma5 or is_time_stop:
+        is_market_weak_drop = (
+            SELL_RULE_MARKET_WEAK_DROP in enabled_sell_rules
+            and market_avg_score < float(config["sell_market_score_threshold"])
+            and pct_change <= float(config["sell_market_drop_threshold"])
+        )
+        if is_drawdown_stop or is_break_ma5 or is_time_stop or is_flip_loss or is_market_weak_drop:
             rule_hits: list[str] = []
             if is_drawdown_stop:
                 rule_hits.append(SELL_RULE_DRAWDOWN)
@@ -1086,6 +1124,10 @@ class BacktestRunner:
                 rule_hits.append(SELL_RULE_BREAK_MA5)
             if is_time_stop:
                 rule_hits.append(SELL_RULE_TIME_STOP)
+            if is_flip_loss:
+                rule_hits.append(SELL_RULE_FLIP_LOSS)
+            if is_market_weak_drop:
+                rule_hits.append(SELL_RULE_MARKET_WEAK_DROP)
             return {"fraction": 1.0, "rule_hits": rule_hits}
 
         if SELL_RULE_TRIM not in enabled_sell_rules or position.trimmed:

@@ -10,6 +10,7 @@ import threading
 import time
 
 import pandas as pd
+import requests
 
 from .analyzer import (
     AnalysisResult,
@@ -186,6 +187,7 @@ class StockAnalysisService:
                 benchmark_cache_mode=cache_stats.benchmark_cache_mode,
             )
         enriched_snapshot = self._enrich_sector_metrics(enriched_snapshot)
+        enriched_snapshot = self._enrich_market_caps(enriched_snapshot)
         results, daily_factors, daily_scores = self._build_daily_outputs(enriched_snapshot, history_cache, benchmark)
         results.sort(key=lambda item: (item.score, item.pct_change), reverse=True)
         top_results = results[: settings.top_n]
@@ -249,7 +251,7 @@ class StockAnalysisService:
             ).fetchone()
             rows = conn.execute(
                 """
-                SELECT ds.symbol, ms.name, ds.score_total AS score, ms.latest_price, ms.pct_change, ms.sector,
+                SELECT ds.symbol, ms.name, ds.score_total AS score, ms.latest_price, ms.market_cap, ms.pct_change, ms.sector,
                        ds.summary, ds.signals, ds.score_breakdown, ds.score_source, ds.review_updated_at
                 FROM daily_score ds
                 LEFT JOIN market_snapshot ms
@@ -265,6 +267,7 @@ class StockAnalysisService:
             payload = dict(row)
             payload["signals"] = json.loads(payload["signals"])
             payload["score_breakdown"] = json.loads(payload["score_breakdown"]) if payload.get("score_breakdown") else []
+            payload["market_cap_text"] = self._format_market_cap(payload.get("market_cap"))
             results.append(payload)
 
         return {
@@ -504,6 +507,8 @@ class StockAnalysisService:
             trade["side_label"] = self._label_trade_side(str(trade.get("side") or ""))
             trade["reason_label"] = self._label_trade_reason(str(trade.get("reason") or ""))
         self._attach_backtest_trade_returns(detail)
+        self._build_backtest_trade_summary(detail)
+        self._attach_backtest_trade_signal_metrics(detail)
         self._attach_backtest_daily_pnl(detail)
         self._decorate_backtest_positions(detail)
         self._group_backtest_trades(detail)
@@ -1021,7 +1026,7 @@ class StockAnalysisService:
             ).fetchall()
             snapshot_row = conn.execute(
                 """
-                SELECT trade_date, symbol, name, latest_price, pct_change, volume, amount, sector,
+                SELECT trade_date, symbol, name, latest_price, market_cap, pct_change, volume, amount, sector,
                        sector_change, sector_up_ratio, main_net_inflow, main_net_inflow_ratio
                 FROM market_snapshot
                 WHERE trade_date = (SELECT MAX(trade_date) FROM market_snapshot)
@@ -1088,6 +1093,8 @@ class StockAnalysisService:
         detail["sector_members"] = [dict(row) for row in sector_rows]
         detail["history_count"] = len(detail["history"])
         detail["benchmark_count"] = len(detail["benchmark_history"])
+        market_cap = detail.get("market_cap")
+        detail["market_cap_text"] = self._format_market_cap(market_cap)
         return detail
 
     def lookup_stock_score(self, symbol: str) -> dict | None:
@@ -1103,7 +1110,7 @@ class StockAnalysisService:
                 return None
             row = conn.execute(
                 """
-                SELECT ds.symbol, ms.name, ds.score_total AS score, ms.latest_price, ms.pct_change, ms.sector,
+                SELECT ds.symbol, ms.name, ds.score_total AS score, ms.latest_price, ms.market_cap, ms.pct_change, ms.sector,
                        ds.summary, ds.signals, ds.score_breakdown, ds.score_source, ds.review_updated_at
                 FROM daily_score ds
                 LEFT JOIN market_snapshot ms
@@ -1118,6 +1125,7 @@ class StockAnalysisService:
         payload = dict(row)
         payload["signals"] = json.loads(payload["signals"]) if payload.get("signals") else []
         payload["score_breakdown"] = json.loads(payload["score_breakdown"]) if payload.get("score_breakdown") else []
+        payload["market_cap_text"] = self._format_market_cap(payload.get("market_cap"))
         return payload
 
     def apply_review_score(self, symbol: str, proposal: dict) -> dict | None:
@@ -1270,6 +1278,8 @@ class StockAnalysisService:
             "sell_break_ma5": "跌破MA5放量清仓",
             "sell_drawdown": "高点回撤止损",
             "sell_time_stop": "时间止损",
+            "sell_flip_loss": "盈转亏卖出",
+            "sell_market_weak_drop": "弱市大跌清仓",
         }
         parts = [labels.get(item.strip(), item.strip()) for item in reason.split(",") if item.strip()]
         return "、".join(parts) if parts else reason
@@ -1285,6 +1295,20 @@ class StockAnalysisService:
         if value is None:
             return "-"
         return f"{value:.2f}"
+
+    @staticmethod
+    def _format_market_cap(value: float | None) -> str:
+        if value in (None, ""):
+            return "-"
+        try:
+            market_cap = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        if market_cap >= 100000000:
+            return f"{market_cap / 100000000:.2f} 亿"
+        if market_cap >= 10000:
+            return f"{market_cap / 10000:.2f} 万"
+        return f"{market_cap:.2f}"
 
     def _attach_backtest_trade_returns(self, detail: dict) -> None:
         trades = detail.get("trades") or []
@@ -1335,6 +1359,436 @@ class StockAnalysisService:
                 entry["return_rate"] = return_rate
                 entry["return_text"] = f"{self._format_percent(return_rate)} (未实现)"
                 entry["pnl_text"] = f"{self._format_amount(pnl_amount)} (未实现)"
+
+    def _build_backtest_trade_summary(self, detail: dict) -> None:
+        trades = sorted(
+            detail.get("trades") or [],
+            key=lambda item: (str(item.get("execution_date") or ""), int(item.get("id") or 0)),
+        )
+        detail["trade_summary_rows"] = []
+        if not trades:
+            return
+
+        symbols = sorted({str(item.get("symbol") or "") for item in trades if item.get("symbol")})
+        execution_dates = [str(item.get("execution_date") or "") for item in trades if item.get("execution_date")]
+        if not symbols or not execution_dates:
+            return
+
+        close_series = self._load_trade_summary_close_series(symbols, min(execution_dates))
+        open_entries: dict[str, list[dict]] = {}
+        summary_rows: list[dict] = []
+
+        for trade in trades:
+            symbol = str(trade.get("symbol") or "")
+            side = str(trade.get("side") or "")
+            shares = float(trade.get("shares") or 0.0)
+            if not symbol or shares <= 0:
+                continue
+
+            if side == "buy":
+                open_entries.setdefault(symbol, []).append(
+                    {
+                        "symbol": symbol,
+                        "buy_trade_id": int(trade.get("id") or 0),
+                        "buy_signal_date": str(trade.get("signal_trade_date") or ""),
+                        "buy_execution_date": str(trade.get("execution_date") or ""),
+                        "buy_reason": str(trade.get("reason") or ""),
+                        "buy_reason_label": self._preferred_trade_reason_label(
+                            str(trade.get("reason") or ""),
+                            str(trade.get("reason_label") or ""),
+                        ),
+                        "buy_shares": shares,
+                        "buy_cost_total": float(trade.get("net_amount") or 0.0),
+                        "remaining_shares": shares,
+                        "remaining_cost": float(trade.get("net_amount") or 0.0),
+                        "realized_pnl": 0.0,
+                        "sell_reasons": [],
+                        "sell_reason_labels": [],
+                        "sell_signal_dates": [],
+                        "sell_execution_dates": [],
+                        "last_sell_price": None,
+                        "final_exit_shares": 0.0,
+                    }
+                )
+                continue
+
+            entry_queue = open_entries.get(symbol) or []
+            if not entry_queue:
+                continue
+
+            total_sell_shares = shares
+            total_sell_net = float(trade.get("net_amount") or 0.0)
+            remaining_sell_shares = total_sell_shares
+            sell_signal_date = str(trade.get("signal_trade_date") or "")
+            sell_execution_date = str(trade.get("execution_date") or "")
+            sell_reason = str(trade.get("reason") or "")
+            sell_reason_label = self._preferred_trade_reason_label(
+                sell_reason,
+                str(trade.get("reason_label") or ""),
+            )
+            sell_price = float(trade.get("price") or 0.0)
+
+            while remaining_sell_shares > 1e-8 and entry_queue:
+                entry = entry_queue[0]
+                entry_remaining_shares = float(entry.get("remaining_shares") or 0.0)
+                if entry_remaining_shares <= 1e-8:
+                    entry_queue.pop(0)
+                    continue
+
+                matched_shares = min(entry_remaining_shares, remaining_sell_shares)
+                cost_portion = float(entry.get("remaining_cost") or 0.0) * (matched_shares / entry_remaining_shares)
+                sell_net_portion = total_sell_net * (matched_shares / total_sell_shares)
+                pnl_amount = sell_net_portion - cost_portion
+
+                entry["remaining_shares"] = round(entry_remaining_shares - matched_shares, 6)
+                entry["remaining_cost"] = round(max(float(entry.get("remaining_cost") or 0.0) - cost_portion, 0.0), 6)
+                entry["realized_pnl"] = round(float(entry.get("realized_pnl") or 0.0) + pnl_amount, 4)
+                entry["last_sell_price"] = sell_price
+                entry["final_exit_shares"] = matched_shares
+                self._append_unique(entry["sell_reasons"], sell_reason)
+                self._append_unique(entry["sell_reason_labels"], sell_reason_label)
+                self._append_unique(entry["sell_signal_dates"], sell_signal_date)
+                self._append_unique(entry["sell_execution_dates"], sell_execution_date)
+
+                remaining_sell_shares = round(remaining_sell_shares - matched_shares, 6)
+
+                if entry["remaining_shares"] <= 1e-8:
+                    entry_queue.pop(0)
+                    summary_rows.append(self._finalize_trade_summary_row(entry, close_series))
+
+        detail["trade_summary_rows"] = summary_rows
+
+    def _attach_backtest_trade_signal_metrics(self, detail: dict) -> None:
+        rows = detail.get("trade_summary_rows") or []
+        if not rows:
+            return
+
+        signal_map: dict[tuple[str, str, str], dict] = {}
+        for signal in detail.get("signals") or []:
+            key = (
+                str(signal.get("trade_date") or ""),
+                str(signal.get("symbol") or ""),
+                str(signal.get("action") or ""),
+            )
+            signal_map[key] = signal
+
+        keys: set[tuple[str, str]] = set()
+        date_ranges: dict[str, tuple[str, str]] = {}
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            buy_date = str(row.get("buy_signal_date") or "")
+            sell_date = str(row.get("sell_signal_date") or "")
+            if symbol and buy_date:
+                keys.add((buy_date, symbol))
+            if symbol and sell_date:
+                keys.add((sell_date, symbol))
+            if symbol and buy_date:
+                range_start = row.get("buy_execution_date") or buy_date
+                range_end = sell_date or row.get("sell_execution_date") or buy_date
+                if range_end and range_start and range_end < range_start:
+                    range_start, range_end = range_end, range_start
+                if range_start and range_end:
+                    existing = date_ranges.get(symbol)
+                    if existing:
+                        date_ranges[symbol] = (min(existing[0], range_start), max(existing[1], range_end))
+                    else:
+                        date_ranges[symbol] = (range_start, range_end)
+
+        snapshot_map = self._load_backtest_signal_snapshots(keys)
+        close_series = self._load_trade_summary_close_series(
+            sorted(date_ranges.keys()),
+            min((value[0] for value in date_ranges.values()), default=""),
+        )
+
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            buy_date = str(row.get("buy_signal_date") or "")
+            sell_date = str(row.get("sell_signal_date") or "")
+            buy_snapshot = snapshot_map.get((buy_date, symbol), {})
+            sell_snapshot = snapshot_map.get((sell_date, symbol), {})
+            buy_signal = signal_map.get((buy_date, symbol, "buy"), {})
+            sell_signal = signal_map.get((sell_date, symbol, "sell"), {})
+
+            row["buy_rule_hits_label"] = self._preferred_trade_reason_label(
+                ",".join(buy_signal.get("buy_rule_hits") or []),
+                "",
+            )
+            row["sell_rule_hits_label"] = self._preferred_trade_reason_label(
+                ",".join(sell_signal.get("sell_rule_hits") or []),
+                "",
+            )
+            row["buy_metrics_text"] = self._build_buy_metric_summary(buy_snapshot)
+            row["sell_metrics_text"] = self._build_sell_metric_summary(
+                row=row,
+                snapshot=sell_snapshot,
+                close_rows=close_series.get(symbol) or [],
+            )
+
+    def _load_backtest_signal_snapshots(self, keys: set[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        if not keys:
+            return {}
+        dates = sorted({trade_date for trade_date, _ in keys if trade_date})
+        symbols = sorted({symbol for _, symbol in keys if symbol})
+        if not dates or not symbols:
+            return {}
+        date_placeholders = ",".join("?" for _ in dates)
+        symbol_placeholders = ",".join("?" for _ in symbols)
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT ds.trade_date,
+                       ds.symbol,
+                       ds.score_total,
+                       ds.score_ma_trend,
+                       ds.score_volume_pattern,
+                       ds.score_capital_sector,
+                       ds.score_breakout,
+                       ds.score_hold,
+                       ds.score_benchmark,
+                       df.ma5,
+                       df.ma10,
+                       df.ma20,
+                       df.vol_ma5,
+                       df.cmf21,
+                       df.mfi14,
+                       df.prior_20_high,
+                       df.atr14,
+                       df.sector_change,
+                       df.sector_up_ratio,
+                       df.benchmark_close,
+                       df.benchmark_ma20,
+                       df.benchmark_prev_ma20,
+                       ph.open,
+                       ph.high,
+                       ph.low,
+                       ph.close,
+                       ph.volume,
+                       ph.amount
+                FROM daily_score ds
+                LEFT JOIN daily_factor df
+                  ON df.trade_date = ds.trade_date AND df.symbol = ds.symbol
+                LEFT JOIN price_history ph
+                  ON ph.trade_date = ds.trade_date AND ph.symbol = ds.symbol
+                WHERE ds.trade_date IN ({date_placeholders})
+                  AND ds.symbol IN ({symbol_placeholders})
+                """,
+                [*dates, *symbols],
+            ).fetchall()
+        payload: dict[tuple[str, str], dict] = {}
+        for raw in rows:
+            row = dict(raw)
+            payload[(str(row.get("trade_date") or ""), str(row.get("symbol") or ""))] = row
+        return payload
+
+    def _build_buy_metric_summary(self, snapshot: dict) -> str:
+        if not snapshot:
+            return "-"
+        parts = [
+            f"总分 {self._fmt_num(snapshot.get('score_total'), 1)}",
+            f"均线 {self._fmt_num(snapshot.get('score_ma_trend'), 1)}",
+            f"量价 {self._fmt_num(snapshot.get('score_volume_pattern'), 1)}",
+            f"资金板块 {self._fmt_num(snapshot.get('score_capital_sector'), 1)}",
+            f"突破 {self._fmt_num(snapshot.get('score_breakout'), 1)}",
+            f"CMF {self._fmt_num(snapshot.get('cmf21'), 3)}",
+            f"MFI {self._fmt_num(snapshot.get('mfi14'), 1)}",
+            f"当日成交额 {self._format_hundred_million(snapshot.get('amount'))}",
+        ]
+        sector_up_ratio = snapshot.get("sector_up_ratio")
+        if sector_up_ratio is not None:
+            parts.append(f"板块上涨占比 {float(sector_up_ratio) * 100:.1f}%")
+        benchmark_close = snapshot.get("benchmark_close")
+        benchmark_ma20 = snapshot.get("benchmark_ma20")
+        if benchmark_close not in (None, "") and benchmark_ma20 not in (None, "", 0):
+            above = float(benchmark_close) > float(benchmark_ma20)
+            parts.append(f"大盘站上MA20 {'是' if above else '否'}")
+        return "｜".join(parts)
+
+    def _build_sell_metric_summary(self, row: dict, snapshot: dict, close_rows: list[dict]) -> str:
+        if not snapshot:
+            return "-"
+        close_price = float(snapshot.get("close") or 0.0)
+        ma5 = float(snapshot.get("ma5") or 0.0) if snapshot.get("ma5") not in (None, "") else None
+        ma20 = float(snapshot.get("ma20") or 0.0) if snapshot.get("ma20") not in (None, "") else None
+        volume = float(snapshot.get("volume") or 0.0)
+        vol_ma5 = float(snapshot.get("vol_ma5") or 0.0) if snapshot.get("vol_ma5") not in (None, "") else None
+        high = float(snapshot.get("high") or 0.0)
+        open_price = float(snapshot.get("open") or 0.0)
+        upper_shadow_ratio = 0.0
+        if close_price > 0 and high > 0:
+            upper_shadow_ratio = max(high - max(open_price, close_price), 0.0) / close_price
+
+        buy_price = 0.0
+        buy_shares = float(row.get("buy_shares") or 0.0)
+        buy_cost_total = float(row.get("buy_cost_total") or 0.0)
+        if buy_shares > 0:
+            buy_price = buy_cost_total / buy_shares
+        position_return = (close_price / buy_price - 1.0) if buy_price > 0 and close_price > 0 else None
+
+        peak_close = None
+        buy_execution_date = str(row.get("buy_execution_date") or "")
+        sell_signal_date = str(row.get("sell_signal_date") or "")
+        if buy_execution_date and sell_signal_date and close_rows:
+            for item in close_rows:
+                trade_date = str(item.get("trade_date") or "")
+                if buy_execution_date <= trade_date <= sell_signal_date:
+                    close_val = item.get("close")
+                    if close_val is None:
+                        continue
+                    peak_close = max(float(close_val), peak_close or float(close_val))
+        peak_return = (peak_close / buy_price - 1.0) if peak_close and buy_price > 0 else None
+        drawdown = ((peak_close - close_price) / peak_close) if peak_close and close_price > 0 else None
+
+        parts = []
+        if ma5 and close_price > 0:
+            parts.append(f"收盘/MA5 {close_price / ma5:.3f}")
+        if ma20 and close_price > 0:
+            parts.append(f"收盘/MA20 {close_price / ma20:.3f}")
+        if vol_ma5 and vol_ma5 > 0:
+            parts.append(f"量比 {volume / vol_ma5:.2f}")
+        parts.append(f"上影 {upper_shadow_ratio * 100:.1f}%")
+        parts.append(f"持仓 {int(row.get('holding_days') or 0)} 天")
+        if position_return is not None:
+            parts.append(f"收益 {self._format_percent(position_return)}")
+        if peak_return is not None:
+            parts.append(f"峰值 {self._format_percent(peak_return)}")
+        if drawdown is not None:
+            parts.append(f"回撤 {self._format_percent(drawdown)}")
+        return "｜".join(parts) if parts else "-"
+
+    def _finalize_trade_summary_row(self, entry: dict, close_series: dict[str, list[dict]]) -> dict:
+        symbol = str(entry.get("symbol") or "")
+        buy_cost_total = float(entry.get("buy_cost_total") or 0.0)
+        realized_pnl = round(float(entry.get("realized_pnl") or 0.0), 4)
+        cumulative_return = round(realized_pnl / buy_cost_total, 6) if buy_cost_total else 0.0
+        buy_execution_date = str(entry.get("buy_execution_date") or "")
+        sell_execution_dates = entry.get("sell_execution_dates") or []
+        sell_execution_date = str(sell_execution_dates[-1] if sell_execution_dates else "")
+        sell_plus_3 = self._resolve_sell_plus_3(close_series, symbol, sell_execution_date)
+
+        post_sell_return = None
+        post_sell_pnl = None
+        last_sell_price = float(entry.get("last_sell_price") or 0.0)
+        final_exit_shares = float(entry.get("final_exit_shares") or 0.0)
+        if sell_plus_3 and last_sell_price > 0:
+            future_close = float(sell_plus_3.get("close") or 0.0)
+            post_sell_return = round(future_close / last_sell_price - 1.0, 6)
+            post_sell_pnl = round((future_close - last_sell_price) * final_exit_shares, 4)
+
+        holding_days = 0
+        if buy_execution_date and sell_execution_date:
+            try:
+                holding_days = max(
+                    (datetime.fromisoformat(sell_execution_date) - datetime.fromisoformat(buy_execution_date)).days,
+                    0,
+                )
+            except ValueError:
+                holding_days = 0
+
+        return {
+            "symbol": symbol,
+            "buy_signal_date": str(entry.get("buy_signal_date") or ""),
+            "buy_execution_date": buy_execution_date,
+            "buy_reason_label": str(entry.get("buy_reason_label") or "-"),
+            "buy_cost_total": buy_cost_total,
+            "sell_signal_date": str((entry.get("sell_signal_dates") or [""])[-1] or ""),
+            "sell_execution_date": sell_execution_date,
+            "sell_reason_label": "、".join(entry.get("sell_reason_labels") or []) or "-",
+            "holding_days": holding_days,
+            "buy_shares": round(float(entry.get("buy_shares") or 0.0), 4),
+            "cumulative_pnl": realized_pnl,
+            "cumulative_pnl_text": self._format_amount(realized_pnl),
+            "cumulative_return": cumulative_return,
+            "cumulative_return_text": self._format_percent(cumulative_return),
+            "sell_plus_3_trade_date": str(sell_plus_3.get("trade_date") or "") if sell_plus_3 else "",
+            "sell_plus_3_pnl": post_sell_pnl,
+            "sell_plus_3_pnl_text": self._format_amount(post_sell_pnl),
+            "sell_plus_3_return": post_sell_return,
+            "sell_plus_3_return_text": self._format_percent(post_sell_return),
+        }
+
+    def _load_trade_summary_close_series(self, symbols: list[str], start_date: str) -> dict[str, list[dict]]:
+        if not symbols or not start_date:
+            return {}
+        placeholders = ",".join("?" for _ in symbols)
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT symbol, trade_date, close
+                FROM price_history
+                WHERE symbol IN ({placeholders}) AND trade_date >= ?
+                ORDER BY symbol ASC, trade_date ASC
+                """,
+                [*symbols, start_date],
+            ).fetchall()
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["symbol"]), []).append(
+                {
+                    "trade_date": str(row["trade_date"]),
+                    "close": float(row["close"]) if row["close"] is not None else None,
+                }
+            )
+        return grouped
+
+    @staticmethod
+    def _resolve_sell_plus_3(close_series: dict[str, list[dict]], symbol: str, sell_execution_date: str) -> dict | None:
+        rows = close_series.get(symbol) or []
+        if not rows or not sell_execution_date:
+            return None
+        for index, row in enumerate(rows):
+            if str(row.get("trade_date") or "") != sell_execution_date:
+                continue
+            target_index = index + 3
+            if target_index >= len(rows):
+                return None
+            return rows[target_index]
+        return None
+
+    @staticmethod
+    def _append_unique(items: list[str], value: str) -> None:
+        normalized = str(value or "").strip()
+        if normalized and normalized not in items:
+            items.append(normalized)
+
+    def _preferred_trade_reason_label(self, reason: str, existing_label: str) -> str:
+        normalized_reason = str(reason or "").strip()
+        normalized_label = str(existing_label or "").strip()
+        fallback = {
+            "buy_strict": "提前型严格买入",
+            "buy_momentum": "提前型增强买入",
+            "sell_trim": "分级止盈减仓",
+            "sell_break_ma5": "跌破MA5放量清仓",
+            "sell_drawdown": "高点回撤止损",
+            "sell_time_stop": "时间止损",
+            "sell_flip_loss": "盈转亏卖出",
+            "sell_market_weak_drop": "弱市大跌清仓",
+            "sell_stale": "新鲜度失效",
+            "sell_capital": "资金撤退",
+            "sell_trend": "趋势转弱",
+            "sell_stop": "硬止损",
+        }
+        if normalized_label and normalized_label != normalized_reason:
+            return normalized_label
+        parts = [fallback.get(item.strip(), item.strip()) for item in normalized_reason.split(",") if item.strip()]
+        return "、".join(parts) if parts else (normalized_label or normalized_reason or "-")
+
+    @staticmethod
+    def _fmt_num(value: float | None, digits: int = 2) -> str:
+        if value in (None, ""):
+            return "-"
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return "-"
+
+    @staticmethod
+    def _format_hundred_million(value: float | None) -> str:
+        if value in (None, ""):
+            return "-"
+        try:
+            return f"{float(value) / 100000000:.2f}亿"
+        except (TypeError, ValueError):
+            return "-"
 
     @staticmethod
     def _decorate_backtest_positions(detail: dict) -> None:
@@ -2362,6 +2816,7 @@ class StockAnalysisService:
             "symbol",
             "name",
             "latest_price",
+            "market_cap",
             "pct_change",
             "volume",
             "amount",
@@ -2376,9 +2831,9 @@ class StockAnalysisService:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO market_snapshot
-                (trade_date, symbol, name, latest_price, pct_change, volume, amount, sector,
+                (trade_date, symbol, name, latest_price, market_cap, pct_change, volume, amount, sector,
                  sector_change, sector_up_ratio, main_net_inflow, main_net_inflow_ratio)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -2386,6 +2841,7 @@ class StockAnalysisService:
                         row["symbol"],
                         row["name"],
                         row["latest_price"],
+                        row["market_cap"],
                         row["pct_change"],
                         row["volume"],
                         row["amount"],
@@ -2497,6 +2953,112 @@ class StockAnalysisService:
             .reset_index()
         )
         return frame.drop(columns=["sector_change", "sector_up_ratio"], errors="ignore").merge(sector_stats, on="sector", how="left")
+
+    def _enrich_market_caps(self, snapshot: pd.DataFrame) -> pd.DataFrame:
+        if snapshot.empty:
+            return snapshot
+        frame = snapshot.copy()
+        if "market_cap" not in frame.columns:
+            frame["market_cap"] = None
+        missing_symbols = [
+            str(symbol)
+            for symbol in frame.loc[frame["market_cap"].isna(), "symbol"].astype(str).tolist()
+            if symbol
+        ]
+        if not missing_symbols:
+            return frame
+        market_cap_map = self._fetch_market_cap_map(missing_symbols)
+        if not market_cap_map:
+            return frame
+        frame["market_cap"] = frame.apply(
+            lambda row: market_cap_map.get(str(row["symbol"]), row.get("market_cap")),
+            axis=1,
+        )
+        return frame
+
+    def _fetch_market_cap_map(self, symbols: list[str]) -> dict[str, float]:
+        wanted = {str(symbol) for symbol in symbols if symbol}
+        if not wanted:
+            return {}
+        session = requests.Session()
+        session.trust_env = not settings.disable_system_proxy
+        url = "https://82.push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pz": 2000,
+            "po": 1,
+            "np": 1,
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f12",
+            "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+            "fields": "f12,f20",
+        }
+        market_cap_map: dict[str, float] = {}
+        for page in range(1, 6):
+            try:
+                response = session.get(
+                    url,
+                    params={**params, "pn": page},
+                    timeout=15,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except Exception:
+                break
+            rows = (((payload or {}).get("data") or {}).get("diff") or [])
+            if not rows:
+                break
+            for row in rows:
+                code = str(row.get("f12") or "")
+                if code not in wanted:
+                    continue
+                market_cap = row.get("f20")
+                if market_cap is None:
+                    continue
+                market_cap_map[code] = float(market_cap)
+            if wanted.issubset(market_cap_map.keys()):
+                break
+        missing = wanted.difference(market_cap_map.keys())
+        for symbol in missing:
+            market_cap = self._fetch_single_market_cap(symbol, session)
+            if market_cap is not None:
+                market_cap_map[symbol] = market_cap
+        return market_cap_map
+
+    def _fetch_single_market_cap(self, symbol: str, session: requests.Session | None = None) -> float | None:
+        code = str(symbol or "").split(".")[-1]
+        if not code:
+            return None
+        secid = self._to_eastmoney_secid(code)
+        client = session or requests.Session()
+        client.trust_env = not settings.disable_system_proxy
+        try:
+            response = client.get(
+                "https://push2.eastmoney.com/api/qt/stock/get",
+                params={
+                    "secid": secid,
+                    "fields": "f20",
+                    "invt": 2,
+                    "fltt": 2,
+                },
+                timeout=15,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            value = ((payload or {}).get("data") or {}).get("f20")
+            return float(value) if value is not None else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _to_eastmoney_secid(code: str) -> str:
+        code = str(code).split(".")[-1]
+        if code.startswith(("60", "68", "90")):
+            return f"1.{code}"
+        return f"0.{code}"
 
     @staticmethod
     def _apply_sector_metrics_to_results(results: list[AnalysisResult], snapshot: pd.DataFrame) -> list[AnalysisResult]:
@@ -2676,6 +3238,8 @@ class StockAnalysisService:
             "sell_break_ma5": "跌破MA5放量清仓：`close < MA5` 且 `volume > vol_ma5` 时清仓。",
             "sell_drawdown": "动态移动止盈：峰值盈利 `>= 10%` 时，回撤 `> 5%` 清仓；峰值盈利 `>= 18%` 时，回撤 `> 6%` 清仓；峰值盈利 `>= 30%` 时，回撤容忍度放宽到 `8%`。",
             "sell_time_stop": "时间止损：持仓 `>= 10` 天、累计收益 `< 2%`，且收盘价 `<= MA20` 时清仓。",
+            "sell_flip_loss": "盈转亏卖出：持仓曾经盈利，但当前收盘已跌回成本线下方时清仓。",
+            "sell_market_weak_drop": "弱市大跌清仓：当市场平均分低于阈值，且个股当日跌幅达到设定值时清仓。",
         }
 
         lines: list[str] = [
@@ -2693,7 +3257,7 @@ class StockAnalysisService:
             "- 卖出执行时点：触发条件后的 `T+1日开盘`。",
             f"- 基准指数：`{config.get('benchmark_symbol') or '000001'}`，图表中按首日净值归一化展示。",
             f"- 最大持仓：`{config.get('max_positions', '-')}` 只。",
-            "- 仓位规则：按“剩余现金 / 新开仓数量”等权分配；已持仓不因新信号调仓；不加仓。",
+            f"- 仓位规则：按“剩余现金 / 新开仓数量”等权分配，但单票仓位不超过 `{fmt_pct(config.get('max_single_position'))}`；已持仓不因新信号调仓；不加仓。",
             "- 交易限制：不允许同一天重复买卖同一只；不考虑融资融券。",
             f"- 手续费：`{fmt_num(config.get('fee_rate'), 4)}`；滑点：`{fmt_num(config.get('slippage_rate'), 4)}`。",
             f"- 市场过滤：当全市场平均分低于 `{fmt_num(config.get('market_score_filter_min_avg'))}`、5日均值低于 `{fmt_num(config.get('market_score_filter_min_ma5'))}`，或大盘收盘价未站上 `MA20` 时，不生成新的买入信号。",
@@ -2731,6 +3295,7 @@ class StockAnalysisService:
             "",
             f"- 辅助过滤：买入前 5 日振幅需 `<= {fmt_pct(config.get('buy_risk_amplitude_max'))}`，且买入前 5 日最大跌幅需 `<= {fmt_pct(config.get('buy_risk_max_drop_max'))}`。",
             f"- 板块过滤：所属板块 5 日涨幅排名需位于前 `{fmt_pct(config.get('buy_sector_rank_top_pct'))}`。",
+            f"- 成交额过滤：近 3 日平均成交额需 `>= {fmt_num((config.get('buy_amount_min') or 0) / 100000000, 1)}` 亿元。",
             f"- 大盘过滤：`market_require_benchmark_above_ma20 = {bool(config.get('market_require_benchmark_above_ma20', True))}`，开启时要求大盘收盘价站上 `MA20` 才开仓。",
         ]
 
@@ -2778,6 +3343,9 @@ class StockAnalysisService:
                 f"- 买入前5日振幅上限：`{fmt_pct(config.get('buy_risk_amplitude_max'))}`",
                 f"- 买入前5日最大跌幅上限：`{fmt_pct(config.get('buy_risk_max_drop_max'))}`",
                 f"- 板块5日强度排名上限：`前 {fmt_pct(config.get('buy_sector_rank_top_pct'))}`",
+                f"- 买入近3日平均成交额下限：`{fmt_num((config.get('buy_amount_min') or 0) / 100000000, 1)} 亿元`",
+                f"- 单票仓位上限：`{fmt_pct(config.get('max_single_position'))}`",
+                f"- 弱市大跌清仓阈值：`市场平均分 < {fmt_num(config.get('sell_market_score_threshold'))}` 且 `个股跌幅 <= {fmt_num(config.get('sell_market_drop_threshold'), 1)}%`",
                 f"- 买入规则：`{', '.join(enabled_buy_rules) or '-'}`",
                 f"- 卖出规则：`{', '.join(enabled_sell_rules) or '-'}`",
                 "",
