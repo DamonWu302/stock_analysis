@@ -1,0 +1,35 @@
+{
+  "entries": [
+    {
+      "signature": "0a643b2c3c90645fc35ac03fd76439e4939e1c87",
+      "generated_at": "2026-03-21 22:19:33",
+      "summary": "本轮优化中最佳试验获得14.53%总收益和12.69%超额收益，最大回撤5.46%，表现良好但基于10个有限样本。",
+      "best_run_id": 106,
+      "best_trial_id": 16,
+      "best_total_return": 0.145324,
+      "fixed_param_names": [
+        "buy_min_core_hits"
+      ],
+      "narrow_param_names": [
+        "market_score_filter_min_avg",
+        "buy_strict_score_total",
+        "buy_amount_min"
+      ],
+      "relax_param_names": [
+        "sell_market_drop_threshold"
+      ],
+      "important_params": []
+    }
+  ],
+  "stable_params": {
+    "buy_min_core_hits": {
+      "fixed_count": 1,
+      "narrow_count": 0,
+      "important_count": 0,
+      "stability_score": 2.0,
+      "recommended_action": "keep",
+      "consensus_fixed_value": null
+    }
+  },
+  "updated_at": "2026-03-21 23:52:11"
+}

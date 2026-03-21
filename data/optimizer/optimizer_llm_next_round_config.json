@@ -117,6 +117,10 @@
     "save_json": true,
     "save_md": true
   },
-  "llm_review_applied_at": "2026-03-21 22:22:24",
-  "llm_review_summary": "本轮优化中最佳试验获得14.53%总收益和12.69%超额收益，最大回撤5.46%，表现良好但基于10个有限样本。"
+  "llm_review_applied_at": "2026-03-21 23:52:11",
+  "llm_review_summary": "本轮优化中最佳试验获得14.53%总收益和12.69%超额收益，最大回撤5.46%，表现良好但基于10个有限样本。",
+  "llm_memory_bias_applied": true,
+  "llm_stable_params_considered": [
+    "buy_min_core_hits"
+  ]
 }

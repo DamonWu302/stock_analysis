@@ -27,11 +27,15 @@ def main() -> None:
     if args.reuse_review:
         result = service.apply_existing_review(args.output_dir)
         print(f"merged_config_path={result['merged_config_path']}")
+        print(f"memory_json_path={result['memory_json_path']}")
+        print(f"memory_md_path={result['memory_md_path']}")
     else:
         result = service.review(args.output_dir, top_n=max(args.top_n, 1))
         print(f"json_path={result['json_path']}")
         print(f"md_path={result['md_path']}")
         print(f"merged_config_path={result['merged_config_path']}")
+        print(f"memory_json_path={result['memory_json_path']}")
+        print(f"memory_md_path={result['memory_md_path']}")
 
 
 if __name__ == "__main__":
