@@ -300,6 +300,117 @@ CREATE TABLE IF NOT EXISTS backfill_task_batch (
     message TEXT,
     FOREIGN KEY (task_id) REFERENCES backfill_task(id)
 );
+
+CREATE TABLE IF NOT EXISTS strategy_plan_run (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date TEXT NOT NULL,
+    template_key TEXT NOT NULL,
+    template_name TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    score_version TEXT NOT NULL,
+    market_status TEXT NOT NULL,
+    market_reason TEXT,
+    target_exposure REAL NOT NULL DEFAULT 0,
+    max_positions INTEGER NOT NULL,
+    max_single_position REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS strategy_plan_stock (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    trade_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    action TEXT NOT NULL,
+    priority_rank INTEGER,
+    target_weight REAL,
+    score_total REAL,
+    score_ma_trend REAL,
+    score_volume_pattern REAL,
+    score_capital_sector REAL,
+    score_breakout REAL,
+    score_hold REAL,
+    score_benchmark REAL,
+    buy_reason TEXT,
+    sell_reason TEXT,
+    signals_json TEXT,
+    metrics_json TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES strategy_plan_run(id)
+);
+
+CREATE TABLE IF NOT EXISTS strategy_position (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    name TEXT,
+    status TEXT NOT NULL,
+    shares REAL NOT NULL DEFAULT 0,
+    cost_price REAL,
+    latest_price REAL,
+    market_value REAL NOT NULL DEFAULT 0,
+    weight REAL NOT NULL DEFAULT 0,
+    unrealized_pnl REAL NOT NULL DEFAULT 0,
+    unrealized_return REAL NOT NULL DEFAULT 0,
+    hold_days INTEGER NOT NULL DEFAULT 0,
+    peak_return REAL NOT NULL DEFAULT 0,
+    peak_price REAL NOT NULL DEFAULT 0,
+    entry_signal_date TEXT,
+    entry_execution_date TEXT,
+    entry_cost_total REAL NOT NULL DEFAULT 0,
+    trimmed INTEGER NOT NULL DEFAULT 0,
+    last_action TEXT,
+    last_action_reason TEXT,
+    plan_run_id INTEGER,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (plan_run_id) REFERENCES strategy_plan_run(id)
+);
+
+CREATE TABLE IF NOT EXISTS strategy_trade_signal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    signal_price_ref REAL,
+    target_weight REAL,
+    reason TEXT,
+    metrics_json TEXT,
+    plan_run_id INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (plan_run_id) REFERENCES strategy_plan_run(id)
+);
+
+CREATE TABLE IF NOT EXISTS strategy_setting (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    setting_key TEXT NOT NULL UNIQUE,
+    setting_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_plan_run_trade_date
+ON strategy_plan_run(trade_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_plan_stock_run_action
+ON strategy_plan_stock(run_id, action, priority_rank);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_plan_stock_trade_symbol
+ON strategy_plan_stock(trade_date, symbol);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_position_trade_status
+ON strategy_position(trade_date, status);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_position_symbol_trade_date
+ON strategy_position(symbol, trade_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_trade_signal_trade_type
+ON strategy_trade_signal(trade_date, signal_type);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_trade_signal_run_id
+ON strategy_trade_signal(plan_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_setting_key
+ON strategy_setting(setting_key);
 """
 
 
@@ -431,6 +542,17 @@ class Database:
                 "message": "TEXT",
                 "run_id": "INTEGER",
                 "config_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+        )
+        Database._ensure_columns(
+            conn,
+            "strategy_position",
+            {
+                "peak_price": "REAL NOT NULL DEFAULT 0",
+                "entry_signal_date": "TEXT",
+                "entry_execution_date": "TEXT",
+                "entry_cost_total": "REAL NOT NULL DEFAULT 0",
+                "trimmed": "INTEGER NOT NULL DEFAULT 0",
             },
         )
         conn.execute(

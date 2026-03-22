@@ -24,74 +24,101 @@ def create_app() -> Flask:
     chat_service = StockChatService()
 
     def build_backtest_payload(form) -> dict:
-        def parse_int(name: str, default: int) -> int:
+        schema_defaults = dict(service.backtest_config_schema().get("defaults") or {})
+        raw_template_id = (form.get("template_id") or "").strip()
+        template_id = int(raw_template_id) if raw_template_id else 0
+        template_config: dict[str, object] = {}
+        if template_id:
+            for item in service.backtest_templates():
+                if int(item["id"]) == template_id:
+                    template_config = dict(item.get("config") or {})
+                    break
+        base = dict(schema_defaults)
+        base.update(template_config)
+
+        def parse_int(name: str, default: int | None = None) -> int:
+            if default is None:
+                default = int(base.get(name, 0) or 0)
             value = (form.get(name) or "").strip()
             if value == "":
                 return int(default)
             return int(value)
 
-        def parse_float(name: str, default: float) -> float:
+        def parse_float(name: str, default: float | None = None) -> float:
+            if default is None:
+                default = float(base.get(name, 0.0) or 0.0)
             value = (form.get(name) or "").strip()
             if value == "":
                 return float(default)
             return float(value)
 
-        def parse_bool(name: str, default: bool = False) -> bool:
+        def parse_bool(name: str, default: bool | None = None) -> bool:
+            if default is None:
+                default = bool(base.get(name, False))
             values = form.getlist(name)
             if not values:
                 return default
             value = values[-1]
             return str(value).strip().lower() in {"1", "true", "on", "yes"}
 
+        def parse_rule_list(name: str) -> list[str]:
+            values = [str(item).strip() for item in form.getlist(name) if str(item).strip()]
+            if values:
+                return values
+            base_values = base.get(name) or []
+            if isinstance(base_values, list):
+                return [str(item).strip() for item in base_values if str(item).strip()]
+            return []
+
         return {
-            "template_id": parse_int("template_id", 0) or None,
+            "template_id": template_id or None,
             "name": (form.get("name") or "").strip() or None,
             "start_date": (form.get("start_date") or "").strip() or None,
             "end_date": (form.get("end_date") or "").strip() or None,
             "lookback_days": parse_int("lookback_days", 120),
-            "max_positions": parse_int("max_positions", 4),
-            "max_single_position": parse_float("max_single_position", 0.30),
-            "initial_capital": parse_float("initial_capital", 1000000.0),
-            "fee_rate": parse_float("fee_rate", 0.001),
-            "slippage_rate": parse_float("slippage_rate", 0.001),
-            "market_score_filter_min_avg": parse_float("market_score_filter_min_avg", 41.0),
-            "market_score_filter_min_ma5": parse_float("market_score_filter_min_ma5", 41.0),
-            "market_require_benchmark_above_ma20": parse_bool("market_require_benchmark_above_ma20", True),
-            "market_require_benchmark_ma20_up": parse_bool("market_require_benchmark_ma20_up", False),
-            "buy_strict_score_total": parse_float("buy_strict_score_total", 74.0),
-            "buy_strict_score_ma_trend": parse_float("buy_strict_score_ma_trend", 14.0),
-            "buy_strict_score_breakout": parse_float("buy_strict_score_breakout", 12.0),
-            "buy_strict_score_capital_sector": parse_float("buy_strict_score_capital_sector", 10.0),
-            "buy_strict_score_volume_pattern": parse_float("buy_strict_score_volume_pattern", 14.0),
-            "buy_momentum_score_total": parse_float("buy_momentum_score_total", 68.0),
-            "buy_momentum_score_volume_pattern": parse_float("buy_momentum_score_volume_pattern", 14.0),
-            "buy_min_core_hits": parse_int("buy_min_core_hits", 4),
-            "buy_low_position_high_ratio_max": parse_float("buy_low_position_high_ratio_max", 0.95),
-            "buy_20d_gain_max": parse_float("buy_20d_gain_max", 15.0),
-            "buy_recent_stall_lookback": parse_int("buy_recent_stall_lookback", 3),
-            "buy_recent_stall_pct_max": parse_float("buy_recent_stall_pct_max", 1.0),
-            "buy_recent_stall_volume_multiple": parse_float("buy_recent_stall_volume_multiple", 1.2),
-            "buy_risk_amplitude_max": parse_float("buy_risk_amplitude_max", 0.20),
-            "buy_risk_max_drop_max": parse_float("buy_risk_max_drop_max", 0.12),
-            "buy_sector_rank_top_pct": parse_float("buy_sector_rank_top_pct", 0.50),
-            "buy_amount_min": parse_float("buy_amount_min", 250000000.0),
-            "sell_trim_profit_threshold": parse_float("sell_trim_profit_threshold", 0.08),
-            "sell_trim_fraction": parse_float("sell_trim_fraction", 0.5),
-            "sell_trim_upper_shadow_ratio": parse_float("sell_trim_upper_shadow_ratio", 0.03),
-            "sell_trim_volume_multiple": parse_float("sell_trim_volume_multiple", 1.2),
-            "sell_break_ma5_volume_multiple": parse_float("sell_break_ma5_volume_multiple", 1.0),
-            "sell_drawdown_profit_threshold": parse_float("sell_drawdown_profit_threshold", 0.10),
-            "sell_drawdown_threshold": parse_float("sell_drawdown_threshold", 0.05),
-            "sell_drawdown_profit_threshold_mid": parse_float("sell_drawdown_profit_threshold_mid", 0.18),
-            "sell_drawdown_threshold_mid": parse_float("sell_drawdown_threshold_mid", 0.06),
-            "sell_drawdown_profit_threshold_high": parse_float("sell_drawdown_profit_threshold_high", 0.30),
-            "sell_drawdown_threshold_high": parse_float("sell_drawdown_threshold_high", 0.08),
-            "sell_time_stop_days": parse_int("sell_time_stop_days", 10),
-            "sell_time_stop_return_threshold": parse_float("sell_time_stop_return_threshold", 0.02),
-            "sell_market_score_threshold": parse_float("sell_market_score_threshold", 35.0),
-            "sell_market_drop_threshold": parse_float("sell_market_drop_threshold", -3.0),
-            "enabled_buy_rules": form.getlist("enabled_buy_rules"),
-            "enabled_sell_rules": form.getlist("enabled_sell_rules"),
+            "max_positions": parse_int("max_positions"),
+            "max_single_position": parse_float("max_single_position"),
+            "initial_capital": parse_float("initial_capital"),
+            "fee_rate": parse_float("fee_rate"),
+            "slippage_rate": parse_float("slippage_rate"),
+            "market_score_filter_min_avg": parse_float("market_score_filter_min_avg"),
+            "market_score_filter_min_ma5": parse_float("market_score_filter_min_ma5"),
+            "market_require_benchmark_above_ma20": parse_bool("market_require_benchmark_above_ma20"),
+            "market_require_benchmark_ma20_up": parse_bool("market_require_benchmark_ma20_up"),
+            "buy_strict_score_total": parse_float("buy_strict_score_total"),
+            "buy_strict_score_ma_trend": parse_float("buy_strict_score_ma_trend"),
+            "buy_strict_score_breakout": parse_float("buy_strict_score_breakout"),
+            "buy_strict_score_capital_sector": parse_float("buy_strict_score_capital_sector"),
+            "buy_strict_score_volume_pattern": parse_float("buy_strict_score_volume_pattern"),
+            "buy_momentum_score_total": parse_float("buy_momentum_score_total"),
+            "buy_momentum_score_volume_pattern": parse_float("buy_momentum_score_volume_pattern"),
+            "buy_min_core_hits": parse_int("buy_min_core_hits"),
+            "buy_low_position_high_ratio_max": parse_float("buy_low_position_high_ratio_max"),
+            "buy_20d_gain_max": parse_float("buy_20d_gain_max"),
+            "buy_recent_stall_lookback": parse_int("buy_recent_stall_lookback"),
+            "buy_recent_stall_pct_max": parse_float("buy_recent_stall_pct_max"),
+            "buy_recent_stall_volume_multiple": parse_float("buy_recent_stall_volume_multiple"),
+            "buy_risk_amplitude_max": parse_float("buy_risk_amplitude_max"),
+            "buy_risk_max_drop_max": parse_float("buy_risk_max_drop_max"),
+            "buy_sector_rank_top_pct": parse_float("buy_sector_rank_top_pct"),
+            "buy_amount_min": parse_float("buy_amount_min"),
+            "sell_trim_profit_threshold": parse_float("sell_trim_profit_threshold"),
+            "sell_trim_fraction": parse_float("sell_trim_fraction"),
+            "sell_trim_upper_shadow_ratio": parse_float("sell_trim_upper_shadow_ratio"),
+            "sell_trim_volume_multiple": parse_float("sell_trim_volume_multiple"),
+            "sell_break_ma5_volume_multiple": parse_float("sell_break_ma5_volume_multiple"),
+            "sell_drawdown_profit_threshold": parse_float("sell_drawdown_profit_threshold"),
+            "sell_drawdown_threshold": parse_float("sell_drawdown_threshold"),
+            "sell_drawdown_profit_threshold_mid": parse_float("sell_drawdown_profit_threshold_mid"),
+            "sell_drawdown_threshold_mid": parse_float("sell_drawdown_threshold_mid"),
+            "sell_drawdown_profit_threshold_high": parse_float("sell_drawdown_profit_threshold_high"),
+            "sell_drawdown_threshold_high": parse_float("sell_drawdown_threshold_high"),
+            "sell_time_stop_days": parse_int("sell_time_stop_days"),
+            "sell_time_stop_return_threshold": parse_float("sell_time_stop_return_threshold"),
+            "sell_market_score_threshold": parse_float("sell_market_score_threshold"),
+            "sell_market_drop_threshold": parse_float("sell_market_drop_threshold"),
+            "enabled_buy_rules": parse_rule_list("enabled_buy_rules"),
+            "enabled_sell_rules": parse_rule_list("enabled_sell_rules"),
         }
 
     @app.template_filter("fmt_dt")

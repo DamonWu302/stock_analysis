@@ -23,7 +23,7 @@ from .analyzer import (
     score_stock,
 )
 from .backtest import build_backtest_config_schema
-from .backtest_runner import BacktestRunner
+from .backtest_runner import BacktestRunner, Position
 from .config import settings
 from .data_source import build_provider
 from .db import Database
@@ -385,6 +385,658 @@ class StockAnalysisService:
 
     def run_backtest(self, config: dict | None = None) -> dict:
         return self.backtest_runner.run(config)
+
+    def generate_strategy_plan(self, trade_date: str | None = None, template_key: str = "return_priority") -> dict:
+        templates = self.backtest_templates()
+        template = next((item for item in templates if str(item.get("template_key") or "") == template_key), None)
+        if not template:
+            raise ValueError(f"未找到策略模板: {template_key}")
+
+        with self.db.connect() as conn:
+            if not trade_date:
+                row = conn.execute("SELECT MAX(trade_date) AS trade_date FROM daily_score").fetchone()
+                trade_date = str(row["trade_date"] or "") if row else ""
+            if not trade_date:
+                raise ValueError("当前没有可用的 daily_score 数据")
+            benchmark_row = conn.execute(
+                """
+                SELECT symbol, trade_date, close
+                FROM benchmark_history
+                WHERE symbol = '000001' AND trade_date = ?
+                """,
+                (trade_date,),
+            ).fetchone()
+            score_version_row = conn.execute(
+                "SELECT MAX(score_version) AS score_version FROM daily_score WHERE trade_date = ?",
+                (trade_date,),
+            ).fetchone()
+            snapshot_rows = conn.execute(
+                """
+                SELECT symbol, name, latest_price, pct_change, amount, sector, sector_change, sector_up_ratio
+                FROM market_snapshot
+                WHERE trade_date = ?
+                """,
+                (trade_date,),
+            ).fetchall()
+
+        config = self.backtest_runner._normalize_config(dict(template.get("config") or {}))
+        context_dates = self.backtest_runner._load_trade_dates(config["lookback_days"], end_date=trade_date)
+        if not context_dates:
+            raise ValueError(f"{trade_date} 没有可用的评分数据")
+        context_start = context_dates[max(0, len(context_dates) - 40)]
+        score_window_rows = self.backtest_runner._load_score_rows(context_start, trade_date)
+        score_rows = [row for row in score_window_rows if str(row.get("trade_date") or "") == trade_date]
+        if not score_rows:
+            raise ValueError(f"{trade_date} 没有可用的评分数据")
+        snapshot_map = {str(row["symbol"] or ""): dict(row) for row in snapshot_rows}
+        for row in score_rows:
+            extra = snapshot_map.get(str(row.get("symbol") or ""), {})
+            row["name"] = extra.get("name")
+            row["latest_price"] = extra.get("latest_price", row.get("close"))
+            row["pct_change"] = extra.get("pct_change", row.get("pct_change"))
+            row["amount"] = extra.get("amount", row.get("amount"))
+            row["sector"] = extra.get("sector")
+            row["sector_change"] = extra.get("sector_change")
+            row["sector_up_ratio"] = extra.get("sector_up_ratio")
+
+        avg_score = round(sum(float(row["score_total"] or 0) for row in score_rows) / len(score_rows), 4)
+        score_trend = self.score_trend(20)
+        score_row = next((item for item in score_trend if str(item.get("trade_date") or "") == trade_date), None)
+        avg_score_ma5 = float(score_row.get("ma5_avg_score") or score_row.get("avg_score_ma5") or 0) if score_row else avg_score
+        market_filter = self.backtest_runner._load_market_score_map(context_start, trade_date).get(trade_date, {})
+        benchmark_above_ma20 = float(market_filter.get("benchmark_close_ma20_ratio") or 0.0) > 1.0
+        market_open = self.backtest_runner._passes_market_filter(market_filter, config)
+        market_status = "open" if market_open else "closed"
+        market_reason = (
+            f"平均分 {avg_score:.2f} / 5日均值 {avg_score_ma5:.2f} / 大盘站上MA20={benchmark_above_ma20}"
+        )
+        target_exposure = 1.0 if market_open else 0.0
+
+        enabled_buy_rules = set(config.get("enabled_buy_rules") or [])
+        enabled_sell_rules = set(config.get("enabled_sell_rules") or [])
+        max_positions = int(config.get("max_positions") or 3)
+        max_single_position = float(config.get("max_single_position") or 0.5)
+        previous_positions = self._load_latest_strategy_positions(template_key=template_key, before_trade_date=trade_date)
+        score_by_symbol = {str(row["symbol"] or ""): dict(row) for row in score_rows}
+
+        buy_candidates: list[dict] = []
+        avoid_rows: list[dict] = []
+        position_action_rows: list[dict] = []
+        signal_rows: list[dict] = []
+
+        for symbol, previous in previous_positions.items():
+            row = score_by_symbol.get(symbol)
+            if not row:
+                continue
+            current_close = float(row.get("latest_price") or row.get("close") or previous.get("latest_price") or 0.0)
+            hold_days = int(previous.get("hold_days") or 0) + 1
+            peak_price = max(float(previous.get("peak_price") or 0.0), current_close)
+            runtime_position = Position(
+                symbol=symbol,
+                shares=float(previous.get("shares") or 0.0),
+                cost_price=float(previous.get("cost_price") or 0.0),
+                entry_signal_date=str(previous.get("entry_signal_date") or trade_date),
+                entry_execution_date=str(previous.get("entry_execution_date") or trade_date),
+                entry_cost_total=float(previous.get("entry_cost_total") or 0.0),
+                peak_close=peak_price,
+                trimmed=bool(previous.get("trimmed") or False),
+            )
+            sell_decision = self.backtest_runner._evaluate_sell_rules(
+                row=row,
+                position=runtime_position,
+                current_close=current_close,
+                hold_days=hold_days,
+                market_filter=market_filter,
+                enabled_sell_rules=enabled_sell_rules,
+                config=config,
+            )
+            action = "hold"
+            sell_reason = ""
+            target_weight = float(previous.get("weight") or 0.0)
+            if sell_decision:
+                action = "trim" if float(sell_decision.get("fraction") or 1.0) < 1.0 else "sell"
+                sell_reason = "、".join(sell_decision.get("rule_hits") or [])
+                if action == "trim":
+                    target_weight = round(target_weight * (1.0 - float(sell_decision.get("fraction") or 0.5)), 4)
+                else:
+                    target_weight = 0.0
+            peak_return = (peak_price - runtime_position.cost_price) / max(runtime_position.cost_price, 0.01)
+            current_return = (current_close - runtime_position.cost_price) / max(runtime_position.cost_price, 0.01)
+            metrics = {
+                "score_total": float(row.get("score_total") or 0.0),
+                "score_ma_trend": float(row.get("score_ma_trend") or 0.0),
+                "score_volume_pattern": float(row.get("score_volume_pattern") or 0.0),
+                "score_capital_sector": float(row.get("score_capital_sector") or 0.0),
+                "score_breakout": float(row.get("score_breakout") or 0.0),
+                "score_hold": float(row.get("score_hold") or 0.0),
+                "score_benchmark": float(row.get("score_benchmark") or 0.0),
+                "cmf21": float(row.get("cmf21") or 0.0),
+                "mfi14": float(row.get("mfi14") or 0.0),
+                "pct_change": float(row.get("pct_change") or 0.0),
+                "close": current_close,
+                "hold_days": hold_days,
+                "peak_return": peak_return,
+                "current_return": current_return,
+            }
+            position_action_rows.append(
+                {
+                    "trade_date": trade_date,
+                    "symbol": symbol,
+                    "name": str(row.get("name") or previous.get("name") or ""),
+                    "action": action,
+                    "priority_rank": 0,
+                    "target_weight": round(target_weight, 4),
+                    "score_total": float(row.get("score_total") or 0.0),
+                    "score_ma_trend": float(row.get("score_ma_trend") or 0.0),
+                    "score_volume_pattern": float(row.get("score_volume_pattern") or 0.0),
+                    "score_capital_sector": float(row.get("score_capital_sector") or 0.0),
+                    "score_breakout": float(row.get("score_breakout") or 0.0),
+                    "score_hold": float(row.get("score_hold") or 0.0),
+                    "score_benchmark": float(row.get("score_benchmark") or 0.0),
+                    "buy_reason": "",
+                    "sell_reason": sell_reason,
+                    "signals_json": json.dumps([], ensure_ascii=False),
+                    "metrics_json": json.dumps(metrics, ensure_ascii=False),
+                }
+            )
+            if action in {"trim", "sell"}:
+                signal_rows.append(
+                    {
+                        "trade_date": trade_date,
+                        "symbol": symbol,
+                        "signal_type": action,
+                        "signal_price_ref": float(row.get("latest_price") or current_close or 0.0),
+                        "target_weight": round(target_weight, 4),
+                        "reason": sell_reason,
+                        "metrics_json": json.dumps(metrics, ensure_ascii=False),
+                    }
+                )
+
+        for rank, row in enumerate(score_rows, start=1):
+            symbol = str(row["symbol"] or "")
+            if symbol in previous_positions:
+                continue
+            score_total = float(row["score_total"] or 0)
+            score_ma_trend = float(row["score_ma_trend"] or 0)
+            score_volume_pattern = float(row["score_volume_pattern"] or 0)
+            score_capital_sector = float(row["score_capital_sector"] or 0)
+            score_breakout = float(row["score_breakout"] or 0)
+            score_hold = float(row["score_hold"] or 0)
+            score_benchmark = float(row["score_benchmark"] or 0)
+            amount = float(row["amount"] or 0)
+            sector_up_ratio = float(row["sector_up_ratio"] or 0)
+            cmf21 = float(row["cmf21"] or 0)
+            mfi14 = float(row["mfi14"] or 0)
+            buy_hits = self.backtest_runner._evaluate_buy_rules(row, enabled_buy_rules=enabled_buy_rules, config=config)
+            avg3_amount = (
+                float(row.get("amount") or 0.0)
+                + float(row.get("amount_lag1") or 0.0)
+                + float(row.get("amount_lag2") or 0.0)
+            ) / 3.0
+
+            metrics = {
+                "score_total": score_total,
+                "score_ma_trend": score_ma_trend,
+                "score_volume_pattern": score_volume_pattern,
+                "score_capital_sector": score_capital_sector,
+                "score_breakout": score_breakout,
+                "score_hold": score_hold,
+                "score_benchmark": score_benchmark,
+                "close": float(row.get("close") or row.get("latest_price") or 0.0),
+                "latest_price": float(row.get("latest_price") or row.get("close") or 0.0),
+                "cmf21": cmf21,
+                "mfi14": mfi14,
+                "amount": amount,
+                "avg3_amount": round(avg3_amount, 4),
+                "sector_up_ratio": sector_up_ratio,
+                "core_hits": int(row.get("core_hits") or 0),
+                "market_open": market_open,
+                "market_avg_score": avg_score,
+                "market_avg_score_ma5": avg_score_ma5,
+                "benchmark_above_ma20": benchmark_above_ma20,
+                "sector_rank_pct": float(row.get("sector_rank_pct") or 0.0),
+            }
+
+            payload = {
+                "trade_date": trade_date,
+                "symbol": symbol,
+                "name": str(row["name"] or ""),
+                "action": "avoid",
+                "priority_rank": rank,
+                "target_weight": 0.0,
+                "score_total": score_total,
+                "score_ma_trend": score_ma_trend,
+                "score_volume_pattern": score_volume_pattern,
+                "score_capital_sector": score_capital_sector,
+                "score_breakout": score_breakout,
+                "score_hold": score_hold,
+                "score_benchmark": score_benchmark,
+                "buy_reason": "、".join(buy_hits) if buy_hits else "",
+                "sell_reason": "",
+                "signals_json": json.dumps(json.loads(str(row.get("signals") or "[]")), ensure_ascii=False),
+                "metrics_json": json.dumps(metrics, ensure_ascii=False),
+            }
+
+            if buy_hits and market_open:
+                payload["action"] = "buy"
+                buy_candidates.append(payload)
+            else:
+                if not buy_hits:
+                    payload["sell_reason"] = "未命中买入规则"
+                elif not market_open:
+                    payload["sell_reason"] = "市场环境未放行"
+                avoid_rows.append(payload)
+
+        active_slots = max_positions - sum(1 for item in position_action_rows if item["action"] in {"hold", "trim"})
+        selected_buys = buy_candidates[: max(active_slots, 0)]
+        if selected_buys:
+            equal_weight = 1.0 / max(len(selected_buys), 1)
+            for item in selected_buys:
+                item["target_weight"] = round(min(equal_weight, max_single_position), 4)
+
+        now = datetime.now().isoformat(timespec="seconds")
+        score_version = str(score_version_row["score_version"] or score_rows[0].get("score_version") or "")
+        with self.db.connect() as conn:
+            old_runs = conn.execute(
+                """
+                SELECT id
+                FROM strategy_plan_run
+                WHERE trade_date = ? AND template_key = ?
+                """,
+                (trade_date, template_key),
+            ).fetchall()
+            old_run_ids = [int(row["id"]) for row in old_runs]
+            for old_run_id in old_run_ids:
+                conn.execute("DELETE FROM strategy_trade_signal WHERE plan_run_id = ?", (old_run_id,))
+                conn.execute("DELETE FROM strategy_plan_stock WHERE run_id = ?", (old_run_id,))
+                conn.execute("DELETE FROM strategy_position WHERE plan_run_id = ?", (old_run_id,))
+            conn.execute("DELETE FROM strategy_plan_run WHERE trade_date = ? AND template_key = ?", (trade_date, template_key))
+            cursor = conn.execute(
+                """
+                INSERT INTO strategy_plan_run
+                (trade_date, template_key, template_name, config_json, score_version, market_status,
+                 market_reason, target_exposure, max_positions, max_single_position, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade_date,
+                    template_key,
+                    str(template.get("name") or ""),
+                    json.dumps(config, ensure_ascii=False),
+                    score_version,
+                    market_status,
+                    market_reason,
+                    target_exposure,
+                    max_positions,
+                    max_single_position,
+                    now,
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+
+            for item in position_action_rows + selected_buys + avoid_rows:
+                conn.execute(
+                    """
+                    INSERT INTO strategy_plan_stock
+                    (run_id, trade_date, symbol, name, action, priority_rank, target_weight,
+                     score_total, score_ma_trend, score_volume_pattern, score_capital_sector,
+                     score_breakout, score_hold, score_benchmark, buy_reason, sell_reason,
+                     signals_json, metrics_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        trade_date,
+                        item["symbol"],
+                        item["name"],
+                        item["action"],
+                        item["priority_rank"],
+                        item["target_weight"],
+                        item["score_total"],
+                        item["score_ma_trend"],
+                        item["score_volume_pattern"],
+                        item["score_capital_sector"],
+                        item["score_breakout"],
+                        item["score_hold"],
+                        item["score_benchmark"],
+                        item["buy_reason"],
+                        item["sell_reason"],
+                        item["signals_json"],
+                        item["metrics_json"],
+                        now,
+                    ),
+                )
+                if item["action"] == "buy":
+                    conn.execute(
+                        """
+                        INSERT INTO strategy_trade_signal
+                        (trade_date, symbol, signal_type, signal_price_ref, target_weight, reason, metrics_json, plan_run_id, created_at)
+                        VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            trade_date,
+                            item["symbol"],
+                            next((float(row["latest_price"] or 0) for row in score_rows if str(row["symbol"] or "") == item["symbol"]), 0.0),
+                            item["target_weight"],
+                            item["buy_reason"],
+                            item["metrics_json"],
+                            run_id,
+                            now,
+                        ),
+                    )
+                elif item["action"] in {"trim", "sell"}:
+                    conn.execute(
+                        """
+                        INSERT INTO strategy_trade_signal
+                        (trade_date, symbol, signal_type, signal_price_ref, target_weight, reason, metrics_json, plan_run_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            trade_date,
+                            item["symbol"],
+                            item["action"],
+                            next((float(row["latest_price"] or 0) for row in score_rows if str(row["symbol"] or "") == item["symbol"]), 0.0),
+                            item["target_weight"],
+                            item["sell_reason"],
+                            item["metrics_json"],
+                            run_id,
+                            now,
+                        ),
+                    )
+
+        self.refresh_strategy_positions(trade_date=trade_date, template_key=template_key)
+
+        return {
+            "run_id": run_id,
+            "trade_date": trade_date,
+            "template_key": template_key,
+            "template_name": template.get("name"),
+            "market_status": market_status,
+            "market_reason": market_reason,
+            "target_exposure": target_exposure,
+            "buy_count": len(selected_buys),
+            "candidate_count": len(buy_candidates),
+            "selected_buys": selected_buys,
+            "position_actions": position_action_rows,
+        }
+
+    def latest_strategy_plan(self, template_key: str | None = None) -> dict | None:
+        with self.db.connect() as conn:
+            if template_key:
+                run = conn.execute(
+                    """
+                    SELECT *
+                    FROM strategy_plan_run
+                    WHERE template_key = ?
+                    ORDER BY trade_date DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (template_key,),
+                ).fetchone()
+            else:
+                run = conn.execute(
+                    """
+                    SELECT *
+                    FROM strategy_plan_run
+                    ORDER BY trade_date DESC, id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+            if not run:
+                return None
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM strategy_plan_stock
+                WHERE run_id = ?
+                ORDER BY action ASC, priority_rank ASC, score_total DESC, symbol ASC
+                """,
+                (int(run["id"]),),
+            ).fetchall()
+            signals = conn.execute(
+                """
+                SELECT *
+                FROM strategy_trade_signal
+                WHERE plan_run_id = ?
+                ORDER BY signal_type ASC, symbol ASC
+                """,
+                (int(run["id"]),),
+            ).fetchall()
+
+        payload = dict(run)
+        payload["config"] = json.loads(payload.get("config_json") or "{}")
+        payload["stocks"] = []
+        for row in rows:
+            item = dict(row)
+            item["signals"] = json.loads(item.get("signals_json") or "[]")
+            item["metrics"] = json.loads(item.get("metrics_json") or "{}")
+            payload["stocks"].append(item)
+        payload["signals"] = []
+        for row in signals:
+            item = dict(row)
+            item["metrics"] = json.loads(item.get("metrics_json") or "{}")
+            payload["signals"].append(item)
+        payload["buy_candidates"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "buy"]
+        payload["avoid_list"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "avoid"]
+        payload["position_actions"] = [item for item in payload["stocks"] if str(item.get("action") or "") in {"hold", "trim", "sell"}]
+        return payload
+
+    def refresh_strategy_positions(self, trade_date: str | None = None, template_key: str = "return_priority") -> dict:
+        plan = self._load_strategy_plan_by_date(trade_date=trade_date, template_key=template_key) if trade_date else self.latest_strategy_plan(template_key=template_key)
+        if not plan:
+            raise ValueError("当前没有可用的策略计划")
+        trade_date = str(plan.get("trade_date") or "")
+        config = dict(plan.get("config") or {})
+        previous_positions = self._load_latest_strategy_positions(template_key=template_key, before_trade_date=trade_date)
+        portfolio_value = float(config.get("initial_capital") or 1_000_000.0)
+        staged_positions: list[dict] = []
+
+        for item in plan.get("stocks") or []:
+            symbol = str(item.get("symbol") or "")
+            action = str(item.get("action") or "")
+            metrics = dict(item.get("metrics") or {})
+            latest_price = float(metrics.get("close") or metrics.get("signal_price_ref") or 0.0)
+            previous = previous_positions.get(symbol)
+            if previous and action in {"hold", "trim", "sell"}:
+                shares = float(previous.get("shares") or 0.0)
+                cost_price = float(previous.get("cost_price") or 0.0)
+                peak_price = max(float(previous.get("peak_price") or 0.0), latest_price)
+                status = "open"
+                if action == "trim":
+                    shares = round(shares * 0.5, 4)
+                elif action == "sell":
+                    shares = 0.0
+                    status = "closed"
+                market_value = round(shares * latest_price, 4)
+                staged_positions.append(
+                    {
+                        "symbol": symbol,
+                        "name": str(item.get("name") or previous.get("name") or ""),
+                        "status": status,
+                        "shares": shares,
+                        "cost_price": cost_price,
+                        "latest_price": latest_price,
+                        "market_value": market_value,
+                        "unrealized_pnl": round((latest_price - cost_price) * shares, 4),
+                        "unrealized_return": round((latest_price - cost_price) / max(cost_price, 0.01), 6) if cost_price else 0.0,
+                        "hold_days": int(previous.get("hold_days") or 0) + 1,
+                        "peak_return": round((peak_price - cost_price) / max(cost_price, 0.01), 6) if cost_price else 0.0,
+                        "peak_price": peak_price,
+                        "entry_signal_date": str(previous.get("entry_signal_date") or trade_date),
+                        "entry_execution_date": str(previous.get("entry_execution_date") or trade_date),
+                        "entry_cost_total": float(previous.get("entry_cost_total") or cost_price * shares),
+                        "trimmed": 1 if action == "trim" or bool(previous.get("trimmed")) else 0,
+                        "last_action": action,
+                        "last_action_reason": str(item.get("sell_reason") or ""),
+                    }
+                )
+            elif action == "buy" and latest_price > 0:
+                target_weight = float(item.get("target_weight") or 0.0)
+                allocation = portfolio_value * target_weight
+                shares = round(allocation / max(latest_price, 0.01), 4)
+                market_value = round(shares * latest_price, 4)
+                staged_positions.append(
+                    {
+                        "symbol": symbol,
+                        "name": str(item.get("name") or ""),
+                        "status": "open",
+                        "shares": shares,
+                        "cost_price": latest_price,
+                        "latest_price": latest_price,
+                        "market_value": market_value,
+                        "unrealized_pnl": 0.0,
+                        "unrealized_return": 0.0,
+                        "hold_days": 1,
+                        "peak_return": 0.0,
+                        "peak_price": latest_price,
+                        "entry_signal_date": trade_date,
+                        "entry_execution_date": trade_date,
+                        "entry_cost_total": market_value,
+                        "trimmed": 0,
+                        "last_action": "buy",
+                        "last_action_reason": str(item.get("buy_reason") or ""),
+                    }
+                )
+
+        total_open_value = sum(float(item["market_value"] or 0.0) for item in staged_positions if item["status"] == "open")
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM strategy_position WHERE trade_date = ? AND plan_run_id = ?", (trade_date, int(plan["id"])))
+            for item in staged_positions:
+                weight = round(float(item["market_value"] or 0.0) / total_open_value, 6) if total_open_value and item["status"] == "open" else 0.0
+                conn.execute(
+                    """
+                    INSERT INTO strategy_position
+                    (trade_date, symbol, name, status, shares, cost_price, latest_price, market_value, weight,
+                     unrealized_pnl, unrealized_return, hold_days, peak_return, peak_price,
+                     entry_signal_date, entry_execution_date, entry_cost_total, trimmed,
+                     last_action, last_action_reason, plan_run_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trade_date,
+                        item["symbol"],
+                        item["name"],
+                        item["status"],
+                        item["shares"],
+                        item["cost_price"],
+                        item["latest_price"],
+                        item["market_value"],
+                        weight,
+                        item["unrealized_pnl"],
+                        item["unrealized_return"],
+                        item["hold_days"],
+                        item["peak_return"],
+                        item["peak_price"],
+                        item["entry_signal_date"],
+                        item["entry_execution_date"],
+                        item["entry_cost_total"],
+                        item["trimmed"],
+                        item["last_action"],
+                        item["last_action_reason"],
+                        int(plan["id"]),
+                        now,
+                    ),
+                )
+        return {
+            "trade_date": trade_date,
+            "template_key": template_key,
+            "position_count": sum(1 for item in staged_positions if item["status"] == "open"),
+            "closed_count": sum(1 for item in staged_positions if item["status"] == "closed"),
+        }
+
+    def _load_strategy_plan_by_date(self, trade_date: str | None, template_key: str) -> dict | None:
+        if not trade_date:
+            return None
+        with self.db.connect() as conn:
+            run = conn.execute(
+                """
+                SELECT *
+                FROM strategy_plan_run
+                WHERE trade_date = ? AND template_key = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (trade_date, template_key),
+            ).fetchone()
+            if not run:
+                return None
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM strategy_plan_stock
+                WHERE run_id = ?
+                ORDER BY action ASC, priority_rank ASC, score_total DESC, symbol ASC
+                """,
+                (int(run["id"]),),
+            ).fetchall()
+            signals = conn.execute(
+                """
+                SELECT *
+                FROM strategy_trade_signal
+                WHERE plan_run_id = ?
+                ORDER BY signal_type ASC, symbol ASC
+                """,
+                (int(run["id"]),),
+            ).fetchall()
+        payload = dict(run)
+        payload["config"] = json.loads(payload.get("config_json") or "{}")
+        payload["stocks"] = []
+        for row in rows:
+            item = dict(row)
+            item["signals"] = json.loads(item.get("signals_json") or "[]")
+            item["metrics"] = json.loads(item.get("metrics_json") or "{}")
+            payload["stocks"].append(item)
+        payload["signals"] = []
+        for row in signals:
+            item = dict(row)
+            item["metrics"] = json.loads(item.get("metrics_json") or "{}")
+            payload["signals"].append(item)
+        payload["buy_candidates"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "buy"]
+        payload["avoid_list"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "avoid"]
+        payload["position_actions"] = [item for item in payload["stocks"] if str(item.get("action") or "") in {"hold", "trim", "sell"}]
+        return payload
+
+    def latest_strategy_positions(self, template_key: str = "return_priority") -> list[dict]:
+        plan = self.latest_strategy_plan(template_key=template_key)
+        if not plan:
+            return []
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM strategy_position
+                WHERE trade_date = ? AND plan_run_id = ?
+                ORDER BY status ASC, weight DESC, symbol ASC
+                """,
+                (str(plan["trade_date"]), int(plan["id"])),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _load_latest_strategy_positions(self, template_key: str, before_trade_date: str) -> dict[str, dict]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT sp.*
+                FROM strategy_position sp
+                JOIN strategy_plan_run spr ON spr.id = sp.plan_run_id
+                WHERE spr.template_key = ?
+                  AND sp.trade_date < ?
+                ORDER BY sp.trade_date DESC, sp.id DESC
+                """,
+                (template_key, before_trade_date),
+            ).fetchall()
+        latest_by_symbol: dict[str, dict] = {}
+        for row in rows:
+            item = dict(row)
+            symbol = str(item.get("symbol") or "")
+            if symbol and symbol not in latest_by_symbol:
+                latest_by_symbol[symbol] = item
+        return {
+            symbol: item
+            for symbol, item in latest_by_symbol.items()
+            if str(item.get("status") or "") == "open"
+        }
 
     def start_backtest_task(self, config: dict | None = None) -> int:
         payload = dict(config or {})
