@@ -1,0 +1,88 @@
+{
+  "name": "backtest-optimizer-v2",
+  "workspace": "D:/codex/stock_analysis",
+  "output_dir": "D:\\codex\\stock_analysis\\data\\optimizer\\rule_toggle_smoke",
+  "base_config": {
+    "name": "自动参数优化",
+    "start_date": "2025-10-01",
+    "end_date": "2026-03-19",
+    "lookback_days": 120,
+    "max_positions": 4,
+    "max_single_position": 0.3,
+    "initial_capital": 1000000,
+    "fee_rate": 0.0001,
+    "slippage_rate": 0.0001,
+    "market_require_benchmark_above_ma20": true,
+    "market_require_benchmark_ma20_up": false,
+    "enabled_buy_rules": [
+      "buy_strict",
+      "buy_momentum"
+    ],
+    "enabled_sell_rules": [
+      "sell_trim",
+      "sell_break_ma5",
+      "sell_drawdown",
+      "sell_time_stop",
+      "sell_flip_loss",
+      "sell_market_weak_drop"
+    ]
+  },
+  "search": {
+    "method": "random",
+    "trials": 4,
+    "seed": 42,
+    "top_k": 4,
+    "progress_every": 1,
+    "checkpoint_every": 1,
+    "stages": [
+      {
+        "name": "toggle-smoke",
+        "method": "grid",
+        "trials": 4,
+        "seed": 42,
+        "top_k": 4,
+        "relations": [],
+        "param_space": {
+          "enable_buy_momentum": {
+            "type": "bool",
+            "values": [
+              true,
+              false
+            ]
+          },
+          "enable_sell_time_stop": {
+            "type": "bool",
+            "values": [
+              true,
+              false
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "constraints": {
+    "min_trade_count": 5,
+    "max_drawdown_lte": 0.25,
+    "min_win_rate": 0.25
+  },
+  "objective": {
+    "primary": "total_return",
+    "mode": "max",
+    "secondary": [
+      {
+        "field": "excess_return",
+        "mode": "max"
+      },
+      {
+        "field": "max_drawdown",
+        "mode": "min"
+      }
+    ]
+  },
+  "report": {
+    "save_csv": true,
+    "save_json": true,
+    "save_md": true
+  }
+}

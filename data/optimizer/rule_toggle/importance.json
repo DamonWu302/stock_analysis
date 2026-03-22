@@ -1,0 +1,52 @@
+{
+  "generated_at": "2026-03-22 01:22:51",
+  "objective": "total_return",
+  "parameter_count": 5,
+  "parameters": [
+    {
+      "name": "enable_buy_momentum",
+      "importance_score": 0.1071,
+      "best_value": "True",
+      "best_avg_objective": 0.108504,
+      "worst_value": "False",
+      "worst_avg_objective": 0.001403,
+      "bucket_count": 2
+    },
+    {
+      "name": "enable_sell_trim",
+      "importance_score": 0.019699,
+      "best_value": "False",
+      "best_avg_objective": 0.064803,
+      "worst_value": "True",
+      "worst_avg_objective": 0.045104,
+      "bucket_count": 2
+    },
+    {
+      "name": "enable_sell_break_ma5",
+      "importance_score": 0.013444,
+      "best_value": "False",
+      "best_avg_objective": 0.061676,
+      "worst_value": "True",
+      "worst_avg_objective": 0.048232,
+      "bucket_count": 2
+    },
+    {
+      "name": "enable_sell_market_weak_drop",
+      "importance_score": 0.002787,
+      "best_value": "True",
+      "best_avg_objective": 0.056347,
+      "worst_value": "False",
+      "worst_avg_objective": 0.05356,
+      "bucket_count": 2
+    },
+    {
+      "name": "enable_sell_time_stop",
+      "importance_score": 0.001875,
+      "best_value": "True",
+      "best_avg_objective": 0.055891,
+      "worst_value": "False",
+      "worst_avg_objective": 0.054016,
+      "bucket_count": 2
+    }
+  ]
+}

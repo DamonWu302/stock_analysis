@@ -583,3 +583,479 @@ stability_score >= 2
 - 区分“长期稳定”和“近期稳定”
 - 对不同参数类型使用不同稳定分公式
 - 达到连续多轮强共识后，自动移出搜索空间
+
+## 15. `optimizer.sample.json` 字段字典
+
+这一节对应当前示例配置文件：
+
+- [optimizer.sample.json](/D:/codex/stock_analysis/optimizer.sample.json)
+
+用于说明优化器配置的每个字段含义、层级关系和常见取值方式。
+
+### 15.1 顶层字段
+
+#### `name`
+
+- 类型：`string`
+- 作用：本轮优化任务名称
+- 示例：`backtest-optimizer-v2`
+
+#### `workspace`
+
+- 类型：`string`
+- 作用：项目工作目录
+- 通常指向项目根目录
+
+#### `output_dir`
+
+- 类型：`string`
+- 作用：优化结果输出目录
+- 会写入：
+  - `backtest_trials.csv`
+  - `best_params.json`
+  - `importance.json`
+  - `optimizer_report.md`
+  - `next_round_config.json`
+  - `optimizer_llm_*`
+
+#### `base_config`
+
+- 类型：`object`
+- 作用：所有 trial 共用的回测基础配置
+
+#### `search`
+
+- 类型：`object`
+- 作用：定义参数搜索方式、阶段和参数空间
+
+#### `constraints`
+
+- 类型：`object`
+- 作用：定义结果过滤条件
+- 不满足的方案即使收益高，也会被视为不合格
+
+#### `objective`
+
+- 类型：`object`
+- 作用：定义优化排序目标
+
+#### `report`
+
+- 类型：`object`
+- 作用：定义哪些结果文件需要输出
+
+### 15.2 `base_config` 字段字典
+
+`base_config` 是实际传入回测引擎的固定参数部分。
+
+#### `base_config.name`
+
+- 类型：`string`
+- 作用：单次回测配置名称
+
+#### `base_config.start_date`
+
+- 类型：`string`
+- 格式：`YYYY-MM-DD`
+- 作用：回测开始日期
+
+#### `base_config.end_date`
+
+- 类型：`string`
+- 格式：`YYYY-MM-DD`
+- 作用：回测结束日期
+
+#### `base_config.lookback_days`
+
+- 类型：`int`
+- 作用：最近交易日数
+- 备注：
+  - 如果同时给了 `start_date/end_date`
+  - 实际通常优先用日期区间
+
+#### `base_config.max_positions`
+
+- 类型：`int`
+- 作用：最多持有股票数
+
+#### `base_config.max_single_position`
+
+- 类型：`float`
+- 作用：单只股票最大仓位上限
+- 示例：`0.30` 表示最多 `30%`
+
+#### `base_config.initial_capital`
+
+- 类型：`float`
+- 作用：初始资金
+
+#### `base_config.fee_rate`
+
+- 类型：`float`
+- 作用：手续费率
+- 示例：`0.001` 表示 `0.1%`
+
+#### `base_config.slippage_rate`
+
+- 类型：`float`
+- 作用：滑点率
+- 示例：`0.001` 表示 `0.1%`
+
+#### `base_config.market_require_benchmark_above_ma20`
+
+- 类型：`bool`
+- 作用：是否要求大盘收盘价站上 `MA20` 才允许开仓
+
+#### `base_config.market_require_benchmark_ma20_up`
+
+- 类型：`bool`
+- 作用：是否要求大盘 `MA20` 方向向上
+
+#### `base_config.enabled_buy_rules`
+
+- 类型：`string[]`
+- 作用：启用的买入规则列表
+- 当前常见值：
+  - `buy_strict`
+  - `buy_momentum`
+
+#### `base_config.enabled_sell_rules`
+
+- 类型：`string[]`
+- 作用：启用的卖出规则列表
+- 当前常见值：
+  - `sell_trim`
+  - `sell_break_ma5`
+  - `sell_drawdown`
+  - `sell_time_stop`
+  - `sell_flip_loss`
+  - `sell_market_weak_drop`
+
+### 15.3 `search` 字段字典
+
+#### `search.method`
+
+- 类型：`string`
+- 作用：默认搜索方式
+- 常见值：
+  - `random`
+  - `grid`
+
+#### `search.trials`
+
+- 类型：`int`
+- 作用：默认总试验次数
+
+#### `search.seed`
+
+- 类型：`int`
+- 作用：随机种子，保证结果可复现
+
+#### `search.top_k`
+
+- 类型：`int`
+- 作用：保留的前几名结果数量
+
+#### `search.progress_every`
+
+- 类型：`int`
+- 作用：每跑多少个 trial 打印一次进度
+
+#### `search.checkpoint_every`
+
+- 类型：`int`
+- 作用：每跑多少个 trial 做一次阶段性输出
+
+#### `search.stages`
+
+- 类型：`object[]`
+- 作用：多阶段优化配置
+- 常见场景：
+  - 第一阶段粗搜
+  - 第二阶段围绕前几组结果细搜
+
+### 15.4 `search.stages[]` 字段字典
+
+每个 stage 表示一轮独立的搜索阶段。
+
+#### `search.stages[].name`
+
+- 类型：`string`
+- 作用：阶段名称
+- 示例：
+  - `coarse`
+  - `refine`
+
+#### `search.stages[].method`
+
+- 类型：`string`
+- 作用：该阶段搜索方法
+- 常见值：
+  - `random`
+  - `grid`
+  - `refine`
+
+#### `search.stages[].trials`
+
+- 类型：`int`
+- 作用：该阶段试验次数
+
+#### `search.stages[].seed`
+
+- 类型：`int`
+- 作用：该阶段随机种子
+
+#### `search.stages[].top_k`
+
+- 类型：`int`
+- 作用：该阶段保留结果数量
+
+#### `search.stages[].source_top_n`
+
+- 类型：`int`
+- 作用：`refine` 阶段从上一阶段前几名结果展开
+- 一般只在 `refine` 阶段使用
+
+#### `search.stages[].radius_steps`
+
+- 类型：`int`
+- 作用：`refine` 阶段围绕最优值向两边扩几步
+
+#### `search.stages[].relations`
+
+- 类型：`object[]`
+- 作用：参数联动约束
+- 用于限制不合理参数组合
+
+#### `search.stages[].param_space`
+
+- 类型：`object`
+- 作用：当前阶段实际可搜索的参数空间
+
+### 15.5 `relations[]` 字段字典
+
+每条 relation 定义一个参数之间的约束关系。
+
+#### `relations[].left`
+
+- 类型：`string`
+- 作用：左侧参数名
+
+#### `relations[].operator`
+
+- 类型：`string`
+- 作用：比较运算符
+- 常见值：
+  - `>=`
+  - `>`
+  - `<=`
+  - `<`
+  - `==`
+
+#### `relations[].right`
+
+- 类型：`string`
+- 作用：右侧参数名
+
+#### `relations[].message`
+
+- 类型：`string`
+- 作用：当约束不满足时的说明文字
+
+### 15.6 `param_space` 字段字典
+
+`param_space` 的 key 是参数名，value 是该参数的搜索规则。
+
+例如：
+
+- `market_score_filter_min_avg`
+- `buy_strict_score_total`
+- `buy_momentum_score_total`
+- `buy_min_core_hits`
+- `buy_amount_min`
+- `max_single_position`
+- `sell_market_score_threshold`
+- `sell_market_drop_threshold`
+
+每个参数 spec 常见字段如下。
+
+#### `param_space.<param>.type`
+
+- 类型：`string`
+- 作用：参数类型
+- 常见值：
+  - `int`
+  - `float`
+  - `bool`
+
+#### `param_space.<param>.min`
+
+- 类型：`int | float`
+- 作用：搜索区间下界
+
+#### `param_space.<param>.max`
+
+- 类型：`int | float`
+- 作用：搜索区间上界
+
+#### `param_space.<param>.step`
+
+- 类型：`int | float`
+- 作用：步长
+
+#### `param_space.<param>.values`
+
+- 类型：`array`
+- 作用：离散值列表
+- 典型场景：
+  - 参数已固定
+  - 或只想测试几个明确值
+
+### 15.7 `constraints` 字段字典
+
+#### `constraints.min_trade_count`
+
+- 类型：`int`
+- 作用：最少交易次数
+- 低于这个值的方案会被视为样本不足
+
+#### `constraints.max_drawdown_lte`
+
+- 类型：`float`
+- 作用：最大回撤上限
+- 示例：`0.25` 表示最大回撤不能超过 `25%`
+
+#### `constraints.min_win_rate`
+
+- 类型：`float`
+- 作用：最低胜率要求
+- 示例：`0.25` 表示胜率至少 `25%`
+
+### 15.8 `objective` 字段字典
+
+#### `objective.primary`
+
+- 类型：`string`
+- 作用：主排序目标
+- 当前常见值：
+  - `total_return`
+
+#### `objective.mode`
+
+- 类型：`string`
+- 作用：主目标排序方式
+- 常见值：
+  - `max`
+  - `min`
+
+#### `objective.secondary`
+
+- 类型：`object[]`
+- 作用：次级排序目标
+
+每条 secondary 包含：
+
+- `field`
+  - 指标字段名
+- `mode`
+  - 排序方式
+
+示例：
+
+- `{"field": "excess_return", "mode": "max"}`
+- `{"field": "max_drawdown", "mode": "min"}`
+
+### 15.9 `report` 字段字典
+
+#### `report.save_csv`
+
+- 类型：`bool`
+- 作用：是否输出 CSV 明细结果
+
+#### `report.save_json`
+
+- 类型：`bool`
+- 作用：是否输出 JSON 结果文件
+
+#### `report.save_md`
+
+- 类型：`bool`
+- 作用：是否输出 Markdown 报告
+
+### 15.10 当前 `optimizer.sample.json` 的参数空间摘要
+
+当前示例配置实际搜索的主要参数有：
+
+- `market_score_filter_min_avg`
+- `market_score_filter_min_ma5`
+- `enable_buy_momentum`
+- `enable_sell_time_stop`
+- `buy_strict_score_total`
+- `buy_momentum_score_total`
+- `buy_min_core_hits`
+- `buy_amount_min`
+- `max_single_position`
+- `sell_market_score_threshold`
+- `sell_market_drop_threshold`
+
+其中：
+
+- `coarse` 阶段先粗搜
+- `refine` 阶段围绕上一阶段前 `3` 名结果继续细搜
+
+### 15.10.1 规则开关字段
+
+优化器现在支持把“规则是否启用”也作为搜索参数，而不是只优化阈值。
+
+当前支持的规则开关字段如下：
+
+- `enable_buy_strict`
+  - 映射到：`buy_strict`
+- `enable_buy_momentum`
+  - 映射到：`buy_momentum`
+- `enable_sell_trim`
+  - 映射到：`sell_trim`
+- `enable_sell_break_ma5`
+  - 映射到：`sell_break_ma5`
+- `enable_sell_drawdown`
+  - 映射到：`sell_drawdown`
+- `enable_sell_time_stop`
+  - 映射到：`sell_time_stop`
+- `enable_sell_flip_loss`
+  - 映射到：`sell_flip_loss`
+- `enable_sell_market_weak_drop`
+  - 映射到：`sell_market_weak_drop`
+
+配置方式示例：
+
+```json
+{
+  "enable_buy_momentum": { "type": "bool", "values": [true, false] },
+  "enable_sell_time_stop": { "type": "bool", "values": [true, false] }
+}
+```
+
+含义是：
+
+- 优化器会自动比较：
+  - 这条规则开启
+  - 这条规则关闭
+- 再根据收益、回撤、交易数等结果判断哪种更优
+
+说明：
+
+- 这些布尔开关不是直接替代 `enabled_buy_rules / enabled_sell_rules`
+- 而是在每个 trial 执行前，自动映射成真实的启用规则列表
+- 所以你依然可以保留基础配置里的默认规则集合，再让优化器在 trial 层做开关比较
+
+### 15.11 当前 `optimizer.sample.json` 的联动约束
+
+当前示例中已经定义了一条参数联动：
+
+- `buy_strict_score_total >= buy_momentum_score_total`
+
+含义是：
+
+- 严格买入总分阈值不应低于增强买入总分阈值
+
+这类 relation 很重要，因为它能避免优化器搜索出逻辑上矛盾的参数组合。

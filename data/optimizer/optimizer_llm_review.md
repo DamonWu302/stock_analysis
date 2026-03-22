@@ -1,31 +1,33 @@
 # 参数优化 LLM 复盘
 
-- 生成时间：`2026-03-21 22:19:33`
+- 生成时间：`2026-03-22 00:52:48`
 - 模型：`deepseek-reasoner`
 - 输出目录：`D:\codex\stock_analysis\data\optimizer`
 
 ## 总结
 
-本轮优化中最佳试验获得14.53%总收益和12.69%超额收益，最大回撤5.46%，表现良好但基于10个有限样本。
+本轮优化最佳试验总收益13.99%，超额收益12.14%，最大回撤7.58%，表现良好但基于有限样本需谨慎。
 
 ## 最佳模式
 
-- buy_strict_score_total在78附近时总收益较高
-- buy_min_core_hits=4与较低最大回撤和较高收益相关
+- 高总收益与高胜率（66.67%）相关，胜率高于0.6时收益较优
+- 市场过滤器参数market_score_filter_min_avg在41附近表现稳定，buy_strict_score_total在74左右收益最高
 
 ## 建议固定参数
 
-- {"name": "buy_min_core_hits", "reason": "在最优和次优试验中均为4，而值为3或5时收益下降且回撤增加", "value": 4}
+- {"name": "buy_min_core_hits", "reason": "历史稳定参数，但本轮最佳试验值为4（总收益13.99%），且值1和2表现较差，反证历史值2，建议固定为4以提升收益", "value": "4"}
 
 ## 建议收窄参数
 
-- {"name": "market_score_filter_min_avg", "reason": "最优值集中在33-35（如试验#16和#5），较高值如37导致性能下降", "current_range": "33-37（从数据推断）", "suggested_range": "33-35"}
-- {"name": "buy_strict_score_total", "reason": "78在多个好试验中出现（如#16和#6），较低值如72收益较差", "current_range": "72-78（从数据推断）", "suggested_range": "76-78"}
-- {"name": "buy_amount_min", "reason": "最优值为200,000,000，较高值如400,000,000与较低收益相关", "current_range": "200,000,000-400,000,000（从数据推断）", "suggested_range": "200,000,000-300,000,000"}
+- {"name": "buy_strict_score_total", "reason": "重要性最高（0.241428），最佳值74，收益显著优于其他值，建议缩窄范围以聚焦最优区域", "current_range": "70-78, step 2", "suggested_range": "72-76, step 2"}
+- {"name": "buy_momentum_score_total", "reason": "重要性高（0.222083），最佳值54，收益稳定，建议缩窄以降低噪声", "current_range": "50-60, step 2", "suggested_range": "52-56, step 2"}
+- {"name": "sell_market_score_threshold", "reason": "重要性高（0.222083），最佳值32，在多个试验中表现良好，建议缩窄提高稳定性", "current_range": "30-34, step 1", "suggested_range": "31-33, step 1"}
+- {"name": "market_score_filter_min_avg", "reason": "重要性高（0.220258），最佳值41，范围较宽，缩窄可减少过拟合风险", "current_range": "35-45, step 1", "suggested_range": "40-42, step 1"}
+- {"name": "market_score_filter_min_ma5", "reason": "重要性中等（0.200912），最佳值34，当前范围33-40，缩窄以聚焦有效区间", "current_range": "33-40, step 1", "suggested_range": "33-35, step 1"}
 
 ## 建议放宽参数
 
-- {"name": "sell_market_drop_threshold", "reason": "在-2.0到-4.0之间变化，对收益和回撤影响不显著，可放宽以探索更多值", "current_range": "-2.0 to -4.0（从数据推断）", "suggested_range": "-2.0 to -5.0"}
+- 暂无
 
 ## 规则开关建议
 
@@ -33,10 +35,10 @@
 
 ## 风险提示
 
-- 试验数量仅10个，可能存在过拟合或偶然性，建议增加样本量
-- 部分试验最大回撤超过10%（如试验#5达9.75%），需监控风险控制
+- 样本天数仅114天，交易次数30左右，可能存在统计波动和过拟合风险
+- 最佳试验胜率高但需更多数据验证泛化能力
 
 ## 下一轮重点
 
-- 增加试验数以验证参数稳定性和统计显著性
-- 微调market_score_filter_min_ma5和sell_market_score_threshold以优化收益回撤比
+- 缩窄高重要性参数如buy_strict_score_total和market_score_filter_min_avg，验证其稳定性
+- 测试固定参数buy_min_core_hits为4时的表现，确保收益与风险平衡

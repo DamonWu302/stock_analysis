@@ -1,0 +1,25 @@
+{
+  "generated_at": "2026-03-22 01:08:51",
+  "objective": "total_return",
+  "parameter_count": 2,
+  "parameters": [
+    {
+      "name": "enable_buy_momentum",
+      "importance_score": 0.031759,
+      "best_value": "False",
+      "best_avg_objective": -0.013383,
+      "worst_value": "True",
+      "worst_avg_objective": -0.045142,
+      "bucket_count": 2
+    },
+    {
+      "name": "enable_sell_time_stop",
+      "importance_score": 0.0,
+      "best_value": "True",
+      "best_avg_objective": -0.029263,
+      "worst_value": "True",
+      "worst_avg_objective": -0.029263,
+      "bucket_count": 2
+    }
+  ]
+}

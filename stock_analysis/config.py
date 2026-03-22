@@ -23,7 +23,9 @@ class Settings:
     llm_api_base: str = os.getenv("LLM_API_BASE", "https://api.openai.com/v1")
     llm_api_key: str | None = os.getenv("LLM_API_KEY") or None
     llm_model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    llm_timeout_seconds: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    llm_timeout_seconds: int = int(os.getenv("LLM_TIMEOUT_SECONDS", "180"))
+    llm_connect_timeout_seconds: int = int(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS", "20"))
+    llm_max_retries: int = int(os.getenv("LLM_MAX_RETRIES", "3"))
 
 
 settings = Settings()

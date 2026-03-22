@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -234,33 +235,51 @@ class OptimizerLLMReviewService:
     def _call_llm(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         if not settings.llm_api_key:
             raise RuntimeError("未配置 LLM_API_KEY，无法执行优化器 LLM 复盘。")
-        response = requests.post(
-            f"{settings.llm_api_base.rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.llm_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.llm_model,
-                "messages": messages,
-                "temperature": 0.2,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=settings.llm_timeout_seconds,
-        )
-        if not response.ok:
+        last_error: Exception | None = None
+        for attempt in range(1, max(int(settings.llm_max_retries), 1) + 1):
             try:
-                payload = response.json()
-            except Exception:
-                payload = response.text
-            raise RuntimeError(
-                f"优化器 LLM 复盘失败: HTTP {response.status_code}, payload: {payload}"
-            )
-        content = response.json()["choices"][0]["message"]["content"].strip()
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"优化器 LLM 返回了非 JSON 内容: {content[:500]}") from exc
+                response = requests.post(
+                    f"{settings.llm_api_base.rstrip('/')}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.llm_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": settings.llm_model,
+                        "messages": messages,
+                        "temperature": 0.2,
+                        "response_format": {"type": "json_object"},
+                    },
+                    timeout=(
+                        settings.llm_connect_timeout_seconds,
+                        settings.llm_timeout_seconds,
+                    ),
+                )
+                if not response.ok:
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        payload = response.text
+                    raise RuntimeError(
+                        f"优化器 LLM 复盘失败: HTTP {response.status_code}, payload: {payload}"
+                    )
+                content = response.json()["choices"][0]["message"]["content"].strip()
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"优化器 LLM 返回了非 JSON 内容: {content[:500]}") from exc
+            except (requests.ReadTimeout, requests.ConnectTimeout, requests.ConnectionError) as exc:
+                last_error = exc
+                if attempt >= max(int(settings.llm_max_retries), 1):
+                    break
+                time.sleep(min(2 ** (attempt - 1), 8))
+                continue
+            except requests.RequestException as exc:
+                last_error = exc
+                break
+        raise RuntimeError(
+            f"优化器 LLM 请求失败，已重试 {max(int(settings.llm_max_retries), 1)} 次: {last_error}"
+        ) from last_error
 
     def _merge_review_into_next_round(
         self,

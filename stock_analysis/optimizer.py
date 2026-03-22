@@ -6,6 +6,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .backtest import (
+    BUY_RULE_MOMENTUM,
+    BUY_RULE_STRICT,
+    SELL_RULE_BREAK_MA5,
+    SELL_RULE_DRAWDOWN,
+    SELL_RULE_FLIP_LOSS,
+    SELL_RULE_MARKET_WEAK_DROP,
+    SELL_RULE_TIME_STOP,
+    SELL_RULE_TRIM,
+)
 from .backtest_runner import BacktestRunner
 from .config import settings
 from .db import Database
@@ -24,6 +34,18 @@ from .optimizer_types import (
     StageSpec,
     TrialResult,
 )
+
+
+RULE_TOGGLE_FIELDS: dict[str, tuple[str, str]] = {
+    "enable_buy_strict": ("buy", BUY_RULE_STRICT),
+    "enable_buy_momentum": ("buy", BUY_RULE_MOMENTUM),
+    "enable_sell_trim": ("sell", SELL_RULE_TRIM),
+    "enable_sell_break_ma5": ("sell", SELL_RULE_BREAK_MA5),
+    "enable_sell_drawdown": ("sell", SELL_RULE_DRAWDOWN),
+    "enable_sell_time_stop": ("sell", SELL_RULE_TIME_STOP),
+    "enable_sell_flip_loss": ("sell", SELL_RULE_FLIP_LOSS),
+    "enable_sell_market_weak_drop": ("sell", SELL_RULE_MARKET_WEAK_DROP),
+}
 
 
 def _load_relations(payload: dict[str, Any]) -> list[RelationRule]:
@@ -124,8 +146,7 @@ class BacktestOptimizer:
                         passed_constraints=False,
                     )
                 else:
-                    trial_config = dict(self.config.base_config)
-                    trial_config.update(params)
+                    trial_config = self._build_trial_backtest_config(params)
                     trial_config["name"] = f"{self.config.name}-{stage.name}-{stage_offset:03d}"
                     try:
                         summary = self.runner.run(trial_config)
@@ -192,6 +213,37 @@ class BacktestOptimizer:
             "failed_count": sum(1 for item in trials if item.status == "failed"),
             "completed_count": sum(1 for item in trials if item.status == "completed"),
         }
+
+    def _build_trial_backtest_config(self, params: dict[str, Any]) -> dict[str, Any]:
+        trial_config = dict(self.config.base_config)
+        trial_config.update(params)
+        buy_rules = list(trial_config.get("enabled_buy_rules") or self.config.base_config.get("enabled_buy_rules") or [])
+        sell_rules = list(trial_config.get("enabled_sell_rules") or self.config.base_config.get("enabled_sell_rules") or [])
+
+        buy_set = set(buy_rules)
+        sell_set = set(sell_rules)
+        for field_name, (group, rule_id) in RULE_TOGGLE_FIELDS.items():
+            if field_name not in params:
+                continue
+            enabled = bool(params[field_name])
+            if group == "buy":
+                if enabled:
+                    buy_set.add(rule_id)
+                else:
+                    buy_set.discard(rule_id)
+            else:
+                if enabled:
+                    sell_set.add(rule_id)
+                else:
+                    sell_set.discard(rule_id)
+
+        trial_config["enabled_buy_rules"] = [rule for rule in buy_rules if rule in buy_set] + [
+            rule for rule in sorted(buy_set) if rule not in buy_rules
+        ]
+        trial_config["enabled_sell_rules"] = [rule for rule in sell_rules if rule in sell_set] + [
+            rule for rule in sorted(sell_set) if rule not in sell_rules
+        ]
+        return trial_config
 
     def _build_stage_specs(self) -> list[StageSpec]:
         if not self.config.search.stages:

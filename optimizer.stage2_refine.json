@@ -1,0 +1,163 @@
+{
+  "name": "backtest-stage2-refine",
+  "workspace": "D:/codex/stock_analysis",
+  "output_dir": "D:/codex/stock_analysis/data/optimizer/stage2_refine",
+  "base_config": {
+    "name": "第二阶段规则阈值联合微调",
+    "start_date": "2025-10-01",
+    "end_date": "2026-03-19",
+    "lookback_days": 120,
+    "max_positions": 4,
+    "max_single_position": 0.30,
+    "initial_capital": 1000000,
+    "fee_rate": 0.0001,
+    "slippage_rate": 0.0001,
+    "market_require_benchmark_above_ma20": true,
+    "market_require_benchmark_ma20_up": false,
+    "enabled_buy_rules": [
+      "buy_strict",
+      "buy_momentum"
+    ],
+    "enabled_sell_rules": [
+      "sell_trim",
+      "sell_break_ma5",
+      "sell_drawdown",
+      "sell_time_stop",
+      "sell_flip_loss",
+      "sell_market_weak_drop"
+    ],
+    "market_score_filter_min_avg": 35,
+    "market_score_filter_min_ma5": 35,
+    "buy_strict_score_total": 74,
+    "buy_strict_score_ma_trend": 14,
+    "buy_strict_score_breakout": 12,
+    "buy_strict_score_capital_sector": 10,
+    "buy_strict_score_volume_pattern": 14,
+    "buy_momentum_score_total": 68,
+    "buy_momentum_score_volume_pattern": 14,
+    "buy_min_core_hits": 4,
+    "buy_low_position_high_ratio_max": 0.95,
+    "buy_20d_gain_max": 15,
+    "buy_recent_stall_lookback": 3,
+    "buy_recent_stall_pct_max": 1.0,
+    "buy_recent_stall_volume_multiple": 1.2,
+    "buy_risk_amplitude_max": 0.20,
+    "buy_risk_max_drop_max": 0.12,
+    "buy_sector_rank_top_pct": 0.50,
+    "buy_amount_min": 250000000,
+    "sell_trim_profit_threshold": 0.08,
+    "sell_trim_fraction": 0.5,
+    "sell_trim_upper_shadow_ratio": 0.03,
+    "sell_trim_volume_multiple": 1.2,
+    "sell_break_ma5_volume_multiple": 1.0,
+    "sell_drawdown_profit_threshold": 0.10,
+    "sell_drawdown_threshold": 0.05,
+    "sell_drawdown_profit_threshold_mid": 0.18,
+    "sell_drawdown_threshold_mid": 0.06,
+    "sell_drawdown_profit_threshold_high": 0.30,
+    "sell_drawdown_threshold_high": 0.08,
+    "sell_time_stop_days": 10,
+    "sell_time_stop_return_threshold": 0.02,
+    "sell_market_score_threshold": 35,
+    "sell_market_drop_threshold": -3.0
+  },
+  "search": {
+    "method": "random",
+    "trials": 80,
+    "seed": 42,
+    "top_k": 15,
+    "progress_every": 5,
+    "checkpoint_every": 10,
+    "stages": [
+      {
+        "name": "coarse",
+        "method": "random",
+        "trials": 48,
+        "seed": 42,
+        "top_k": 12,
+        "relations": [
+          {
+            "left": "buy_strict_score_total",
+            "operator": ">=",
+            "right": "buy_momentum_score_total",
+            "message": "严格买入总分阈值不应低于增强买入总分阈值"
+          }
+        ],
+        "param_space": {
+          "enable_buy_momentum": { "type": "bool", "values": [true] },
+          "enable_sell_trim": { "type": "bool", "values": [false] },
+          "enable_sell_break_ma5": { "type": "bool", "values": [false] },
+          "enable_sell_market_weak_drop": { "type": "bool", "values": [true, false] },
+          "enable_sell_time_stop": { "type": "bool", "values": [true, false] },
+          "market_score_filter_min_avg": { "type": "int", "min": 33, "max": 38, "step": 1 },
+          "market_score_filter_min_ma5": { "type": "int", "min": 33, "max": 38, "step": 1 },
+          "buy_strict_score_total": { "type": "int", "min": 72, "max": 78, "step": 2 },
+          "buy_momentum_score_total": { "type": "int", "min": 66, "max": 72, "step": 2 },
+          "buy_min_core_hits": { "type": "int", "min": 3, "max": 5, "step": 1 },
+          "buy_amount_min": { "type": "float", "min": 200000000, "max": 350000000, "step": 50000000 },
+          "max_single_position": { "type": "float", "min": 0.25, "max": 0.35, "step": 0.05 },
+          "sell_drawdown_threshold": { "type": "float", "min": 0.04, "max": 0.07, "step": 0.01 },
+          "sell_drawdown_threshold_mid": { "type": "float", "min": 0.05, "max": 0.08, "step": 0.01 },
+          "sell_time_stop_days": { "type": "int", "min": 8, "max": 12, "step": 1 },
+          "sell_market_score_threshold": { "type": "int", "min": 33, "max": 38, "step": 1 },
+          "sell_market_drop_threshold": { "type": "float", "min": -4.0, "max": -2.0, "step": 0.5 }
+        }
+      },
+      {
+        "name": "refine",
+        "method": "refine",
+        "trials": 32,
+        "seed": 84,
+        "top_k": 10,
+        "source_top_n": 5,
+        "radius_steps": 1,
+        "relations": [
+          {
+            "left": "buy_strict_score_total",
+            "operator": ">=",
+            "right": "buy_momentum_score_total",
+            "message": "严格买入总分阈值不应低于增强买入总分阈值"
+          }
+        ],
+        "param_space": {
+          "enable_buy_momentum": { "type": "bool", "values": [true] },
+          "enable_sell_trim": { "type": "bool", "values": [false] },
+          "enable_sell_break_ma5": { "type": "bool", "values": [false] },
+          "enable_sell_market_weak_drop": { "type": "bool", "values": [true, false] },
+          "enable_sell_time_stop": { "type": "bool", "values": [true, false] },
+          "market_score_filter_min_avg": { "type": "int", "min": 33, "max": 38, "step": 1 },
+          "market_score_filter_min_ma5": { "type": "int", "min": 33, "max": 38, "step": 1 },
+          "buy_strict_score_total": { "type": "int", "min": 72, "max": 78, "step": 2 },
+          "buy_momentum_score_total": { "type": "int", "min": 66, "max": 72, "step": 2 },
+          "buy_min_core_hits": { "type": "int", "min": 3, "max": 5, "step": 1 },
+          "buy_amount_min": { "type": "float", "min": 200000000, "max": 350000000, "step": 50000000 },
+          "max_single_position": { "type": "float", "min": 0.25, "max": 0.35, "step": 0.05 },
+          "sell_drawdown_threshold": { "type": "float", "min": 0.04, "max": 0.07, "step": 0.01 },
+          "sell_drawdown_threshold_mid": { "type": "float", "min": 0.05, "max": 0.08, "step": 0.01 },
+          "sell_time_stop_days": { "type": "int", "min": 8, "max": 12, "step": 1 },
+          "sell_market_score_threshold": { "type": "int", "min": 33, "max": 38, "step": 1 },
+          "sell_market_drop_threshold": { "type": "float", "min": -4.0, "max": -2.0, "step": 0.5 }
+        }
+      }
+    ]
+  },
+  "constraints": {
+    "min_trade_count": 8,
+    "max_drawdown_lte": 0.20,
+    "min_win_rate": 0.30
+  },
+  "objective": {
+    "primary": "total_return",
+    "mode": "max",
+    "secondary": [
+      { "field": "excess_return", "mode": "max" },
+      { "field": "max_drawdown", "mode": "min" },
+      { "field": "trade_count", "mode": "max" }
+    ]
+  },
+  "report": {
+    "save_csv": true,
+    "save_json": true,
+    "save_md": true
+  }
+}

@@ -1,7 +1,7 @@
 {
-  "name": "backtest-optimizer-v2-next-round-llm",
+  "name": "backtest-optimizer-v2-next-round",
   "workspace": "D:/codex/stock_analysis",
-  "output_dir": "D:\\codex\\stock_analysis\\data\\optimizer",
+  "output_dir": "D:/codex/stock_analysis/data/optimizer",
   "base_config": {
     "name": "自动参数优化",
     "start_date": "2025-10-01",
@@ -29,7 +29,7 @@
   },
   "search": {
     "method": "random",
-    "trials": 40,
+    "trials": 50,
     "seed": 42,
     "top_k": 5,
     "progress_every": 5,
@@ -57,33 +57,47 @@
         "param_space": {
           "market_score_filter_min_avg": {
             "type": "int",
-            "min": -42,
-            "max": 40,
+            "min": 35,
+            "max": 47,
             "step": 1
           },
           "market_score_filter_min_ma5": {
             "type": "int",
-            "min": -35,
-            "max": 33,
+            "min": 33,
+            "max": 45,
             "step": 1
+          },
+          "enable_buy_momentum": {
+            "type": "bool",
+            "values": [
+              false,
+              true
+            ]
+          },
+          "enable_sell_time_stop": {
+            "type": "bool",
+            "values": [
+              true,
+              false
+            ]
           },
           "buy_strict_score_total": {
             "type": "int",
-            "min": -76,
-            "max": 72,
+            "min": 54,
+            "max": 74,
             "step": 2
           },
           "buy_momentum_score_total": {
             "type": "int",
-            "min": -56,
-            "max": 52,
+            "min": 52,
+            "max": 66,
             "step": 2
           },
           "buy_min_core_hits": {
             "type": "int",
-            "values": [
-              4
-            ]
+            "min": 1,
+            "max": 3,
+            "step": 1
           },
           "buy_amount_min": {
             "type": "float",
@@ -99,8 +113,8 @@
           },
           "sell_market_score_threshold": {
             "type": "int",
-            "min": -33,
-            "max": 31,
+            "min": 30,
+            "max": 40,
             "step": 1
           },
           "sell_market_drop_threshold": {
@@ -131,33 +145,47 @@
         "param_space": {
           "market_score_filter_min_avg": {
             "type": "int",
-            "min": -42,
-            "max": 40,
+            "min": 35,
+            "max": 47,
             "step": 1
           },
           "market_score_filter_min_ma5": {
             "type": "int",
-            "min": -35,
-            "max": 33,
+            "min": 33,
+            "max": 45,
             "step": 1
+          },
+          "enable_buy_momentum": {
+            "type": "bool",
+            "values": [
+              false,
+              true
+            ]
+          },
+          "enable_sell_time_stop": {
+            "type": "bool",
+            "values": [
+              true,
+              false
+            ]
           },
           "buy_strict_score_total": {
             "type": "int",
-            "min": -76,
-            "max": 72,
+            "min": 54,
+            "max": 74,
             "step": 2
           },
           "buy_momentum_score_total": {
             "type": "int",
-            "min": -56,
-            "max": 52,
+            "min": 52,
+            "max": 66,
             "step": 2
           },
           "buy_min_core_hits": {
             "type": "int",
-            "values": [
-              4
-            ]
+            "min": 1,
+            "max": 3,
+            "step": 1
           },
           "buy_amount_min": {
             "type": "float",
@@ -173,8 +201,8 @@
           },
           "sell_market_score_threshold": {
             "type": "int",
-            "min": -33,
-            "max": 31,
+            "min": 30,
+            "max": 40,
             "step": 1
           },
           "sell_market_drop_threshold": {
@@ -213,36 +241,30 @@
   },
   "generated_from_top_trials": [
     {
-      "trial_id": 4,
-      "run_id": 127,
+      "trial_id": 7,
+      "run_id": 147,
       "stage_name": "coarse"
     },
     {
-      "trial_id": 13,
-      "run_id": 132,
-      "stage_name": "refine"
-    },
-    {
       "trial_id": 14,
-      "run_id": 133,
+      "run_id": 152,
       "stage_name": "refine"
     },
     {
-      "trial_id": 7,
-      "run_id": 129,
+      "trial_id": 15,
+      "run_id": 153,
+      "stage_name": "refine"
+    },
+    {
+      "trial_id": 11,
+      "run_id": 149,
       "stage_name": "coarse"
     },
     {
       "trial_id": 1,
-      "run_id": 125,
+      "run_id": 142,
       "stage_name": "coarse"
     }
   ],
-  "generated_at": "2026-03-22 00:40:43",
-  "llm_review_applied_at": "2026-03-22 00:52:48",
-  "llm_review_summary": "本轮优化最佳试验总收益13.99%，超额收益12.14%，最大回撤7.58%，表现良好但基于有限样本需谨慎。",
-  "llm_memory_bias_applied": true,
-  "llm_stable_params_considered": [
-    "buy_min_core_hits"
-  ]
+  "generated_at": "2026-03-22 01:14:34"
 }

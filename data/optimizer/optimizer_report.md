@@ -1,8 +1,8 @@
-# 参数优化报告：backtest-optimizer-v1
+# 参数优化报告：backtest-optimizer-v2
 
-- 生成时间：`2026-03-21 21:21:40`
-- 搜索方法：`random`
-- 结果数量：`10`
+- 生成时间：`2026-03-22 01:14:34`
+- 搜索阶段数：`2`
+- 结果数量：`5`
 
 ## 约束条件
 
@@ -12,122 +12,162 @@
 
 ## 前十结果
 
-### 1. Trial #16
+### 1. Trial #7
 
-- run_id：`106`
+- 所属阶段：`coarse`
+- run_id：`147`
 - 状态：`completed`
 - 是否通过约束：`True`
-- 总收益：`0.145324`
-- 超额收益：`0.126874`
-- 最大回撤：`0.05459`
-- 胜率：`0.411765`
-- 交易次数：`33`
-- 参数：`{"market_score_filter_min_avg": 33, "market_score_filter_min_ma5": 35, "buy_strict_score_total": 78, "buy_momentum_score_total": 68, "buy_min_core_hits": 4, "buy_amount_min": 200000000.0, "max_single_position": 0.3, "sell_market_score_threshold": 37, "sell_market_drop_threshold": -3.5}`
+- 总收益：`0.014026`
+- 超额收益：`-0.004424`
+- 最大回撤：`0.035273`
+- 胜率：`0.5`
+- 交易次数：`12`
+- 参数：`{"market_score_filter_min_avg": 38, "market_score_filter_min_ma5": 44, "enable_buy_momentum": false, "enable_sell_time_stop": true, "buy_strict_score_total": 70, "buy_momentum_score_total": 58, "buy_min_core_hits": 1, "buy_amount_min": 400000000.0, "max_single_position": 0.25, "sell_market_score_threshold": 38, "sell_market_drop_threshold": -3.5}`
 
-### 2. Trial #6
+### 2. Trial #14
 
-- run_id：`96`
+- 所属阶段：`refine`
+- run_id：`152`
 - 状态：`completed`
 - 是否通过约束：`True`
-- 总收益：`0.060465`
-- 超额收益：`0.042015`
-- 最大回撤：`0.075067`
-- 胜率：`0.470588`
-- 交易次数：`34`
-- 参数：`{"market_score_filter_min_avg": 35, "market_score_filter_min_ma5": 33, "buy_strict_score_total": 78, "buy_momentum_score_total": 66, "buy_min_core_hits": 4, "buy_amount_min": 200000000.0, "max_single_position": 0.3, "sell_market_score_threshold": 38, "sell_market_drop_threshold": -2.0}`
+- 总收益：`-0.002244`
+- 超额收益：`-0.020694`
+- 最大回撤：`0.049467`
+- 胜率：`0.333333`
+- 交易次数：`18`
+- 参数：`{"market_score_filter_min_avg": 39, "market_score_filter_min_ma5": 44, "enable_buy_momentum": true, "enable_sell_time_stop": false, "buy_strict_score_total": 72, "buy_momentum_score_total": 58, "buy_min_core_hits": 2, "buy_amount_min": 400000000.0, "max_single_position": 0.3, "sell_market_score_threshold": 37, "sell_market_drop_threshold": -4.0}`
 
-### 3. Trial #5
+### 3. Trial #15
 
-- run_id：`95`
+- 所属阶段：`refine`
+- run_id：`153`
 - 状态：`completed`
 - 是否通过约束：`True`
-- 总收益：`0.046798`
-- 超额收益：`0.028348`
-- 最大回撤：`0.097519`
-- 胜率：`0.388889`
-- 交易次数：`36`
-- 参数：`{"market_score_filter_min_avg": 34, "market_score_filter_min_ma5": 35, "buy_strict_score_total": 72, "buy_momentum_score_total": 66, "buy_min_core_hits": 4, "buy_amount_min": 200000000.0, "max_single_position": 0.3, "sell_market_score_threshold": 35, "sell_market_drop_threshold": -2.0}`
+- 总收益：`-0.003639`
+- 超额收益：`-0.022089`
+- 最大回撤：`0.033295`
+- 胜率：`0.444444`
+- 交易次数：`18`
+- 参数：`{"market_score_filter_min_avg": 46, "market_score_filter_min_ma5": 44, "enable_buy_momentum": true, "enable_sell_time_stop": true, "buy_strict_score_total": 64, "buy_momentum_score_total": 62, "buy_min_core_hits": 2, "buy_amount_min": 250000000.0, "max_single_position": 0.2, "sell_market_score_threshold": 31, "sell_market_drop_threshold": -4.0}`
 
 ### 4. Trial #11
 
-- run_id：`101`
+- 所属阶段：`coarse`
+- run_id：`149`
 - 状态：`completed`
 - 是否通过约束：`True`
-- 总收益：`0.04395`
-- 超额收益：`0.0255`
-- 最大回撤：`0.062167`
-- 胜率：`0.461538`
-- 交易次数：`26`
-- 参数：`{"market_score_filter_min_avg": 35, "market_score_filter_min_ma5": 33, "buy_strict_score_total": 74, "buy_momentum_score_total": 70, "buy_min_core_hits": 3, "buy_amount_min": 350000000.0, "max_single_position": 0.35, "sell_market_score_threshold": 38, "sell_market_drop_threshold": -2.5}`
+- 总收益：`-0.009702`
+- 超额收益：`-0.028152`
+- 最大回撤：`0.062223`
+- 胜率：`0.333333`
+- 交易次数：`18`
+- 参数：`{"market_score_filter_min_avg": 45, "market_score_filter_min_ma5": 44, "enable_buy_momentum": true, "enable_sell_time_stop": true, "buy_strict_score_total": 66, "buy_momentum_score_total": 64, "buy_min_core_hits": 1, "buy_amount_min": 200000000.0, "max_single_position": 0.2, "sell_market_score_threshold": 32, "sell_market_drop_threshold": -3.5}`
 
-### 5. Trial #17
+### 5. Trial #1
 
-- run_id：`107`
+- 所属阶段：`coarse`
+- run_id：`142`
 - 状态：`completed`
 - 是否通过约束：`True`
-- 总收益：`0.028683`
-- 超额收益：`0.010233`
-- 最大回撤：`0.085962`
-- 胜率：`0.285714`
-- 交易次数：`28`
-- 参数：`{"market_score_filter_min_avg": 37, "market_score_filter_min_ma5": 33, "buy_strict_score_total": 76, "buy_momentum_score_total": 68, "buy_min_core_hits": 3, "buy_amount_min": 300000000.0, "max_single_position": 0.25, "sell_market_score_threshold": 37, "sell_market_drop_threshold": -2.0}`
+- 总收益：`-0.010154`
+- 超额收益：`-0.028604`
+- 最大回撤：`0.109893`
+- 胜率：`0.357143`
+- 交易次数：`54`
+- 参数：`{"market_score_filter_min_avg": 36, "market_score_filter_min_ma5": 33, "enable_buy_momentum": false, "enable_sell_time_stop": true, "buy_strict_score_total": 56, "buy_momentum_score_total": 54, "buy_min_core_hits": 1, "buy_amount_min": 400000000.0, "max_single_position": 0.2, "sell_market_score_threshold": 39, "sell_market_drop_threshold": -2.5}`
 
-### 6. Trial #3
+## 参数重要性统计
 
-- run_id：`93`
-- 状态：`completed`
-- 是否通过约束：`True`
-- 总收益：`0.019258`
-- 超额收益：`0.000808`
-- 最大回撤：`0.078493`
-- 胜率：`0.4`
-- 交易次数：`10`
-- 参数：`{"market_score_filter_min_avg": 37, "market_score_filter_min_ma5": 37, "buy_strict_score_total": 72, "buy_momentum_score_total": 68, "buy_min_core_hits": 5, "buy_amount_min": 400000000.0, "max_single_position": 0.35, "sell_market_score_threshold": 34, "sell_market_drop_threshold": -2.5}`
+- 目标字段：`total_return`
+- 统计参数数：`11`
 
-### 7. Trial #20
+### 1. buy_strict_score_total
 
-- run_id：`110`
-- 状态：`completed`
-- 是否通过约束：`True`
-- 总收益：`0.015704`
-- 超额收益：`-0.002746`
-- 最大回撤：`0.075575`
-- 胜率：`0.375`
-- 交易次数：`31`
-- 参数：`{"market_score_filter_min_avg": 34, "market_score_filter_min_ma5": 38, "buy_strict_score_total": 78, "buy_momentum_score_total": 68, "buy_min_core_hits": 4, "buy_amount_min": 400000000.0, "max_single_position": 0.35, "sell_market_score_threshold": 34, "sell_market_drop_threshold": -2.0}`
+- 重要性分数：`0.047568`
+- 最优取值：`70`
+- 最优平均目标值：`0.014026`
+- 最差取值：`76`
+- 最差平均目标值：`-0.033542`
+- 分桶数：`10`
 
-### 8. Trial #13
+### 2. market_score_filter_min_avg
 
-- run_id：`103`
-- 状态：`completed`
-- 是否通过约束：`True`
-- 总收益：`0.015467`
-- 超额收益：`-0.002983`
-- 最大回撤：`0.045887`
-- 胜率：`0.384615`
-- 交易次数：`26`
-- 参数：`{"market_score_filter_min_avg": 36, "market_score_filter_min_ma5": 37, "buy_strict_score_total": 78, "buy_momentum_score_total": 70, "buy_min_core_hits": 3, "buy_amount_min": 250000000.0, "max_single_position": 0.35, "sell_market_score_threshold": 33, "sell_market_drop_threshold": -4.0}`
+- 重要性分数：`0.040555`
+- 最优取值：`38`
+- 最优平均目标值：`0.007013`
+- 最差取值：`40`
+- 最差平均目标值：`-0.033542`
+- 分桶数：`7`
 
-### 9. Trial #4
+### 3. buy_momentum_score_total
 
-- run_id：`94`
-- 状态：`completed`
-- 是否通过约束：`True`
-- 总收益：`0.015373`
-- 超额收益：`-0.003077`
-- 最大回撤：`0.075141`
-- 胜率：`0.4`
-- 交易次数：`10`
-- 参数：`{"market_score_filter_min_avg": 37, "market_score_filter_min_ma5": 35, "buy_strict_score_total": 72, "buy_momentum_score_total": 68, "buy_min_core_hits": 5, "buy_amount_min": 350000000.0, "max_single_position": 0.3, "sell_market_score_threshold": 35, "sell_market_drop_threshold": -3.5}`
+- 重要性分数：`0.035066`
+- 最优取值：`58`
+- 最优平均目标值：`0.003927`
+- 最差取值：`52`
+- 最差平均目标值：`-0.031138`
+- 分桶数：`8`
 
-### 10. Trial #8
+### 4. market_score_filter_min_ma5
 
-- run_id：`98`
-- 状态：`completed`
-- 是否通过约束：`True`
-- 总收益：`0.013097`
-- 超额收益：`-0.005353`
-- 最大回撤：`0.063267`
-- 胜率：`0.4`
-- 交易次数：`10`
-- 参数：`{"market_score_filter_min_avg": 33, "market_score_filter_min_ma5": 36, "buy_strict_score_total": 76, "buy_momentum_score_total": 72, "buy_min_core_hits": 5, "buy_amount_min": 300000000.0, "max_single_position": 0.25, "sell_market_score_threshold": 35, "sell_market_drop_threshold": -3.0}`
+- 重要性分数：`0.033542`
+- 最优取值：`40`
+- 最优平均目标值：`0.0`
+- 最差取值：`42`
+- 最差平均目标值：`-0.033542`
+- 分桶数：`8`
+
+### 5. max_single_position
+
+- 重要性分数：`0.031674`
+- 最优取值：`0.25`
+- 最优平均目标值：`-0.001868`
+- 最差取值：`0.35`
+- 最差平均目标值：`-0.033542`
+- 分桶数：`4`
+
+### 6. buy_min_core_hits
+
+- 重要性分数：`0.031599`
+- 最优取值：`1`
+- 最优平均目标值：`-0.001943`
+- 最差取值：`4`
+- 最差平均目标值：`-0.033542`
+- 分桶数：`5`
+
+### 7. sell_market_drop_threshold
+
+- 重要性分数：`0.027667`
+- 最优取值：`-3.5`
+- 最优平均目标值：`0.001081`
+- 最差取值：`-3.0`
+- 最差平均目标值：`-0.026586`
+- 分桶数：`4`
+
+### 8. sell_market_score_threshold
+
+- 重要性分数：`0.021117`
+- 最优取值：`34`
+- 最优平均目标值：`0.0`
+- 最差取值：`40`
+- 最差平均目标值：`-0.021117`
+- 分桶数：`8`
+
+### 9. buy_amount_min
+
+- 重要性分数：`0.018285`
+- 最优取值：`400000000.0`
+- 最优平均目标值：`0.000543`
+- 最差取值：`300000000.0`
+- 最差平均目标值：`-0.017742`
+- 分桶数：`5`
+
+### 10. enable_buy_momentum
+
+- 重要性分数：`0.015446`
+- 最优取值：`False`
+- 最优平均目标值：`-0.000803`
+- 最差取值：`True`
+- 最差平均目标值：`-0.016249`
+- 分桶数：`2`
