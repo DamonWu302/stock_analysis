@@ -376,6 +376,9 @@ CREATE TABLE IF NOT EXISTS strategy_trade_signal (
     target_weight REAL,
     reason TEXT,
     metrics_json TEXT,
+    execution_status TEXT NOT NULL DEFAULT 'pending',
+    execution_note TEXT,
+    executed_at TEXT,
     plan_run_id INTEGER,
     created_at TEXT NOT NULL,
     FOREIGN KEY (plan_run_id) REFERENCES strategy_plan_run(id)
@@ -554,6 +557,21 @@ class Database:
                 "entry_cost_total": "REAL NOT NULL DEFAULT 0",
                 "trimmed": "INTEGER NOT NULL DEFAULT 0",
             },
+        )
+        Database._ensure_columns(
+            conn,
+            "strategy_trade_signal",
+            {
+                "execution_status": "TEXT NOT NULL DEFAULT 'pending'",
+                "execution_note": "TEXT",
+                "executed_at": "TEXT",
+            },
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_strategy_trade_signal_status
+            ON strategy_trade_signal(execution_status, trade_date DESC)
+            """
         )
         conn.execute(
             """

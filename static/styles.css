@@ -231,6 +231,93 @@ button[disabled] {
     margin: 24px 0;
 }
 
+.strategy-hero {
+    align-items: start;
+}
+
+.strategy-panel {
+    align-content: start;
+}
+
+.strategy-history-form {
+    grid-template-columns: minmax(260px, 380px) 180px;
+    align-items: end;
+    margin-top: 18px;
+}
+
+.strategy-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px;
+    margin: 24px 0;
+}
+
+.strategy-table td,
+.strategy-table th {
+    vertical-align: top;
+}
+
+.table-subtle {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.compact-empty {
+    padding: 22px 24px;
+    text-align: left;
+}
+
+.compact-empty h2 {
+    font-size: 20px;
+    margin-bottom: 8px;
+}
+
+.badge-up {
+    background: rgba(239, 68, 68, 0.12);
+    color: var(--red);
+}
+
+.badge-down {
+    background: rgba(15, 118, 110, 0.12);
+    color: var(--green);
+}
+
+.signal-status {
+    display: grid;
+    gap: 8px;
+}
+
+.signal-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.signal-btn {
+    width: auto;
+    min-width: 96px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.status-pending {
+    background: rgba(180, 83, 9, 0.12);
+    color: var(--accent);
+}
+
+.status-executed {
+    background: rgba(15, 118, 110, 0.14);
+    color: var(--green);
+}
+
+.status-skipped {
+    background: rgba(107, 114, 128, 0.14);
+    color: var(--muted);
+}
+
 .alert {
     margin-top: 20px;
     padding: 16px 20px;
@@ -1392,6 +1479,7 @@ th {
 @media (max-width: 900px) {
     .hero,
     .stats,
+    .strategy-grid,
     .detail-grid,
     .detail-hero,
     .filter-bar {
@@ -1399,6 +1487,10 @@ th {
     }
 
     .backtest-builder {
+        grid-template-columns: 1fr;
+    }
+
+    .strategy-history-form {
         grid-template-columns: 1fr;
     }
 

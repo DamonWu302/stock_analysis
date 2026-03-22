@@ -812,14 +812,111 @@ class StockAnalysisService:
             item["metrics"] = json.loads(item.get("metrics_json") or "{}")
             payload["stocks"].append(item)
         payload["signals"] = []
+        signal_map: dict[tuple[str, str], dict] = {}
         for row in signals:
             item = dict(row)
             item["metrics"] = json.loads(item.get("metrics_json") or "{}")
             payload["signals"].append(item)
-        payload["buy_candidates"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "buy"]
-        payload["avoid_list"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "avoid"]
-        payload["position_actions"] = [item for item in payload["stocks"] if str(item.get("action") or "") in {"hold", "trim", "sell"}]
+        self._attach_strategy_signal_state(payload)
+        payload["summary"] = self._build_strategy_plan_summary(payload)
         return payload
+
+    def update_strategy_signal_status(
+        self,
+        signal_id: int,
+        execution_status: str,
+        execution_note: str | None = None,
+    ) -> dict:
+        allowed = {"pending", "executed", "skipped"}
+        normalized = str(execution_status or "").strip().lower()
+        if normalized not in allowed:
+            raise ValueError("执行状态不支持，必须是 pending / executed / skipped")
+        note = str(execution_note or "").strip()
+        executed_at = datetime.now().isoformat(timespec="seconds") if normalized in {"executed", "skipped"} else None
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT sts.*, spr.template_key
+                FROM strategy_trade_signal sts
+                LEFT JOIN strategy_plan_run spr ON spr.id = sts.plan_run_id
+                WHERE sts.id = ?
+                """,
+                (int(signal_id),),
+            ).fetchone()
+            if not row:
+                raise ValueError(f"未找到策略信号 {signal_id}")
+            conn.execute(
+                """
+                UPDATE strategy_trade_signal
+                SET execution_status = ?, execution_note = ?, executed_at = ?
+                WHERE id = ?
+                """,
+                (normalized, note or None, executed_at, int(signal_id)),
+            )
+            updated = conn.execute("SELECT * FROM strategy_trade_signal WHERE id = ?", (int(signal_id),)).fetchone()
+        self._refresh_strategy_positions_from(
+            template_key=str(row["template_key"] or "return_priority"),
+            start_trade_date=str(row["trade_date"] or ""),
+        )
+        payload = dict(updated)
+        payload["execution_status_label"] = self._label_strategy_signal_status(str(payload.get("execution_status") or "pending"))
+        payload["template_key"] = str(row["template_key"] or "")
+        return payload
+
+    def _label_strategy_signal_status(self, status: str) -> str:
+        mapping = {
+            "pending": "待执行",
+            "executed": "已执行",
+            "skipped": "已跳过",
+        }
+        return mapping.get(str(status or "").strip().lower(), str(status or "-"))
+
+    def _refresh_strategy_positions_from(self, template_key: str, start_trade_date: str) -> None:
+        if not start_trade_date:
+            return
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_date
+                FROM strategy_plan_run
+                WHERE template_key = ? AND trade_date >= ?
+                ORDER BY trade_date ASC, id ASC
+                """,
+                (template_key, start_trade_date),
+            ).fetchall()
+        ordered_dates: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            trade_date = str(row["trade_date"] or "")
+            if trade_date and trade_date not in seen:
+                seen.add(trade_date)
+                ordered_dates.append(trade_date)
+        for index, trade_date in enumerate(ordered_dates[:3]):
+            if index == 0:
+                self.refresh_strategy_positions(trade_date=trade_date, template_key=template_key)
+            else:
+                self.generate_strategy_plan(trade_date=trade_date, template_key=template_key)
+
+    def _attach_strategy_signal_state(self, payload: dict) -> None:
+        signal_map: dict[tuple[str, str], dict] = {}
+        normalized_signals: list[dict] = []
+        for item in payload.get("signals") or []:
+            signal = dict(item)
+            signal["execution_status_label"] = self._label_strategy_signal_status(str(signal.get("execution_status") or "pending"))
+            normalized_signals.append(signal)
+            signal_map[(str(signal.get("symbol") or ""), str(signal.get("signal_type") or ""))] = signal
+        payload["signals"] = normalized_signals
+        for item in payload.get("stocks") or []:
+            signal_type = str(item.get("action") or "")
+            signal = signal_map.get((str(item.get("symbol") or ""), signal_type))
+            item["signal_id"] = int(signal["id"]) if signal else None
+            item["execution_status"] = str((signal or {}).get("execution_status") or "pending")
+            item["execution_status_label"] = self._label_strategy_signal_status(item["execution_status"])
+            item["execution_note"] = str((signal or {}).get("execution_note") or "").strip()
+            item["executed_at"] = (signal or {}).get("executed_at")
+        payload["buy_candidates"] = [item for item in payload.get("stocks") or [] if str(item.get("action") or "") == "buy"]
+        payload["avoid_list"] = [item for item in payload.get("stocks") or [] if str(item.get("action") or "") == "avoid"]
+        payload["position_actions"] = [item for item in payload.get("stocks") or [] if str(item.get("action") or "") in {"hold", "trim", "sell"}]
 
     def refresh_strategy_positions(self, trade_date: str | None = None, template_key: str = "return_priority") -> dict:
         plan = self._load_strategy_plan_by_date(trade_date=trade_date, template_key=template_key) if trade_date else self.latest_strategy_plan(template_key=template_key)
@@ -830,6 +927,10 @@ class StockAnalysisService:
         previous_positions = self._load_latest_strategy_positions(template_key=template_key, before_trade_date=trade_date)
         portfolio_value = float(config.get("initial_capital") or 1_000_000.0)
         staged_positions: list[dict] = []
+        signal_map = {
+            (str(item.get("symbol") or ""), str(item.get("signal_type") or "")): dict(item)
+            for item in (plan.get("signals") or [])
+        }
 
         for item in plan.get("stocks") or []:
             symbol = str(item.get("symbol") or "")
@@ -838,15 +939,22 @@ class StockAnalysisService:
             latest_price = float(metrics.get("close") or metrics.get("signal_price_ref") or 0.0)
             previous = previous_positions.get(symbol)
             if previous and action in {"hold", "trim", "sell"}:
+                signal = signal_map.get((symbol, action))
+                execution_status = str((signal or {}).get("execution_status") or "pending")
                 shares = float(previous.get("shares") or 0.0)
                 cost_price = float(previous.get("cost_price") or 0.0)
                 peak_price = max(float(previous.get("peak_price") or 0.0), latest_price)
                 status = "open"
-                if action == "trim":
+                applied_action = action
+                action_reason = str(item.get("sell_reason") or "")
+                if action == "trim" and execution_status == "executed":
                     shares = round(shares * 0.5, 4)
-                elif action == "sell":
+                elif action == "sell" and execution_status == "executed":
                     shares = 0.0
                     status = "closed"
+                elif action in {"trim", "sell"}:
+                    applied_action = "hold"
+                    action_reason = f"{'已跳过' if execution_status == 'skipped' else '待执行'}{'减仓' if action == 'trim' else '卖出'}信号"
                 market_value = round(shares * latest_price, 4)
                 staged_positions.append(
                     {
@@ -865,12 +973,16 @@ class StockAnalysisService:
                         "entry_signal_date": str(previous.get("entry_signal_date") or trade_date),
                         "entry_execution_date": str(previous.get("entry_execution_date") or trade_date),
                         "entry_cost_total": float(previous.get("entry_cost_total") or cost_price * shares),
-                        "trimmed": 1 if action == "trim" or bool(previous.get("trimmed")) else 0,
-                        "last_action": action,
-                        "last_action_reason": str(item.get("sell_reason") or ""),
+                        "trimmed": 1 if (action == "trim" and execution_status == "executed") or bool(previous.get("trimmed")) else 0,
+                        "last_action": applied_action,
+                        "last_action_reason": action_reason,
                     }
                 )
             elif action == "buy" and latest_price > 0:
+                signal = signal_map.get((symbol, "buy"))
+                execution_status = str((signal or {}).get("execution_status") or "pending")
+                if execution_status != "executed":
+                    continue
                 target_weight = float(item.get("target_weight") or 0.0)
                 allocation = portfolio_value * target_weight
                 shares = round(allocation / max(latest_price, 0.01), 4)
@@ -992,13 +1104,21 @@ class StockAnalysisService:
             item = dict(row)
             item["metrics"] = json.loads(item.get("metrics_json") or "{}")
             payload["signals"].append(item)
-        payload["buy_candidates"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "buy"]
-        payload["avoid_list"] = [item for item in payload["stocks"] if str(item.get("action") or "") == "avoid"]
-        payload["position_actions"] = [item for item in payload["stocks"] if str(item.get("action") or "") in {"hold", "trim", "sell"}]
+        self._attach_strategy_signal_state(payload)
+        payload["summary"] = self._build_strategy_plan_summary(payload)
         return payload
 
     def latest_strategy_positions(self, template_key: str = "return_priority") -> list[dict]:
         plan = self.latest_strategy_plan(template_key=template_key)
+        if not plan:
+            return []
+        return self.strategy_positions(trade_date=str(plan["trade_date"]), template_key=template_key)
+
+    def strategy_plan(self, trade_date: str | None = None, template_key: str = "return_priority") -> dict | None:
+        return self._load_strategy_plan_by_date(trade_date=trade_date, template_key=template_key) if trade_date else self.latest_strategy_plan(template_key=template_key)
+
+    def strategy_positions(self, trade_date: str | None = None, template_key: str = "return_priority") -> list[dict]:
+        plan = self.strategy_plan(trade_date=trade_date, template_key=template_key)
         if not plan:
             return []
         with self.db.connect() as conn:
@@ -1012,6 +1132,181 @@ class StockAnalysisService:
                 (str(plan["trade_date"]), int(plan["id"])),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def strategy_plan_dates(self, template_key: str = "return_priority", limit: int = 60) -> list[str]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_date
+                FROM strategy_plan_run
+                WHERE template_key = ?
+                GROUP BY trade_date
+                ORDER BY trade_date DESC
+                LIMIT ?
+                """,
+                (template_key, max(int(limit), 1)),
+            ).fetchall()
+        return [str(row["trade_date"] or "") for row in rows if str(row["trade_date"] or "")]
+
+    def _build_strategy_plan_summary(self, plan: dict) -> dict:
+        trade_date = str(plan.get("trade_date") or "")
+        config = dict(plan.get("config") or {})
+        initial_capital = float(config.get("initial_capital") or 1_000_000.0)
+        with self.db.connect() as conn:
+            position_rows = conn.execute(
+                """
+                SELECT *
+                FROM strategy_position
+                WHERE trade_date = ? AND plan_run_id = ?
+                ORDER BY weight DESC, symbol ASC
+                """,
+                (trade_date, int(plan["id"])),
+            ).fetchall()
+            benchmark_rows = conn.execute(
+                """
+                SELECT trade_date, close
+                FROM benchmark_history
+                WHERE symbol = '000001' AND trade_date <= ?
+                ORDER BY trade_date DESC
+                LIMIT 2
+                """,
+                (trade_date,),
+            ).fetchall()
+            first_plan_row = conn.execute(
+                """
+                SELECT MIN(trade_date) AS first_trade_date
+                FROM strategy_plan_run
+                WHERE template_key = ?
+                """,
+                (str(plan.get("template_key") or ""),),
+            ).fetchone()
+            first_trade_date = str((first_plan_row or {})["first_trade_date"] or trade_date)
+            benchmark_start_row = conn.execute(
+                """
+                SELECT close
+                FROM benchmark_history
+                WHERE symbol = '000001' AND trade_date = ?
+                """,
+                (first_trade_date,),
+            ).fetchone()
+
+        positions = [dict(row) for row in position_rows]
+        open_positions = [row for row in positions if str(row.get("status") or "") == "open"]
+        market_value = sum(float(row.get("market_value") or 0.0) for row in open_positions)
+        unrealized_pnl = sum(float(row.get("unrealized_pnl") or 0.0) for row in open_positions)
+        exposure_ratio = market_value / initial_capital if initial_capital else 0.0
+        strategy_return = unrealized_pnl / initial_capital if initial_capital else 0.0
+
+        benchmark_close = 0.0
+        benchmark_daily_change = 0.0
+        benchmark_period_return = 0.0
+        if benchmark_rows:
+            benchmark_close = float(benchmark_rows[0]["close"] or 0.0)
+            if len(benchmark_rows) > 1:
+                previous_close = float(benchmark_rows[1]["close"] or 0.0)
+                if previous_close:
+                    benchmark_daily_change = benchmark_close / previous_close - 1.0
+        if benchmark_start_row:
+            start_close = float(benchmark_start_row["close"] or 0.0)
+            if start_close:
+                benchmark_period_return = benchmark_close / start_close - 1.0
+
+        return {
+            "position_count": len(open_positions),
+            "market_value": round(market_value, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "strategy_return": round(strategy_return, 6),
+            "exposure_ratio": round(exposure_ratio, 6),
+            "cash_estimate": round(max(initial_capital - market_value, 0.0), 2),
+            "benchmark_close": round(benchmark_close, 2),
+            "benchmark_daily_change": round(benchmark_daily_change, 6),
+            "benchmark_period_return": round(benchmark_period_return, 6),
+            "first_trade_date": first_trade_date,
+        }
+
+    def strategy_performance_series(self, template_key: str = "return_priority", days: int = 30) -> list[dict]:
+        days = max(int(days), 1)
+        with self.db.connect() as conn:
+            run_rows = conn.execute(
+                """
+                SELECT id, trade_date, config_json, template_key
+                FROM strategy_plan_run
+                WHERE template_key = ?
+                ORDER BY trade_date DESC, id DESC
+                LIMIT ?
+                """,
+                (template_key, days),
+            ).fetchall()
+        if not run_rows:
+            return []
+        chronological = list(reversed([dict(row) for row in run_rows]))
+        results: list[dict] = []
+        for row in chronological:
+            plan = {
+                "id": row["id"],
+                "trade_date": row["trade_date"],
+                "template_key": row["template_key"],
+                "config": json.loads(row.get("config_json") or "{}"),
+            }
+            summary = self._build_strategy_plan_summary(plan)
+            results.append(
+                {
+                    "trade_date": str(row["trade_date"] or ""),
+                    "strategy_return": float(summary.get("strategy_return") or 0.0),
+                    "benchmark_return": float(summary.get("benchmark_period_return") or 0.0),
+                }
+            )
+        return results
+
+    def reset_strategy_state(self, template_key: str | None = None, regenerate_latest: bool = True) -> dict:
+        target_templates: list[str]
+        if template_key:
+            target_templates = [template_key]
+        else:
+            target_templates = [
+                str(item.get("template_key") or "")
+                for item in self.backtest_templates()
+                if str(item.get("template_key") or "") in {"return_priority", "steady_default"}
+            ]
+        target_templates = [item for item in target_templates if item]
+        if not target_templates:
+            return {"templates": [], "deleted_runs": 0, "regenerated": []}
+
+        deleted_runs = 0
+        with self.db.connect() as conn:
+            for key in target_templates:
+                run_rows = conn.execute(
+                    "SELECT id FROM strategy_plan_run WHERE template_key = ?",
+                    (key,),
+                ).fetchall()
+                run_ids = [int(row["id"]) for row in run_rows]
+                if run_ids:
+                    placeholders = ",".join("?" for _ in run_ids)
+                    conn.execute(f"DELETE FROM strategy_position WHERE plan_run_id IN ({placeholders})", run_ids)
+                    conn.execute(f"DELETE FROM strategy_trade_signal WHERE plan_run_id IN ({placeholders})", run_ids)
+                    conn.execute(f"DELETE FROM strategy_plan_stock WHERE run_id IN ({placeholders})", run_ids)
+                    conn.execute("DELETE FROM strategy_plan_run WHERE template_key = ?", (key,))
+                    deleted_runs += len(run_ids)
+
+        regenerated: list[dict] = []
+        if regenerate_latest:
+            for key in target_templates:
+                try:
+                    regenerated.append(self.generate_strategy_plan(template_key=key))
+                except Exception:
+                    continue
+        return {
+            "templates": target_templates,
+            "deleted_runs": deleted_runs,
+            "regenerated": [
+                {
+                    "template_key": str(item.get("template_key") or ""),
+                    "trade_date": str(item.get("trade_date") or ""),
+                    "run_id": int(item.get("run_id") or 0),
+                }
+                for item in regenerated
+            ],
+        }
 
     def _load_latest_strategy_positions(self, template_key: str, before_trade_date: str) -> dict[str, dict]:
         with self.db.connect() as conn:

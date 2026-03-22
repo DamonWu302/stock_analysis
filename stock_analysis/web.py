@@ -7,7 +7,7 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 import json
 import pandas as pd
 
-from .charts import build_candlestick_svg, build_nav_svg, build_score_trend_svg
+from .charts import build_candlestick_svg, build_nav_svg, build_score_trend_svg, build_strategy_vs_benchmark_svg
 from .chat import StockChatService
 from .config import settings
 from .service import StockAnalysisService
@@ -250,6 +250,78 @@ def create_app() -> Flask:
             selected_template_id=selected_template_id,
             error=request.args.get("error"),
             success=request.args.get("success"),
+        )
+
+    @app.get("/strategy")
+    def strategy_dashboard():
+        template_key = (request.args.get("template") or "return_priority").strip() or "return_priority"
+        trade_date = (request.args.get("trade_date") or "").strip() or None
+        plan = service.strategy_plan(trade_date=trade_date, template_key=template_key)
+        positions = service.strategy_positions(trade_date=trade_date, template_key=template_key)
+        performance_rows = service.strategy_performance_series(template_key=template_key, days=30)
+        available_dates = service.strategy_plan_dates(template_key=template_key, limit=60)
+        templates = service.backtest_templates()
+        strategy_templates = [
+            item
+            for item in templates
+            if str(item.get("template_key") or "") in {"return_priority", "steady_default"}
+        ]
+        sell_actions = []
+        trim_actions = []
+        hold_actions = []
+        if plan:
+            sell_actions = [item for item in plan.get("position_actions", []) if str(item.get("action") or "") == "sell"]
+            trim_actions = [item for item in plan.get("position_actions", []) if str(item.get("action") or "") == "trim"]
+            hold_actions = [item for item in plan.get("position_actions", []) if str(item.get("action") or "") == "hold"]
+        return render_template(
+            "strategy.html",
+            plan=plan,
+            positions=positions,
+            strategy_templates=strategy_templates,
+            selected_template_key=template_key,
+            selected_trade_date=(plan or {}).get("trade_date") or trade_date or "",
+            available_dates=available_dates,
+            buy_candidates=(plan or {}).get("buy_candidates", []),
+            sell_actions=sell_actions,
+            trim_actions=trim_actions,
+            hold_actions=hold_actions,
+            performance_rows=performance_rows,
+            performance_svg=build_strategy_vs_benchmark_svg(performance_rows),
+            success=request.args.get("success"),
+            error=request.args.get("error"),
+        )
+
+    @app.post("/strategy/generate")
+    def generate_strategy_dashboard():
+        template_key = (request.form.get("template_key") or "return_priority").strip() or "return_priority"
+        trade_date = (request.form.get("trade_date") or "").strip() or None
+        try:
+            plan = service.generate_strategy_plan(trade_date=trade_date, template_key=template_key)
+        except Exception as exc:
+            return redirect(url_for("strategy_dashboard", template=template_key, error=str(exc)))
+        return redirect(
+            url_for(
+                "strategy_dashboard",
+                template=template_key,
+                success=f"已生成 {plan['trade_date']} 的策略执行计划",
+            )
+        )
+
+    @app.post("/strategy/signals/<int:signal_id>/status")
+    def update_strategy_signal(signal_id: int):
+        template_key = (request.form.get("template_key") or "return_priority").strip() or "return_priority"
+        status = (request.form.get("execution_status") or "").strip().lower()
+        note = (request.form.get("execution_note") or "").strip()
+        try:
+            signal = service.update_strategy_signal_status(signal_id=signal_id, execution_status=status, execution_note=note)
+        except Exception as exc:
+            return redirect(url_for("strategy_dashboard", template=template_key, error=str(exc)))
+        return redirect(
+            url_for(
+                "strategy_dashboard",
+                template=signal.get("template_key") or template_key,
+                success=f"{signal['symbol']} 的{signal['signal_type']}信号已更新为{signal['execution_status_label']}",
+            )
         )
 
     @app.get("/backtests/<int:run_id>")

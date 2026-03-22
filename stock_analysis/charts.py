@@ -199,6 +199,73 @@ def build_score_trend_svg(rows: list[dict], width: int = 900, height: int = 280)
     return "".join(parts)
 
 
+def build_strategy_vs_benchmark_svg(rows: list[dict], width: int = 860, height: int = 240) -> str:
+    if not rows:
+        return "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 860 240'><text x='24' y='48'>No chart data</text></svg>"
+
+    df = pd.DataFrame(rows).copy()
+    df["strategy_return"] = pd.to_numeric(df["strategy_return"], errors="coerce").fillna(0.0)
+    df["benchmark_return"] = pd.to_numeric(df["benchmark_return"], errors="coerce").fillna(0.0)
+    df["excess_return"] = df["strategy_return"] - df["benchmark_return"]
+    df = df.reset_index(drop=True)
+    if df.empty:
+        return "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 860 240'><text x='24' y='48'>No chart data</text></svg>"
+
+    padding = 28
+    chart_width = width - padding * 2
+    chart_height = height - padding * 2
+    min_value = float(df[["strategy_return", "benchmark_return", "excess_return"]].min(numeric_only=True).min())
+    max_value = float(df[["strategy_return", "benchmark_return", "excess_return"]].max(numeric_only=True).max())
+    min_value = min(min_value, 0.0)
+    max_value = max(max_value, 0.0)
+    value_range = max(max_value - min_value, 0.01)
+    step_x = chart_width / max(len(df) - 1, 1)
+
+    def y_scale(value: float) -> float:
+        return padding + (max_value - value) / value_range * chart_height
+
+    def build_path(column: str, color: str, dash: str = "") -> str:
+        points: list[str] = []
+        for index, value in enumerate(df[column]):
+            x = padding + index * step_x
+            y = y_scale(float(value))
+            points.append(f"{x:.2f},{y:.2f}")
+        dash_attr = f" stroke-dasharray='{dash}'" if dash else ""
+        return (
+            f"<polyline fill='none' stroke='{color}' stroke-width='3' stroke-linecap='round' "
+            f"stroke-linejoin='round'{dash_attr} points='{' '.join(points)}' />"
+        )
+
+    parts = [
+        f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {width} {height}' role='img' aria-label='策略收益对比图'>",
+        "<rect width='100%' height='100%' fill='#fffaf4' rx='20' />",
+        f"<text x='{padding}' y='20' fill='#6b7280' font-size='12'>策略收益 vs 基准收益 vs 超额收益</text>",
+    ]
+
+    zero_y = y_scale(0.0)
+    parts.append(
+        f"<line x1='{padding}' x2='{width - padding}' y1='{zero_y:.2f}' y2='{zero_y:.2f}' stroke='rgba(31,41,51,.12)' stroke-width='1' />"
+    )
+
+    for index, row in df.iterrows():
+        x = padding + index * step_x
+        label = html.escape(str(row.get("trade_date") or ""))
+        parts.append(f"<circle cx='{x:.2f}' cy='{y_scale(float(row['strategy_return'])):.2f}' r='3.5' fill='#ea580c' />")
+        parts.append(f"<circle cx='{x:.2f}' cy='{y_scale(float(row['benchmark_return'])):.2f}' r='3' fill='#2563eb' />")
+        parts.append(f"<circle cx='{x:.2f}' cy='{y_scale(float(row['excess_return'])):.2f}' r='2.8' fill='#0f766e' />")
+        if index in {0, len(df) - 1}:
+            parts.append(f"<text x='{x:.2f}' y='{height - 10}' text-anchor='middle' fill='#6b7280' font-size='11'>{label}</text>")
+
+    parts.append(build_path("strategy_return", "#ea580c"))
+    parts.append(build_path("benchmark_return", "#2563eb", "6 5"))
+    parts.append(build_path("excess_return", "#0f766e", "3 4"))
+    parts.append(f"<text x='{padding + 170}' y='20' fill='#ea580c' font-size='12'>策略</text>")
+    parts.append(f"<text x='{padding + 220}' y='20' fill='#2563eb' font-size='12'>基准</text>")
+    parts.append(f"<text x='{padding + 270}' y='20' fill='#0f766e' font-size='12'>超额</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def build_nav_svg(rows: list[dict], trades: list[dict] | None = None, width: int = 900, height: int = 280) -> str:
     if not rows:
         return "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 280'><text x='24' y='48'>No chart data</text></svg>"

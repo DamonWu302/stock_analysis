@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>策略执行台</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+    <main class="page">
+        <section class="hero strategy-hero">
+            <div>
+                <p class="eyebrow">STRATEGY EXECUTION DESK</p>
+                <h1>策略执行台</h1>
+                <p class="subtitle">按模板生成每日买入候选、减仓卖出提示和当前持仓快照，让回测里定下来的参数直接进入日常建议。</p>
+                <div class="badges">
+                    <span class="badge">模板：{{ (plan or {}).get('template_name') or '收益优先' }}</span>
+                    {% if plan %}
+                    <span class="badge">交易日：{{ plan.trade_date }}</span>
+                    <span class="badge {{ 'badge-up' if plan.market_status == 'open' else 'badge-down' }}">
+                        市场状态：{{ '允许开仓' if plan.market_status == 'open' else '暂停开仓' }}
+                    </span>
+                    {% endif %}
+                </div>
+            </div>
+            <form class="control-panel strategy-panel" method="post" action="{{ url_for('generate_strategy_dashboard') }}">
+                <label>
+                    策略模板
+                    <select name="template_key">
+                        {% for item in strategy_templates %}
+                        <option value="{{ item.template_key }}" {% if item.template_key == selected_template_key %}selected{% endif %}>{{ item.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    指定交易日
+                    <input type="date" name="trade_date" value="{{ (plan or {}).get('trade_date') or '' }}">
+                </label>
+                <div class="hint">
+                    <strong>当前口径</strong>
+                    <span>默认按模板直接生成最新计划；收益优先模板当前为最多持有 3 只、单票最大仓位 50%。</span>
+                </div>
+                <button type="submit">立即生成最新计划</button>
+                <a class="detail-link" href="{{ url_for('index') }}">返回首页</a>
+                <a class="detail-link" href="{{ url_for('backtests') }}">前往回测中心</a>
+            </form>
+        </section>
+
+        {% if available_dates %}
+        <section class="table-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>历史日期切换</h2>
+                    <p>切换到已生成过策略计划的交易日，回看当日的市场判断、买卖建议和持仓状态。</p>
+                </div>
+            </div>
+            <form class="control-panel strategy-history-form" method="get" action="{{ url_for('strategy_dashboard') }}">
+                <input type="hidden" name="template" value="{{ selected_template_key }}">
+                <label>
+                    已生成交易日
+                    <select name="trade_date">
+                        {% for item in available_dates %}
+                        <option value="{{ item }}" {% if item == selected_trade_date %}selected{% endif %}>{{ item }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <button type="submit">切换历史日期</button>
+            </form>
+        </section>
+        {% endif %}
+
+        {% if error %}
+        <section class="alert">
+            <strong>操作失败：</strong>{{ error }}
+        </section>
+        {% endif %}
+
+        {% if success %}
+        <section class="alert success">
+            <strong>操作成功：</strong>{{ success }}
+        </section>
+        {% endif %}
+
+        {% if plan %}
+        <section class="stats">
+            <article class="card">
+                <span>市场状态</span>
+                <strong class="{{ 'up' if plan.market_status == 'open' else 'down' }}">{{ '允许开仓' if plan.market_status == 'open' else '暂停开仓' }}</strong>
+            </article>
+            <article class="card">
+                <span>建议总仓位</span>
+                <strong>{{ '%.0f'|format((plan.target_exposure or 0) * 100) }}%</strong>
+            </article>
+            <article class="card">
+                <span>买入候选</span>
+                <strong>{{ buy_candidates|length }}</strong>
+            </article>
+            <article class="card">
+                <span>当前持仓</span>
+                <strong>{{ (plan.summary or {}).get('position_count', positions|length) }}</strong>
+            </article>
+        </section>
+
+        <section class="stats">
+            <article class="card">
+                <span>策略浮盈亏</span>
+                <strong class="{{ 'up' if ((plan.summary or {}).get('unrealized_pnl', 0) or 0) >= 0 else 'down' }}">{{ '%.2f'|format((plan.summary or {}).get('unrealized_pnl', 0) or 0) }}</strong>
+            </article>
+            <article class="card">
+                <span>策略收益率</span>
+                <strong class="{{ 'up' if ((plan.summary or {}).get('strategy_return', 0) or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((plan.summary or {}).get('strategy_return', 0) or 0) * 100) }}%</strong>
+            </article>
+            <article class="card">
+                <span>当前持仓市值</span>
+                <strong>{{ '%.2f'|format((plan.summary or {}).get('market_value', 0) or 0) }}</strong>
+            </article>
+            <article class="card">
+                <span>当前资金利用率</span>
+                <strong>{{ '%.2f'|format(((plan.summary or {}).get('exposure_ratio', 0) or 0) * 100) }}%</strong>
+            </article>
+        </section>
+
+        <section class="stats">
+            <article class="card">
+                <span>上证最新点位</span>
+                <strong>{{ '%.2f'|format((plan.summary or {}).get('benchmark_close', 0) or 0) }}</strong>
+            </article>
+            <article class="card">
+                <span>上证当日涨跌</span>
+                <strong class="{{ 'up' if ((plan.summary or {}).get('benchmark_daily_change', 0) or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((plan.summary or {}).get('benchmark_daily_change', 0) or 0) * 100) }}%</strong>
+            </article>
+            <article class="card">
+                <span>基准区间收益</span>
+                <strong class="{{ 'up' if ((plan.summary or {}).get('benchmark_period_return', 0) or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((plan.summary or {}).get('benchmark_period_return', 0) or 0) * 100) }}%</strong>
+            </article>
+            <article class="card">
+                <span>策略起始日</span>
+                <strong>{{ (plan.summary or {}).get('first_trade_date') or plan.trade_date }}</strong>
+            </article>
+        </section>
+
+        <section class="table-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>市场判断</h2>
+                    <p>{{ plan.market_reason }}</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="strategy-grid">
+            <section class="table-wrap">
+                <div class="section-title">
+                    <div>
+                        <h2>今日买入候选</h2>
+                        <p>按模板规则筛出的优先候选，已包含建议仓位和触发原因。</p>
+                    </div>
+                </div>
+                {% if buy_candidates %}
+                <div class="data-table-wrap">
+                    <table class="data-table strategy-table">
+                        <thead>
+                            <tr>
+                                <th>股票</th>
+                                <th>总分</th>
+                                <th>建议仓位</th>
+                                <th>成交额</th>
+                                <th>板块</th>
+                                <th>触发原因</th>
+                                <th>执行状态</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in buy_candidates %}
+                            <tr>
+                                <td>
+                                    <strong>{{ row.symbol }}</strong>
+                                    <div class="table-subtle">{{ row.name or '-' }}</div>
+                                </td>
+                                <td>{{ '%.2f'|format(row.score_total or 0) }}</td>
+                                <td>{{ '%.0f'|format((row.target_weight or 0) * 100) }}%</td>
+                                <td>{{ '%.2f'|format(((row.metrics or {}).get('avg_amount_3d') or 0) / 100000000) }} 亿</td>
+                                <td>{{ row.sector or '-' }}</td>
+                                <td>{{ row.reason or '-' }}</td>
+                                <td>
+                                    <div class="signal-status">
+                                        <span class="badge status-{{ row.execution_status }}">{{ row.execution_status_label }}</span>
+                                        {% if row.signal_id %}
+                                        <form class="signal-actions" method="post" action="{{ url_for('update_strategy_signal', signal_id=row.signal_id) }}">
+                                            <input type="hidden" name="template_key" value="{{ selected_template_key }}">
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="executed">标记已执行</button>
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="skipped">标记跳过</button>
+                                            {% if row.execution_status != 'pending' %}
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="pending">恢复待执行</button>
+                                            {% endif %}
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="empty-state compact-empty">
+                    <h2>今天没有新的买入候选</h2>
+                    <p>可能是市场过滤未放行，或当前没有股票满足收益优先模板的买入条件。</p>
+                </div>
+                {% endif %}
+            </section>
+
+            <section class="table-wrap">
+                <div class="section-title">
+                    <div>
+                        <h2>当前持仓</h2>
+                        <p>基于策略计划每日滚动更新的持仓快照，用于观察浮盈亏、仓位和持仓天数。</p>
+                    </div>
+                </div>
+                {% if positions %}
+                <div class="data-table-wrap">
+                    <table class="data-table strategy-table">
+                        <thead>
+                            <tr>
+                                <th>股票</th>
+                                <th>仓位</th>
+                                <th>浮盈亏</th>
+                                <th>浮动收益</th>
+                                <th>持仓天数</th>
+                                <th>最后动作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in positions %}
+                            <tr>
+                                <td>
+                                    <strong>{{ row.symbol }}</strong>
+                                    <div class="table-subtle">{{ row.name or '-' }}</div>
+                                </td>
+                                <td>{{ '%.1f'|format((row.weight or 0) * 100) }}%</td>
+                                <td class="{{ 'up' if (row.unrealized_pnl or 0) >= 0 else 'down' }}">{{ '%.2f'|format(row.unrealized_pnl or 0) }}</td>
+                                <td class="{{ 'up' if (row.unrealized_return or 0) >= 0 else 'down' }}">{{ '%.2f'|format((row.unrealized_return or 0) * 100) }}%</td>
+                                <td>{{ row.hold_days or 0 }}</td>
+                                <td>{{ row.last_action_reason or row.last_action or '-' }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="empty-state compact-empty">
+                    <h2>当前没有持仓</h2>
+                    <p>生成计划后，如果没有持仓延续或新开仓，持仓表会保持为空。</p>
+                </div>
+                {% endif %}
+            </section>
+        </section>
+
+        <section class="strategy-grid">
+            <section class="table-wrap">
+                <div class="section-title">
+                    <div>
+                        <h2>今日卖出提示</h2>
+                        <p>已经命中清仓条件的持仓，按模板建议在下一交易日执行。</p>
+                    </div>
+                </div>
+                {% if sell_actions %}
+                <div class="data-table-wrap">
+                    <table class="data-table strategy-table">
+                        <thead>
+                            <tr>
+                                <th>股票</th>
+                                <th>动作</th>
+                                <th>当前收益</th>
+                                <th>回撤</th>
+                                <th>原因</th>
+                                <th>执行状态</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in sell_actions %}
+                            <tr>
+                                <td>
+                                    <strong>{{ row.symbol }}</strong>
+                                    <div class="table-subtle">{{ row.name or '-' }}</div>
+                                </td>
+                                <td><span class="badge badge-down">清仓</span></td>
+                                <td class="{{ 'up' if ((row.metrics or {}).get('position_return') or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((row.metrics or {}).get('position_return') or 0) * 100) }}%</td>
+                                <td class="{{ 'up' if ((row.metrics or {}).get('drawdown_from_peak') or 0) <= 0 else 'down' }}">{{ '%.2f'|format(((row.metrics or {}).get('drawdown_from_peak') or 0) * 100) }}%</td>
+                                <td>{{ row.reason or '-' }}</td>
+                                <td>
+                                    <div class="signal-status">
+                                        <span class="badge status-{{ row.execution_status }}">{{ row.execution_status_label }}</span>
+                                        {% if row.signal_id %}
+                                        <form class="signal-actions" method="post" action="{{ url_for('update_strategy_signal', signal_id=row.signal_id) }}">
+                                            <input type="hidden" name="template_key" value="{{ selected_template_key }}">
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="executed">标记已执行</button>
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="skipped">标记跳过</button>
+                                            {% if row.execution_status != 'pending' %}
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="pending">恢复待执行</button>
+                                            {% endif %}
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="empty-state compact-empty">
+                    <h2>今天没有清仓提示</h2>
+                    <p>说明当前持仓还没有命中卖出规则，或者当前没有持仓。</p>
+                </div>
+                {% endif %}
+            </section>
+
+            <section class="table-wrap">
+                <div class="section-title">
+                    <div>
+                        <h2>今日减仓与继续持有</h2>
+                        <p>减仓提示用于锁定部分利润，继续持有则表示现阶段仍符合持仓逻辑。</p>
+                    </div>
+                </div>
+                {% if trim_actions or hold_actions %}
+                <div class="data-table-wrap">
+                    <table class="data-table strategy-table">
+                        <thead>
+                            <tr>
+                                <th>股票</th>
+                                <th>动作</th>
+                                <th>当前收益</th>
+                                <th>峰值收益</th>
+                                <th>原因</th>
+                                <th>执行状态</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for row in trim_actions %}
+                            <tr>
+                                <td>
+                                    <strong>{{ row.symbol }}</strong>
+                                    <div class="table-subtle">{{ row.name or '-' }}</div>
+                                </td>
+                                <td><span class="badge">减仓</span></td>
+                                <td class="{{ 'up' if ((row.metrics or {}).get('position_return') or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((row.metrics or {}).get('position_return') or 0) * 100) }}%</td>
+                                <td class="{{ 'up' if ((row.metrics or {}).get('peak_return') or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((row.metrics or {}).get('peak_return') or 0) * 100) }}%</td>
+                                <td>{{ row.reason or '-' }}</td>
+                                <td>
+                                    <div class="signal-status">
+                                        <span class="badge status-{{ row.execution_status }}">{{ row.execution_status_label }}</span>
+                                        {% if row.signal_id %}
+                                        <form class="signal-actions" method="post" action="{{ url_for('update_strategy_signal', signal_id=row.signal_id) }}">
+                                            <input type="hidden" name="template_key" value="{{ selected_template_key }}">
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="executed">标记已执行</button>
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="skipped">标记跳过</button>
+                                            {% if row.execution_status != 'pending' %}
+                                            <button class="button-secondary signal-btn" type="submit" name="execution_status" value="pending">恢复待执行</button>
+                                            {% endif %}
+                                        </form>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                            {% for row in hold_actions %}
+                            <tr>
+                                <td>
+                                    <strong>{{ row.symbol }}</strong>
+                                    <div class="table-subtle">{{ row.name or '-' }}</div>
+                                </td>
+                                <td><span class="badge">持有</span></td>
+                                <td class="{{ 'up' if ((row.metrics or {}).get('position_return') or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((row.metrics or {}).get('position_return') or 0) * 100) }}%</td>
+                                <td class="{{ 'up' if ((row.metrics or {}).get('peak_return') or 0) >= 0 else 'down' }}">{{ '%.2f'|format(((row.metrics or {}).get('peak_return') or 0) * 100) }}%</td>
+                                <td>{{ row.reason or '-' }}</td>
+                                <td><span class="badge status-pending">无需执行</span></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="empty-state compact-empty">
+                    <h2>今天没有持仓动作</h2>
+                    <p>当前还没有历史持仓，或这一天所有持仓都没有触发减仓/继续持有建议。</p>
+                </div>
+                {% endif %}
+            </section>
+        </section>
+
+        <section class="chart-wrap">
+            <div class="section-title">
+                <div>
+                    <h2>策略收益对比基准</h2>
+                    <p>按策略起始日累计的组合浮动收益率，与上证指数区间收益及超额收益做对比。</p>
+                </div>
+            </div>
+            <div class="chart-box">{{ performance_svg|safe }}</div>
+        </section>
+        {% else %}
+        <section class="empty-state">
+            <h2>还没有策略计划</h2>
+            <p>先选择模板并生成一份最新计划，页面才会展示实时买卖建议和持仓快照。</p>
+        </section>
+        {% endif %}
+    </main>
+</body>
+</html>
